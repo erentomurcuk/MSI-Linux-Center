@@ -4,14 +4,14 @@ Thanks for looking. This is a small, opinionated project that controls real
 hardware, so the bar is *"prove it"*, not *"it compiles"*. Everything below
 exists because something here has already bitten someone once.
 
-Before you start, read [`APP_DETAILS.md`](APP_DETAILS.md) — it is the single
+Before you start, read [`APP_DETAILS.md`](APP_DETAILS.md) - it is the single
 map of the system: the model registry, the EC register map, the socket
 protocol, the daemon's design rules, and the hardware gotchas that are already
 paid for. If you are an AI agent (or working with one), [`AGENTS.md`](AGENTS.md)
 is the same map written for that workflow. This file is the *how to work here*.
 
 The single most common contribution is **adding a model for a laptop that is
-not the dev machine** — if that is why you are here, skip to
+not the dev machine** - if that is why you are here, skip to
 [Adding your model](#adding-your-model).
 
 ---
@@ -22,7 +22,7 @@ not the dev machine** — if that is why you are here, skip to
 
 Nothing in this project may write to the embedded controller except
 `msi_controld.py`, through the validated path. If you are tempted to poke a byte
-from the GUI, the CLI, a script, or a test, stop — that is the one way this
+from the GUI, the CLI, a script, or a test, stop - that is the one way this
 program can hard-crash the machine. New registers, if any, go in a model file
 (see below) and are written through the daemon like everything else.
 
@@ -48,7 +48,7 @@ make check        # compile + tests + GUI smoke
 make test         # the offline suite only
 make smoke        # GUI build + one screenshot per tab
 make shots-light  # the same, light theme
-make verify       # live hardware checks — root, safe and reversible
+make verify       # live hardware checks - root, safe and reversible
 ```
 
 `tests/test_msi_control.py` needs **no root and no hardware**: it builds a fake
@@ -62,8 +62,8 @@ enough).
 
 This program knows about one laptop by default (an MSI GS66 Stealth 10SE).
 Making it work fully on **your** MSI laptop means adding a model file under
-`models/`. Everything the `msi-ec` driver exposes — temperatures, shift and fan
-modes, Cooler Boost, the charge limit — already works without one; a model file
+`models/`. Everything the `msi-ec` driver exposes - temperatures, shift and fan
+modes, Cooler Boost, the charge limit - already works without one; a model file
 adds the fan curves, RPM and the graphics switch, which need per-model EC
 registers the driver does not know.
 
@@ -79,19 +79,19 @@ msi-control detect --ec-dump    # the 256-register map (needs msi-ec debug=1)
 Then:
 
 1. **Copy the shape** of [`models/gs66-stealth-10se/model.json`](models/gs66-stealth-10se/model.json)
-   and read [`models/README.md`](models/README.md) — it documents every field,
+   and read [`models/README.md`](models/README.md) - it documents every field,
    including the two-part `match` block and each feature flag.
 2. **Fill in the `ec` block** with the fan-curve and tachometer addresses for
    your firmware, and set the matching `features` flags to `true`. The way to
    find them: turn the driver's debug interface on, change one thing at a time
    (a curve point, Cooler Boost) and diff `detect --ec-dump` before and after.
-   Other projects carry maps for many MSI models — YoyPa/isw, the in-tree
-   `msi-ec` `CONF_*` tables, other forks of this program — **check the licence**
+   Other projects carry maps for many MSI models - YoyPa/isw, the in-tree
+   `msi-ec` `CONF_*` tables, other forks of this program - **check the licence**
    and record where yours came from in `provenance`.
 3. **Keep the flags you could not prove `false`.** A model that reads
    temperatures and controls the fans is useful; one that writes a guessed
    address into an unknown EC is a machine that will not boot. The
-   "unsupported" state is a feature, not a bug — do not turn on `fan_curve` or
+   "unsupported" state is a feature, not a bug - do not turn on `fan_curve` or
    `mux` without a measurement behind them.
 4. **Write `models/<id>/README.md`** explaining how you found the registers and
    what you measured, following the GS66 one.
@@ -135,7 +135,7 @@ anyway. Half a model is a real improvement over none.
 
 ## Tests
 
-`tests/test_msi_control.py` is not a formality — it is where the ugly cases live,
+`tests/test_msi_control.py` is not a formality - it is where the ugly cases live,
 and they are all there because one of them shipped:
 
 * an EC byte that **refuses to be written** (read-back must catch it);
@@ -155,7 +155,7 @@ Add a test for anything you add. A behaviour that only a human can check will
 be broken again within a month.
 
 `tests/gui_smoke.py` is the other half: it asserts what a screenshot cannot
-show — **WCAG contrast ratios**, the battery tab's pending-vs-applied state
+show - **WCAG contrast ratios**, the battery tab's pending-vs-applied state
 machine, keyboard access to the curve editor, the exact wording of every
 confirmation, and the dashboard's numbers against their labels. If you change a
 label, a colour, or a state machine, extend it here.
@@ -165,7 +165,7 @@ label, a colour, or a state machine, extend it here.
 Both the test suite and the smoke test take the same view: a test must
 **never touch the user's real config**. `gui_smoke.py` redirects
 `XDG_CONFIG_HOME` into the shots directory before anything constructs a
-`QSettings`, and drops any stale file first. Do not remove that — without it a
+`QSettings`, and drops any stale file first. Do not remove that - without it a
 test run rewrites `~/.config/msi-control/msi-control.conf` and opens the
 developer's next real window on whatever tab the test ended on.
 
@@ -177,15 +177,19 @@ developer's next real window on whatever tab the test ended on.
   shell with nothing installed. PySide6 is a GUI-only dependency.
 * **No subprocesses in the daemon.** It reads and writes files at fixed sysfs
   paths through Python, and nothing else.
-* Comments explain *why*, not *what* — the reason a value was chosen, the bug a
+* Comments explain *why*, not *what* - the reason a value was chosen, the bug a
   guard prevents, the measurement behind a constant. `# increment i` is noise;
   `# speeds[0] is the speed below the first threshold, so it owns no point` is
   the kind of thing that saves the next reader an hour.
 * Keep the runbook voice: plain sentences, real numbers, and the measurement
   written next to the conclusion so the next person can re-check it.
+* **Plain hyphens, never typographic dashes.** No em-dash, en-dash or Unicode
+  minus sign in source, comments, docs or UI strings - the tree was swept clean
+  on 2026-10-18. It is the one style rule a reviewer will send a change back
+  for, so it is worth a moment before you commit.
 * Paths and constants are imported from `msi_control.py`, never re-typed. If
   the CLI and the GUI disagree about what "warm" means, they are both reading
-  the same helper — that is the point.
+  the same helper - that is the point.
 
 ---
 
@@ -193,7 +197,7 @@ developer's next real window on whatever tab the test ended on.
 
 There is no enforced commit format. What *is* enforced is `CHANGELOG.md`: every
 upgrade, fix, or config change gets a row, in the same session, before the work
-is called done. The row says what changed and, where it matters, **why** —
+is called done. The row says what changed and, where it matters, **why** -
 that file is the archaeology the next contributor reads. Old rows keep the old
 names (`GS66 Center`, `gs66-centerd`); they are history, not stale references.
 
@@ -204,7 +208,7 @@ names (`GS66 Center`, `gs66-centerd`); they are history, not stale references.
 The vendored driver in `third_party/msi-ec/` is
 [**teackot/msi-ec**](https://github.com/teackot/msi-ec) **v0.13**, GPL-2.0, kept
 in-tree (not a submodule) so the DKMS build needs no network. Keep its licence
-and headers intact, and **do not rename anything inside it** — its device
+and headers intact, and **do not rename anything inside it** - its device
 strings and file names are upstream's, not ours. The MUX mechanism is
 cross-checked against
 [`ElXreno/msi-gpu-switcher`](https://github.com/ElXreno/msi-gpu-switcher).

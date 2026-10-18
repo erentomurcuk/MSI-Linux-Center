@@ -8,7 +8,7 @@ clears.  Answers three questions the earlier probes could not:
      continuously; a duty register jumps.  Sample the whole space twice,
      1.5 s apart, and look for pairs whose value drifts.
   2. Which bytes does Cooler Boost actually drive?  Toggle 0x98.7 and diff
-     the entire EC image — that is the authoritative list of "the fans".
+     the entire EC image - that is the authoritative list of "the fans".
   3. What is the RPM scale?  Compare the tach periods against a fan whose
      true speed we can read elsewhere (the NVIDIA GPU fan, via nvidia-smi).
 

@@ -1,4 +1,4 @@
-# MSI Linux Control — editor configuration
+# MSI Linux Control - editor configuration
 # https://EditorConfig.org
 root = true
 
@@ -11,7 +11,7 @@ indent_style = space
 indent_size = 4
 max_line_length = 79
 
-# Python, plus the two extensionless programs — both are Python.
+# Python, plus the two extensionless programs - both are Python.
 [*.py]
 indent_size = 4
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""msi_control — shared core: model registry, registers, paths, protocol.
+"""msi_control - shared core: model registry, registers, paths, protocol.
 
 Everything the daemon, the CLI and the GUI have to agree about lives here:
-the paths, the wire protocol, the validation, and the **model registry** —
+the paths, the wire protocol, the validation, and the **model registry** -
 one JSON file per laptop model under `models/`, holding the EC addresses,
 feature flags and built-in profiles that differ between MSI machines.
 
@@ -40,7 +40,7 @@ import socket
 VERSION = "1.0.0"
 
 # --------------------------------------------------------------------------
-# Paths — every one overridable through the environment so the whole stack
+# Paths - every one overridable through the environment so the whole stack
 # can be exercised against a fake sysfs tree without root (see tests/).
 # --------------------------------------------------------------------------
 
@@ -112,7 +112,7 @@ def models_dir() -> str:
 #
 # Shift modes, fan modes, cooler boost and the charge threshold are NOT here,
 # because the msi-ec driver exposes them through sysfs on every machine it
-# binds to — they are model-independent facts, and the driver's own
+# binds to - they are model-independent facts, and the driver's own
 # `available_*_modes` attributes say which values a given firmware accepts.
 #
 # A model file is validated when it is loaded, not when it is used: a typo in
@@ -133,7 +133,7 @@ MODEL_FEATURES = (
 )
 
 # What a machine can do when nobody has written a model file for it: exactly
-# what the driver exposes by itself.  Deliberately not optimistic — every
+# what the driver exposes by itself.  Deliberately not optimistic - every
 # `False` here is a control the user would otherwise be offered and then
 # refused, and one of them (mux) can leave a laptop with no display.
 UNKNOWN_FEATURES = {
@@ -338,7 +338,7 @@ class Model:
             if len(speeds) != len(temps) + 1:
                 raise ModelError(
                     f"{self.where}: ec.curve.{which} has {len(temps)} "
-                    f"thresholds and {len(speeds)} speeds — a step function "
+                    f"thresholds and {len(speeds)} speeds - a step function "
                     "always has one more speed than threshold")
             if not temps:
                 raise ModelError(f"{self.where}: ec.curve.{which} is empty")
@@ -377,7 +377,7 @@ class Model:
             if name == "factory":
                 raise ModelError(
                     f"{self.where}: a built-in profile may not be called "
-                    "\"factory\" — that name is reserved for the curve "
+                    "\"factory\" - that name is reserved for the curve "
                     "captured from the EC on first run")
             if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
                 raise ModelError(
@@ -476,7 +476,7 @@ def load_model_file(path: str) -> Model:
 
 
 def load_models(root: str | None = None) -> tuple:
-    """`(models, errors)` — a broken model file never stops the others.
+    """`(models, errors)` - a broken model file never stops the others.
 
     A malformed file is reported rather than raised, because the machine it
     breaks for is most likely *not* the machine its author is sitting at, and
@@ -495,7 +495,7 @@ def machine_facts() -> dict:
     """This machine's identity: DMI strings plus the EC firmware revision.
 
     All of it is world-readable, so `detect` works without root and works
-    with the daemon down — which is exactly when somebody is most likely to
+    with the daemon down - which is exactly when somebody is most likely to
     be asking what this laptop is.
     """
     ec = msi_ec_dir()
@@ -568,7 +568,7 @@ DRIVER_ATTRS = ("shift_mode", "fan_mode", "cooler_boost", "webcam",
 
 
 def driver_facts() -> dict:
-    """What the msi-ec driver exposes here — no root, no daemon."""
+    """What the msi-ec driver exposes here - no root, no daemon."""
     ec = msi_ec_dir()
     bat = find_battery()
     present = [a for a in DRIVER_ATTRS if os.path.exists(os.path.join(ec, a))]
@@ -622,10 +622,10 @@ def detect(include_dump: bool = True) -> dict:
 
 
 def render_detect(report: dict) -> str:
-    """The report as plain text — the block a contributor pastes into a PR."""
+    """The report as plain text - the block a contributor pastes into a PR."""
     m, d = report["machine"], report["driver"]
     add = []
-    add.append("MSI Linux Control — model detection")
+    add.append("MSI Linux Control - model detection")
     add.append("=" * 38)
     add.append("")
     add.append("machine")
@@ -656,7 +656,7 @@ def render_detect(report: dict) -> str:
         add.append(f"matched: {who['name']}  ({who['id']}, score "
                    f"{who['score']})")
     else:
-        add.append("matched: NOTHING — this laptop has no model file yet.")
+        add.append("matched: NOTHING - this laptop has no model file yet.")
         add.append("")
         add.append("  Everything the msi-ec driver exposes already works:")
         add.append("  temperatures, shift and fan modes, cooler boost and the")
@@ -698,7 +698,7 @@ def firmware_glob(firmware: str) -> str:
     """`"16V1EMS1.118"` -> `"16V1EMS1.*"`.
 
     The trailing revision arrives with every firmware update, so a pattern
-    that pinned it would stop working for every user who updated — which is
+    that pinned it would stop working for every user who updated - which is
     the opposite of what a registry entry is for.
     """
     text = (firmware or "").strip()
@@ -768,7 +768,7 @@ def write_draft(directory: str, facts: dict | None = None) -> str:
     """Write `draft_model()` into `<directory>/model.json`.  Returns the path."""
     path = os.path.join(directory, "model.json")
     if os.path.exists(path):
-        raise ModelError(f"{path} already exists — refusing to overwrite it")
+        raise ModelError(f"{path} already exists - refusing to overwrite it")
     os.makedirs(directory, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(draft_model(facts), fh, indent=2)
@@ -781,7 +781,7 @@ def write_draft(directory: str, facts: dict | None = None) -> str:
 #
 # `MODEL`, `CURVE_REGS`, `N_TEMPS`, `RPM_REGS`, `RPM_NUMERATOR`,
 # `BUILTIN_PROFILES` and `CHARGE_MIN`/`CHARGE_MAX` are published at the END of
-# this file, once every helper they need has been defined — see "select this
+# this file, once every helper they need has been defined - see "select this
 # machine's model" at the bottom.  Everything here about the embedded
 # controller is *this model's*, never a generic MSI layout.
 # --------------------------------------------------------------------------
@@ -796,17 +796,17 @@ def write_draft(directory: str, facts: dict | None = None) -> str:
 # tool ElXreno/msi-gpu-switcher drives the identical trio on MSI hardware from
 # other model lines, so the addresses live here and every model file that
 # declares "mux": true uses them.  What *is* per-model is whether anybody has
-# established that the switch works there — see CONTRIBUTING.md.
+# established that the switch works there - see CONTRIBUTING.md.
 #
 # The firmware can run the panel off the discrete GPU alone, or off the Intel
 # iGPU with the dGPU as a render offload (Optimus).  Three places encode the
 # same single fact, and all three agree on this machine:
 #
-#   * EC register 0x2e, bit 6 — MSI's "PXCT" bit.  1 = the panel is wired to
+#   * EC register 0x2e, bit 6 - MSI's "PXCT" bit.  1 = the panel is wired to
 #     the dGPU (discrete); 0 = the iGPU drives the panel (hybrid).
-#   * the UEFI variable MsiDCVarData, byte 1 — the same polarity, read by the
+#   * the UEFI variable MsiDCVarData, byte 1 - the same polarity, read by the
 #     firmware at POST, so it is what decides the *next* boot.
-#   * whether an Intel PCI display controller exists at all — the firmware
+#   * whether an Intel PCI display controller exists at all - the firmware
 #     powers the iGPU down in discrete mode, so its absence is the only
 #     observation of what the machine is *actually* doing right now.
 #
@@ -840,7 +840,7 @@ MUX_LABELS = {
 }
 
 # --------------------------------------------------------------------------
-# Temperature bands — ONE definition, shared by the CLI and the GUI.
+# Temperature bands - ONE definition, shared by the CLI and the GUI.
 #
 # They used to live in both places and disagreed (the CLI called 60 °C "warm",
 # the GUI called the same reading "cool"), so a colour meant different things
@@ -869,7 +869,7 @@ def temp_band(temp) -> str | None:
 
 
 # --------------------------------------------------------------------------
-# Human-readable setting names — used by every "what changed" summary.
+# Human-readable setting names - used by every "what changed" summary.
 # --------------------------------------------------------------------------
 
 SETTING_LABELS = {
@@ -888,7 +888,7 @@ SETTING_LABELS = {
 # diff's "performance" is fine as "performance eco -> sport", but as a verb
 # phrase "Set performance to sport" is missing the word that tells you it is
 # a *mode*.  Only the keys whose diff label reads awkwardly as a verb
-# subject need overriding — the rest carry over unchanged.
+# subject need overriding - the rest carry over unchanged.
 ACTIVITY_LABELS = {
     "shift": "performance mode",
 }
@@ -921,7 +921,7 @@ def describe_change(key: str, was, now) -> str:
 def describe_activity(key: str, was, now) -> str:
     """`"Set charge limit to 80%"`, `"Enabled cooler boost"`.
 
-    `describe_change` writes a *diff* — the right shape for a log line or a
+    `describe_change` writes a *diff* - the right shape for a log line or a
     `--json` consumer, because it says exactly what moved.  A notification
     needs the other shape: the sentence describing what the person just
     *did*.  "charge limit 60% -> 80%" answers "what changed on the machine";
@@ -970,7 +970,7 @@ def curve_points_changed(before: dict, after: dict) -> int:
 
 
 def graphics_activity(mode: str, was: str | None, now: str | None) -> str:
-    """`"Switched graphics to Hybrid (Intel + NVIDIA) — reboot to apply"`.
+    """`"Switched graphics to Hybrid (Intel + NVIDIA) - reboot to apply"`.
 
     The graphics mode is the one setting where "done" is a lie until the
     machine restarts, so the sentence says both what was requested and what is
@@ -980,8 +980,8 @@ def graphics_activity(mode: str, was: str | None, now: str | None) -> str:
     if now == mode and was == mode:
         return f"Graphics mode already {label}"
     if was == mode:
-        return f"Graphics mode still {label} — reboot to apply"
-    return f"Switched graphics to {label} — reboot to apply"
+        return f"Graphics mode still {label} - reboot to apply"
+    return f"Switched graphics to {label} - reboot to apply"
 
 # The charge-threshold bounds are per model (`charge.min`/`charge.max`) and
 # are published as CHARGE_MIN/CHARGE_MAX at the end of this file.
@@ -994,15 +994,15 @@ SPEED_MIN, SPEED_MAX = 0, 100
 
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
-# Built-in profiles are per-model data — the `gaming` profile's curve is a
-# statement about one machine's thermal envelope — so they live in
+# Built-in profiles are per-model data - the `gaming` profile's curve is a
+# statement about one machine's thermal envelope - so they live in
 # `model.json` and are published as BUILTIN_PROFILES at the end of this file.
 #
 # The rule that must survive every model file:
 #
 # ⚠️ A profile carries a `charge_end` ONLY when setting a charge limit is the
 # point of that profile.  "silent" / "balanced" / "gaming" deliberately omit
-# it, so applying one changes nothing about charging — because the limit is
+# it, so applying one changes nothing about charging - because the limit is
 # the one setting a person chooses for *battery health* rather than for
 # performance, and silently pushing it back to 100% (which these three used
 # to do) threw away a limit the user had deliberately picked.  The journal
@@ -1012,7 +1012,7 @@ PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 # preserving the battery IS that profile's purpose.
 #
 # `clean_profile` (below) is what enforces the rest of a profile's shape, and
-# it is applied to *both* a model's built-ins and a saved profile — a stored
+# it is applied to *both* a model's built-ins and a saved profile - a stored
 # profile is untrusted input that the next boot replays into the EC.
 
 DEFAULT_CONFIG = {
@@ -1040,7 +1040,7 @@ DEFAULT_CONFIG = {
 
 
 # --------------------------------------------------------------------------
-# Validation — the daemon never trusts a client, and the GUI is a client.
+# Validation - the daemon never trusts a client, and the GUI is a client.
 # --------------------------------------------------------------------------
 
 class ValidationError(ValueError):
@@ -1062,7 +1062,7 @@ def check_choice(value, choices, what: str):
 
 
 def check_int(value, lo: int, hi: int, what: str) -> int:
-    # bool is an int in Python — and "true" must never become speed 1.
+    # bool is an int in Python - and "true" must never become speed 1.
     if isinstance(value, bool) or not isinstance(value, (int, float)) \
             or isinstance(value, float) and value != int(value):
         raise ValidationError(f"invalid {what}: not an integer")
@@ -1141,7 +1141,7 @@ def clean_profile(data: dict, n_temps: int | None = None,
     """Keep only the known keys of a profile, validated.
 
     Used for a *stored* profile (untrusted input the next boot replays into
-    the EC) and for a model's built-in profiles at load time — one function,
+    the EC) and for a model's built-in profiles at load time - one function,
     so a built-in can never be shaped unlike a saved one.  `charge_end` is
     optional on purpose; see the note above BUILTIN_PROFILES.
 
@@ -1234,7 +1234,7 @@ def daemon_available() -> bool:
 
 
 # --------------------------------------------------------------------------
-# Local (unprivileged) reads — enough for a degraded `status` without the
+# Local (unprivileged) reads - enough for a degraded `status` without the
 # daemon.  Anything that needs an EC *write* (RPM tach, fan curve) is only
 # reachable through the daemon.
 # --------------------------------------------------------------------------
@@ -1262,7 +1262,7 @@ def _read_int(path: str):
 
 
 def find_battery() -> str | None:
-    """BAT0/BAT1/… — this machine uses BAT1, others use BAT0."""
+    """BAT0/BAT1/… - this machine uses BAT1, others use BAT0."""
     bats = sorted(glob.glob(os.path.join(power_dir(), "BAT*")))
     return bats[0] if bats else None
 
@@ -1274,7 +1274,7 @@ def _lines(text) -> list:
 
 
 def local_status(mux: bool = True) -> dict:
-    """Best-effort state straight from sysfs — no daemon, no root.
+    """Best-effort state straight from sysfs - no daemon, no root.
 
     Missing pieces (RPM, fan curve) come back as None so the UI can say
     "daemon offline" instead of printing a wrong number.  `mux=False` skips
@@ -1355,13 +1355,13 @@ def _ac_online():
 
 
 # --------------------------------------------------------------------------
-# Graphics mode (MUX) — reading it without root
+# Graphics mode (MUX) - reading it without root
 #
 # The daemon reads the EC state bit with ec_read (two sysfs ops).  A client
 # without the daemon cannot: msi-ec's debug/ec_get needs the address written
 # to it first, and that write is root-only.  So the unprivileged view is built
-# from the two sources that *are* world-readable — the UEFI variable and which
-# PCI display controllers exist — and the EC bit is reported as unknown rather
+# from the two sources that *are* world-readable - the UEFI variable and which
+# PCI display controllers exist - and the EC bit is reported as unknown rather
 # than guessed.  Deliberately NOT read here: debug/ec_dump, which is also
 # world-readable but costs ~120 ms because the driver walks all 256 registers
 # to build it.  That is far too expensive for a 1.5 s poll.
@@ -1387,7 +1387,7 @@ def parse_ec_dump(text: str) -> dict:
     """The driver's `debug/ec_dump` as `{address: byte}`.
 
     It is a formatted table (`| 0x2_ | xx xx … |`), so addresses come from the
-    row label and never from counting bytes across the whole file — a header
+    row label and never from counting bytes across the whole file - a header
     line or a width change then shifts nothing.
     """
     out = {}
@@ -1436,7 +1436,7 @@ def igpu_present() -> bool | None:
     """Is an Intel PCI display controller present?  None if we cannot tell.
 
     In discrete mode the firmware powers the iGPU down, so its *absence* is
-    the one observation of what the running machine is actually doing — as
+    the one observation of what the running machine is actually doing - as
     opposed to what the EC and the UEFI variable say it should do.
     """
     root = os.path.join(sysfs_root(), "bus", "pci", "devices")
@@ -1516,7 +1516,7 @@ def load_config() -> dict:
 # This runs once, at import, because "which laptop am I on" cannot change
 # while the process lives and deciding it lazily would let two callers
 # disagree.  The module-level names below are the model's, which is why the
-# daemon, the CLI and the GUI never have to ask a second time — and why a
+# daemon, the CLI and the GUI never have to ask a second time - and why a
 # per-model register address is typed in exactly one place in the program,
 # `models/<id>/model.json`.
 #

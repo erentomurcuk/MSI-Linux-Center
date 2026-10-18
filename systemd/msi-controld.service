@@ -22,7 +22,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-# NOT protected: /sys must stay writable — that is the entire point
+# NOT protected: /sys must stay writable - that is the entire point
 # (msi-ec attributes + the battery charge thresholds live there).
 ProtectKernelTunables=no
 ProtectControlGroups=yes

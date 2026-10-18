@@ -1,4 +1,4 @@
-# MSI Linux Control — convenience targets.
+# MSI Linux Control - convenience targets.
 #
 # The real work is three commands (test, smoke, verify); this file just names
 # them so nobody has to remember the QT_QPA_PLATFORM incantation.  Nothing
@@ -42,7 +42,7 @@ compile:             ## Byte-compile every source file
 
 check: compile test smoke  ## Everything that runs without root or hardware
 
-verify:              ## Live hardware checks — root, safe + reversible
+verify:              ## Live hardware checks - root, safe + reversible
 	sudo ./verify.sh
 
 install:             ## Install driver + programs (root, re-execs via pkexec)

@@ -3,7 +3,7 @@
 
 Runs entirely unprivileged against a fake sysfs tree and a RAM-backed EC,
 so it exercises the real daemon (Service + Unix socket server + protocol),
-the real validation code and the real CLI — without touching hardware.
+the real validation code and the real CLI - without touching hardware.
 
     python3 tests/test_msi_control.py
 """
@@ -32,7 +32,7 @@ sys.path.insert(0, SRC)
 # The registry is model-driven now, and "which model is this machine" is
 # decided at *import* of msi_control.  A test run must not depend on the
 # machine it happens to be on, so pin the model and the registry directory
-# before the import — exactly the escape hatch MSI_MODEL/MSI_MODELS exist for.
+# before the import - exactly the escape hatch MSI_MODEL/MSI_MODELS exist for.
 REPO = os.path.dirname(HERE)
 os.environ["MSI_MODELS"] = os.path.join(REPO, "models")
 os.environ["MSI_MODEL"] = "gs66-stealth-10se"
@@ -620,7 +620,7 @@ class TestProfiles(DaemonTest):
         out = self.call({"cmd": "profile", "action": "apply", "name": "silent"})
         self.assertEqual(self.read_attr("shift_mode"), "eco")
         self.assertEqual(self.read_attr("fan_mode"), "silent")
-        # The charge limit is deliberately NOT part of "silent" — see the
+        # The charge limit is deliberately NOT part of "silent" - see the
         # two tests below.  The fake battery starts at 60 and must still be.
         self.assertEqual(self.bat_file("charge_control_end_threshold"), "60")
         self.assertEqual(out["warnings"], [])
@@ -641,7 +641,7 @@ class TestProfiles(DaemonTest):
                 f"profile {name} moved the charge limit: {out}")
             self.assertFalse([c for c in (out["changes"] or [])
                               if "charge limit" in c], out["changes"])
-            # and it must not be reported as an activity either — the
+            # and it must not be reported as an activity either - the
             # confirmation has to agree with the hardware.
             self.assertFalse([a for a in (out["activities"] or [])
                               if "charge limit" in a], out["activities"])
@@ -693,7 +693,7 @@ class TestProfiles(DaemonTest):
             self.call({"cmd": "profile", "action": "delete", "name": "silent"})
 
     def test_show_reads_profile_without_applying(self):
-        # "show" is what the GUI uses to ghost the factory curve — it must
+        # "show" is what the GUI uses to ghost the factory curve - it must
         # never touch the EC.
         before = dict(self.ec.mem)
         self.service.capture_factory()
@@ -724,7 +724,7 @@ class TestProfiles(DaemonTest):
         with open(os.path.join(self.state, "profiles", "factory.json"),
                   encoding="utf-8") as fh:
             first = fh.read()
-        # mutate the EC, capture again — the original must be preserved,
+        # mutate the EC, capture again - the original must be preserved,
         # and the daemon must report that it did nothing.
         self.ec.mem[0x72] = 99
         self.assertEqual(self.service.capture_factory(), "exists")
@@ -811,7 +811,7 @@ class TestCli(DaemonTest):
         # subparser via parents=[common]) from SUPPRESS to False, so the
         # subparser wrote json=False into the namespace and clobbered a
         # `--json status`.  A script reading JSON off stdout would have got
-        # prose with exit code 0 — the worst possible failure mode.
+        # prose with exit code 0 - the worst possible failure mode.
         proc = self.run_cli("--json", "status")
         st = json.loads(proc.stdout)          # raises if it is not JSON
         self.assertEqual(st["shift"]["current"], "comfort")
@@ -826,7 +826,7 @@ class TestCli(DaemonTest):
 
     def test_json_flag_position_does_not_change_the_answer(self):
         # Both positions must produce the same parsed value, not just both
-        # be JSON — a flag that quietly changed *which* command ran would
+        # be JSON - a flag that quietly changed *which* command ran would
         # still parse fine here.
         before = json.loads(self.run_cli("--json", "mode").stdout)
         after = json.loads(self.run_cli("mode", "--json").stdout)
@@ -905,8 +905,8 @@ class TestCli(DaemonTest):
 #
 # The switch is the one setting here that can survive a reboot in a state the
 # user did not want, so the tests are as much about what it must *refuse* to
-# do — write while disabled, write on a firmware that has no MUX, write
-# without a backup — as about the bytes it writes.
+# do - write while disabled, write on a firmware that has no MUX, write
+# without a backup - as about the bytes it writes.
 # --------------------------------------------------------------------------
 
 class TestMuxParsing(unittest.TestCase):
@@ -1001,7 +1001,7 @@ class TestGraphicsRead(DaemonTest):
         self.assertIsNone(core.local_status(mux=False)["graphics"])
 
     def test_an_intel_gpu_flips_effective_and_raises_the_reboot_flag(self):
-        # var says discrete (next boot), iGPU present (running now) — the
+        # var says discrete (next boot), iGPU present (running now) - the
         # machine is mid-switch.
         add_fake_igpu(self.sysfs)
         svc = self.make_service()
@@ -1451,7 +1451,7 @@ class TestModelSelection(unittest.TestCase):
 
     def test_an_explicit_unknown_id_is_a_loud_error(self):
         # A typo must not look like "a laptop the registry has never heard
-        # of" — that would hide a broken model file behind a blank screen.
+        # of" - that would hide a broken model file behind a blank screen.
         with self.assertRaises(core.ModelError):
             core.select_model(hint="does-not-exist", root=self.tmp)
 

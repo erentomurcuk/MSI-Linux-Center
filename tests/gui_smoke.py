@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless GUI smoke test — builds the real MainWindow against a fake status
+"""Headless GUI smoke test - builds the real MainWindow against a fake status
 payload and renders each tab to a PNG, so layout regressions are visible
 without a display or the hardware.
 
@@ -89,7 +89,7 @@ def check_contrast(win) -> None:
         fg = gui.text_on(colour)
         ratio = contrast(fg, colour)
         assert ratio >= 4.5, (
-            f"{name}={colour} with text {fg} is only {ratio:.2f}:1 — "
+            f"{name}={colour} with text {fg} is only {ratio:.2f}:1 - "
             f"WCAG AA needs 4.5:1")
 
     # The muted hint text is derived from the live palette, so check the
@@ -112,7 +112,7 @@ def check_contrast(win) -> None:
         assert got.startswith("#"), got
         assert ratio >= 3.0, (
             f"muted hint text {got} on the {label} theme's background "
-            f"{bg_hex} is {ratio:.2f}:1 — too faint to read")
+            f"{bg_hex} is {ratio:.2f}:1 - too faint to read")
         probe.deleteLater()
 
 
@@ -120,7 +120,7 @@ def check_theme_tokens() -> None:
     """The two themes must define the same tokens, and every accent must be
     readable with the text colour computed for it.
 
-    A theme that is missing a token does not fail loudly — the stylesheet
+    A theme that is missing a token does not fail loudly - the stylesheet
     silently interpolates an empty string and the widget loses its border or
     its background, which looks like a rendering bug rather than a typo.  And
     an accent whose `on_accent` is not actually legible is exactly the "white
@@ -140,7 +140,7 @@ def check_theme_tokens() -> None:
         ratio = contrast(t["on_accent"], t["accent"])
         assert ratio >= 4.5, (
             f"{name} accent {t['accent']} with text {t['on_accent']} is "
-            f"{ratio:.2f}:1 — WCAG AA needs 4.5:1")
+            f"{ratio:.2f}:1 - WCAG AA needs 4.5:1")
         # The ink used for text on a tinted accent surface has to read on the
         # surface it actually lands on, which is the theme's own background.
         ink = contrast(t["accent_ink"], t["surface"])
@@ -179,7 +179,7 @@ def check_brand_mark() -> None:
 
     The window/menu icon is the SVG; the header mark and tray are painted at
     runtime.  If they drift, the app looks like two different applications
-    depending on where you meet it — so pin the file, its validity, the
+    depending on where you meet it - so pin the file, its validity, the
     shield's box, the colours the mark is built from, and the fact that the
     painted mark is *only* the shield and Tux: no tile behind it, no
     lettering on it.  Both of those were removed because at the 16-22 px a
@@ -238,7 +238,7 @@ def check_brand_mark() -> None:
                             (ink[3], size * (by + bh), "bottom edge")):
         assert abs(got - want) <= 2, (
             f"the shield's {what} is at {got} px but MARK_BOX puts it at "
-            f"{want:.1f} — the mark no longer fills its canvas")
+            f"{want:.1f} - the mark no longer fills its canvas")
 
     # The tray tints the same shield by temperature; different bands must not
     # paint the same mark, which is the whole point of tinting it.
@@ -252,7 +252,7 @@ def check_brand_mark() -> None:
     # eyeballed: rasterise the SVG at the same size, take both ink bounding
     # boxes and compare the four edges.  Two outlines that differ by a few
     # percent look "the same" in a screenshot while clearly disagreeing side
-    # by side — which is what happened the last time this mark was edited.
+    # by side - which is what happened the last time this mark was edited.
     svg_img = QImage(size, size, QImage.Format_ARGB32)
     svg_img.fill(QColor(0, 0, 0, 0))
     painter = QPainter(svg_img)
@@ -262,14 +262,14 @@ def check_brand_mark() -> None:
     for i, what in ((0, "left edge"), (1, "top edge"),
                     (2, "right edge"), (3, "bottom edge")):
         assert abs(px[i] - sx[i]) <= 3, (
-            f"painted mark's {what} is {px[i]} but the SVG's is {sx[i]} — "
+            f"painted mark's {what} is {px[i]} but the SVG's is {sx[i]} - "
             "the shipped icon and the painted one have drifted")
 
     # The tray's reading is the only text in the mark, and it has to fit
     # inside the shield.  Measured with the same font the mark uses, not
     # guessed.  The band of sizes is the band the tray renders: the app paints
     # the icon at 64 and the tray scales it, so 22 (KDE's tray icon) and 64
-    # bound what anyone can see — below about 20 px a three-digit reading is
+    # bound what anyone can see - below about 20 px a three-digit reading is
     # physically wider than the badge, which is why the icon is not painted
     # that small in the first place.
     for label in ("9", "62", "100"):
@@ -297,8 +297,8 @@ def check_control_sizes(win) -> None:
     def eff(w) -> int:
         """The height the layout will actually give this widget.
 
-        Deliberately not `height()`: a page that has never been shown — every
-        tab but the current one — has not been laid out, and its widgets
+        Deliberately not `height()`: a page that has never been shown - every
+        tab but the current one - has not been laid out, and its widgets
         report a placeholder instead of their real size.  Not `sizeHint()`
         alone either: a stray setMinimumHeight() does not touch the hint, so
         a check reading only that would pass while the widget rendered 10 px
@@ -313,7 +313,7 @@ def check_control_sizes(win) -> None:
     got = {eff(b) for b in buttons}
     assert got == {rung}, (
         f"buttons are {sorted(got)} px tall, expected the one rung of {rung} "
-        "— a widget with its own setMinimumHeight() has crept back in")
+        "- a widget with its own setMinimumHeight() has crept back in")
     for group, what in ((win.sidebar.buttons, "sidebar row"),
                         (win.findChildren(QLineEdit), "line edit"),
                         (win.findChildren(QSpinBox), "spin box")):
@@ -323,7 +323,7 @@ def check_control_sizes(win) -> None:
             if eff(w) <= 20:
                 continue
             assert eff(w) == rung, (
-                f"a {what} is {eff(w)} px, not {rung} — every control has to "
+                f"a {what} is {eff(w)} px, not {rung} - every control has to "
                 "share one height")
     # The hero is the one control that is deliberately not on the rung.
     assert eff(hero) > rung, \
@@ -337,7 +337,7 @@ def check_glyphs(win) -> None:
 
     A typo in `Sidebar.ITEMS` does not raise: `glyph_pixmap` falls through its
     if-chain and returns a fully transparent pixmap, so the sidebar simply
-    shows a label with a hole beside it — which reads as a design choice
+    shows a label with a hole beside it - which reads as a design choice
     rather than a bug.  Nothing else in the suite would notice.
     """
     names = [glyph for _label, glyph in gui.Sidebar.ITEMS]
@@ -351,7 +351,7 @@ def check_glyphs(win) -> None:
     for n in names:
         got = opaque(gui.glyph_pixmap(n, 18, "#ffffff"))
         assert got > 8, f"glyph {n!r} draws nothing ({got} opaque pixels)"
-    # An unknown name is empty rather than an exception — so this check fails
+    # An unknown name is empty rather than an exception - so this check fails
     # loudly when a glyph is renamed, instead of the UI half-drawing.
     assert opaque(gui.glyph_pixmap("not-a-glyph", 18, "#ffffff")) == 0
     for b in win.sidebar.buttons:
@@ -398,7 +398,7 @@ def check_battery_apply_state(win) -> None:
 
     The old tab wrote the EC the moment the slider was released, so a slow
     drag reprogrammed the charger several times on the way to the intended
-    value.  Now nothing is written until Apply, and the button says so —
+    value.  Now nothing is written until Apply, and the button says so -
     both halves are asserted here.
     """
     from PySide6.QtCore import Qt
@@ -446,7 +446,7 @@ def check_battery_apply_state(win) -> None:
     assert batt.slider.value() == 80
     assert not batt._dirty()
 
-    # Presets select only — they must never write on their own.
+    # Presets select only - they must never write on their own.
     batt._preset(60)
     assert batt.slider.value() == 60
     assert batt._dirty(), "a preset is still pending until Apply"
@@ -461,7 +461,7 @@ def check_battery_apply_state(win) -> None:
 
     # An unreadable threshold is the EC's genuine unset boot state (the
     # driver's get_end_threshold returns -ENODATA when the charge byte reads
-    # 0).  That must NOT lock the user out of setting a limit — it is the
+    # 0).  That must NOT lock the user out of setting a limit - it is the
     # one situation where they most need to.  So the tab treats "the EC is
     # holding nothing" as something to apply, enables the button, and says
     # plainly that the current value cannot be read.
@@ -502,7 +502,7 @@ def check_curve_keyboard(win) -> None:
 
     # The plot must span the *whole* range the editor can produce.  TMIN was
     # once a hardcoded 20 while core.TEMP_MIN is 10, so a keyboard nudge could
-    # push point 0 to a temperature the graph drew off its left edge — the
+    # push point 0 to a temperature the graph drew off its left edge - the
     # handle disappeared and the mouse could no longer reach the value the
     # spin box showed.  Pin the two together.
     assert canvas.TMIN == gui.core.TEMP_MIN, canvas.TMIN
@@ -535,7 +535,7 @@ def check_curve_keyboard(win) -> None:
     press(Qt.Key_Up)                            # fine step = 1
     assert canvas.speeds[2] == start + 1, canvas.speeds
 
-    # The coarse step would overshoot the ceiling, so it clamps — this is
+    # The coarse step would overshoot the ceiling, so it clamps - this is
     # the whole reason mouse and keyboard share one code path.
     press(Qt.Key_Up, Qt.ShiftModifier)
     assert canvas.speeds[2] == ceiling, canvas.speeds
@@ -550,7 +550,7 @@ def check_curve_keyboard(win) -> None:
         press(Qt.Key_Down, Qt.ShiftModifier)
     assert canvas.speeds[2] == floor, canvas.speeds
 
-    # Temperature is clamped too, and the curve stays valid throughout —
+    # Temperature is clamped too, and the curve stays valid throughout -
     # which is what makes "Apply" always meaningful.  check_curve signals
     # failure by raising, so "no exception" is the assertion.
     for _ in range(200):
@@ -626,7 +626,7 @@ def check_graphics(win) -> None:
 
     A MUX switch is the one control here that can leave a laptop with no
     display, so what matters is not the happy path but that the card refuses
-    in the right places and *says why* — a greyed-out button with no reason
+    in the right places and *says why* - a greyed-out button with no reason
     reads as a bug.
     """
     perf = win.perf
@@ -655,7 +655,7 @@ def check_graphics(win) -> None:
     assert "reboot" in perf.gfx_rows["at next boot"].text()
     assert perf.gfx_buttons["hybrid"].isChecked()
     assert not perf.gfx_warn.isHidden() and "reboot" in perf.gfx_warn.text()
-    # Both the tile row and the dashboard say a reboot is outstanding —
+    # Both the tile row and the dashboard say a reboot is outstanding -
     # "Hybrid" alone would claim the switch had already happened.
     assert win.dash.mode_rows["Graphics"].text() == "Hybrid after reboot", \
         win.dash.mode_rows["Graphics"].text()
@@ -676,7 +676,7 @@ def check_graphics(win) -> None:
     win.online = True
     msg = gui.MainWindow._action_message(
         {"cmd": "graphics"},
-        {"activity": "Switched graphics to Hybrid (Intel + NVIDIA) — "
+        {"activity": "Switched graphics to Hybrid (Intel + NVIDIA) - "
                      "reboot to apply",
          "mode": "hybrid", "now": "hybrid"}, None)
     assert "reboot" in msg and "Hybrid" in msg, msg
@@ -687,13 +687,13 @@ def check_dashboard_facts(win) -> None:
     """Every number on the Dashboard must mean what its label says.
 
     This is the regression guard for "N% of new", which divided energy_now by
-    energy_full — the state of charge, printed as if it were the battery's
+    energy_full - the state of charge, printed as if it were the battery's
     health, right beside the same percentage shown as the charge.
     """
     win._refresh(FAKE)
     sub = win.dash.battery.sub.text()
     # 60 Wh of a 66 Wh design = 91%.  `energy_now` is 40/60 = 67%, which is
-    # also the big number — so a regression to the old formula is visible as
+    # also the big number - so a regression to the old formula is visible as
     # the two agreeing.
     assert "health 91%" in sub, sub
     assert "67% of new" not in sub, sub
@@ -702,6 +702,16 @@ def check_dashboard_facts(win) -> None:
     assert "RPM" in win.dash.cpu_rpm.sub.text(), win.dash.cpu_rpm.sub.text()
     assert "fan 48%" in win.dash.cpu_rpm.sub.text(), win.dash.cpu_rpm.sub.text()
     assert win.dash.cpu_rpm.value.text() == "2,290", win.dash.cpu_rpm.value.text()
+
+    # The temperature cards carry the temperature, its bar and its band, and
+    # nothing else: the duty number belongs to the fan cards beside them, and
+    # printing it twice made a temperature card read as a fan card.  The
+    # sub-line is hidden as well as blank, so it does not reserve a row.
+    for card in (win.dash.cpu, win.dash.gpu):
+        assert card.sub.text() == "", card.sub.text()
+        assert not card.sub.isVisible(), "an empty sub-line still takes space"
+        assert card.chip.text() in ("COOL", "WARM", "HOT", "CRITICAL"), \
+            card.chip.text()
 
     # The battery chip names the state and colours it by whether that state
     # wants your attention.  Pinned because it is a decision, not a reading:
@@ -729,9 +739,62 @@ def check_dashboard_facts(win) -> None:
     win._refresh(FAKE)
 
 
+def check_tray_icon(win) -> None:
+    """The tray mark's inks, and the Settings controls that choose one.
+
+    The tray is the one surface with no label beside it, so which ink it uses
+    and whether it carries a reading at all are decisions rather than
+    rendering details: a flat white icon, a flat black icon and a band-tinted
+    one must be distinguishable from each other, and the colour mode must
+    still follow the temperature.
+    """
+    def mean_brightness(mode):
+        img = gui.temp_pixmap(32, 58, "58", mode).toImage()
+        total = n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                px = img.pixelColor(x, y)
+                if px.alpha() < 32:
+                    continue
+                total += (px.red() + px.green() + px.blue()) / 3.0
+                n += 1
+        assert n, f"{mode} painted nothing"
+        return total / n
+
+    white = mean_brightness("white")
+    black = mean_brightness("black")
+    colour = mean_brightness("colour")
+    assert white > 150, f"white mode is not white ({white:.0f})"
+    assert black < 120, f"black mode is not dark ({black:.0f})"
+    assert white > colour > black, (white, colour, black)
+
+    # Colour mode follows the band: a cool fill is greener than a critical
+    # one, which is the only thing it offers over the two flat inks.
+    def green_minus_red(temp):
+        img = gui.temp_pixmap(32, temp, "", "colour").toImage()
+        g = r = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                px = img.pixelColor(x, y)
+                if px.alpha() < 32:
+                    continue
+                g += px.green()
+                r += px.red()
+        return g - r
+
+    assert green_minus_red(45) > green_minus_red(95), \
+        "colour mode ignores the temperature band"
+    assert set(gui.TRAY_TEMP_MODES) == {"colour", "white", "black"}
+
+    # The Settings card mirrors the window, it does not keep its own copy.
+    win._refresh(FAKE)
+    assert win.settings.tray_show.isChecked() == bool(win.tray_temp)
+    for key, btn in win.settings.tray_mode_btns.items():
+        assert btn.isChecked() == (key == win.tray_colour), key
+
 
 def check_settings_persistence(app) -> None:
-    """Geometry and the open tab survive a real close — and nothing else does.
+    """Geometry and the open tab survive a real close - and nothing else does.
 
     The second half matters as much as the first: hide-to-tray must NOT
     persist (a hidden window's tab is not a choice the user made), and a
@@ -776,6 +839,37 @@ def check_settings_persistence(app) -> None:
         app.processEvents()
 
 
+def check_tray_options(app) -> None:
+    """The tray preferences persist, and an unknown mode falls back.
+
+    Run *after* check_settings_persistence: writing these is what creates the
+    QSettings file, and that check asserts the file starts out absent.
+    """
+    w = gui.MainWindow()
+    w.poll.stop()
+    assert w.tray_temp is True, "the temperature should be on by default"
+    assert w.tray_colour == "colour", w.tray_colour
+
+    w.set_tray_options(show=False, colour="white")
+    assert w.tray_temp is False and w.tray_colour == "white"
+    # Changing only the toggle must not reset the ink.
+    w.set_tray_options(show=True)
+    assert w.tray_colour == "white", "a show-only change reset the ink"
+    w.set_tray_options(colour="nonsense")
+    assert w.tray_colour == "colour", "an unknown mode must fall back"
+    w.close()
+    app.processEvents()
+
+    again = gui.MainWindow()
+    again.poll.stop()
+    try:
+        assert again.tray_temp is True, "the tray toggle did not persist"
+        assert again.tray_colour == "colour", again.tray_colour
+    finally:
+        again.close()
+        app.processEvents()
+
+
 def check_action_messages(win) -> None:
     """Confirmations must read as what the person did, not just "applied"."""
     describe = gui.MainWindow._action_message
@@ -791,7 +885,7 @@ def check_action_messages(win) -> None:
                     {"summary": "performance comfort -> sport"},
                     "set:shift") == "performance comfort -> sport"
 
-    # With neither, the GUI must still build the sentence itself — and it
+    # With neither, the GUI must still build the sentence itself - and it
     # must be the activity form, not the diff.
     assert describe({"cmd": "set", "key": "charge_end"},
                     {"was": 60, "now": 80},
@@ -808,7 +902,7 @@ def check_action_messages(win) -> None:
     assert describe({"cmd": "reapply"},
                     {"activity": "Re-applied settings: nothing to change"},
                     None) == "Re-applied settings: nothing to change"
-    # tag is optional and can be None — it must never be .replace()d.
+    # tag is optional and can be None - it must never be .replace()d.
     assert describe({"cmd": "mystery"}, {}, None) == "done"
     assert describe({"cmd": "mystery"}, {}, "profile:save") == "profile save"
 
@@ -922,6 +1016,7 @@ def main() -> int:
     check_type_scale(win)
     check_control_sizes(win)
     check_dashboard_facts(win)
+    check_tray_icon(win)
     check_battery_apply_state(win)
     check_curve_keyboard(win)
     check_performance_tab(win)
@@ -933,6 +1028,8 @@ def main() -> int:
     # Last: it opens and closes extra windows, and must not disturb `win`.
     check_settings_persistence(app)
     print("  settings persistence: OK")
+    check_tray_options(app)
+    print("  tray options: OK")
 
     print("GUI smoke: OK")
     win.close()

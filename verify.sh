@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify.sh — post-install live checks against the real hardware.
+# verify.sh - post-install live checks against the real hardware.
 #
 # Only performs SAFE, REVERSIBLE operations:
 #   * reads (status, temps, RPM, curves)
@@ -18,7 +18,7 @@ fail=0
 # Discover the battery rather than assuming BAT1.  The daemon does exactly
 # this (a hardcoded name would fail on any machine that calls it BAT0), and
 # a verification script that silently reads nothing is worse than one that
-# says so — every check below would then "pass" against an empty string.
+# says so - every check below would then "pass" against an empty string.
 BAT=""
 for cand in /sys/class/power_supply/BAT*; do
     [ -e "$cand/charge_control_end_threshold" ] && BAT="$cand" && break
@@ -32,7 +32,7 @@ section "driver"
 [ -d "$EC" ] && ok "msi-ec bound: $(cat $EC/fw_version 2>/dev/null)" \
              || bad "msi-ec sysfs dir missing"
 [ -d "$EC/debug" ] && ok "debug interface present (RPM + curves available)" \
-                   || bad "debug interface MISSING — RPM/curves unavailable"
+                   || bad "debug interface MISSING - RPM/curves unavailable"
 
 section "daemon"
 systemctl is-active --quiet msi-controld && ok "msi-controld active" \
@@ -60,7 +60,7 @@ eval "$FEATURES"
 if [ "$supported" = "True" ]; then
     ok "a model definition matches this laptop  ($FEATURES)"
 else
-    bad "no model definition matches this laptop — fan curve, RPM and the graphics switch are off.  Run: msi-control detect"
+    bad "no model definition matches this laptop - fan curve, RPM and the graphics switch are off.  Run: msi-control detect"
 fi
 
 section "status"
@@ -80,7 +80,7 @@ section "fan mode round-trip"
 # Capture the original first: the shift block above restores what it found,
 # and this one must too.  It used to hardcode `fan auto`, so running the
 # verifier silently moved a user who had deliberately chosen "advanced" back
-# onto the firmware default — the opposite of what this script's header
+# onto the firmware default - the opposite of what this script's header
 # promises.
 orig_fan=$("$BIN" fan 2>/dev/null | head -1)
 for m in auto silent advanced; do
@@ -133,7 +133,7 @@ section "fan curve write-back (re-writing what is already there)"
 # Use --json rather than scraping the human formatting: the display layout
 # is allowed to change, the JSON contract is not.
 if [ "$curve" != "True" ]; then
-    ok "skipped — no model definition for this laptop (curve registers unknown)"
+    ok "skipped - no model definition for this laptop (curve registers unknown)"
 elif curve=$("$BIN" curve --json 2>/dev/null); then
     read -r temps speeds < <(printf '%s' "$curve" | python3 -c '
 import json,sys
@@ -160,7 +160,7 @@ for w in ("cpu", "gpu"):
     t, f, r = d.get("temp"), d.get("fan_pct"), d.get("rpm")
     print("  %s: %s°C  fan %s%%  %s RPM" % (w, t, f, r))
     # 0 RPM is a stopped fan, which is a real answer (the EC parks them at
-    # idle), not a failure — only reject values that cannot be a tach count.
+    # idle), not a failure - only reject values that cannot be a tach count.
     assert r is None or 0 <= r < 10000, "%s RPM implausible: %s" % (w, r)
 print("  RPM values plausible")
 ' && ok "RPM reads are sane" || bad "RPM check failed"
