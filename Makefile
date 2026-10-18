@@ -1,4 +1,4 @@
-# GS66 Center — convenience targets.
+# MSI Linux Control — convenience targets.
 #
 # The real work is three commands (test, smoke, verify); this file just names
 # them so nobody has to remember the QT_QPA_PLATFORM incantation.  Nothing
@@ -19,7 +19,7 @@ help:                ## Show this help
 			printf "  \033[1m%-11s\033[0m %s\n", a[1], $$2 }'
 
 test:                ## Offline suite (fake sysfs + RAM-backed EC, no root)
-	$(PY) $(TESTS)/test_gs66.py
+	$(PY) $(TESTS)/test_msi_control.py
 
 smoke:               ## Headless GUI build + screenshots (needs PySide6)
 	QT_QPA_PLATFORM=offscreen $(PY) $(TESTS)/gui_smoke.py $(SHOTS)
@@ -27,15 +27,15 @@ smoke:               ## Headless GUI build + screenshots (needs PySide6)
 shots: smoke         ## Alias for `smoke`
 
 shots-light:         ## Headless GUI build + light-theme screenshots
-	GS66_THEME=light QT_QPA_PLATFORM=offscreen $(PY) $(TESTS)/gui_smoke.py \
+	MSI_THEME=light QT_QPA_PLATFORM=offscreen $(PY) $(TESTS)/gui_smoke.py \
 		$(SHOTS)/light
 
 lint:                ## pyflakes over src/ and tests/ (if installed)
 	-$(PY) -m pyflakes $(SRC) $(TESTS)
 
 compile:             ## Byte-compile every source file
-	$(PY) -m py_compile $(SRC)/gs66_common.py $(SRC)/gs66d.py \
-		$(SRC)/gs66-center $(SRC)/gs66-gui $(TESTS)/test_gs66.py \
+	$(PY) -m py_compile $(SRC)/msi_control.py $(SRC)/msi_controld.py \
+		$(SRC)/msi-control $(SRC)/msi-control-gui $(TESTS)/test_msi_control.py \
 		$(TESTS)/gui_smoke.py
 	@bash -n install.sh uninstall.sh verify.sh
 	@echo "syntax OK"

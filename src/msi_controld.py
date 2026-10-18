@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gs66d — the privileged half of gs66-center.
+"""msi-controld — the privileged half of msi-control.
 
 Runs as root (systemd system service), owns every EC write, and speaks a
 tiny one-request-per-connection JSON protocol on a Unix socket:
@@ -11,14 +11,14 @@ tiny one-request-per-connection JSON protocol on a Unix socket:
     {"cmd":"raw","addr":242}                (read; gated by AllowRaw)
 
 Design rules:
-  * never trust a client — every value is validated by gs66_common;
+  * never trust a client — every value is validated by msi_control;
   * every EC write is followed by a read-back, because an EC that silently
     ignores a byte is indistinguishable from one that accepted it;
   * all writes are serialised under one lock (the EC is a shared resource
     the kernel's ACPI code also talks to);
   * no subprocesses, ever — only sysfs reads/writes at fixed paths.
 
-Run: gs66d [--socket PATH] [--sysfs PATH] [--config PATH] [--state PATH]
+Run: msi-controld [--socket PATH] [--sysfs PATH] [--config PATH] [--state PATH]
            [--no-restore]
 """
 
@@ -41,19 +41,19 @@ import time
 
 
 def _add_lib_path() -> str:
-    """Find gs66_common.py, whether run from the source tree or installed.
+    """Find msi_control.py, whether run from the source tree or installed.
 
-    Installed layout puts the shared module beside gs66d.py in
-    /usr/local/lib/gs66-center, so this normally just resolves to the
+    Installed layout puts the shared module beside msi_controld.py in
+    /usr/local/lib/msi-control, so this normally just resolves to the
     script's own directory; the extra candidates keep it working if the
     unit file ever changes how it invokes us.
     """
     here = os.path.dirname(os.path.realpath(__file__))
     candidates = [here,
-                  "/usr/local/lib/gs66-center",
-                  "/usr/lib/gs66-center"]
+                  "/usr/local/lib/msi-control",
+                  "/usr/lib/msi-control"]
     for c in candidates:
-        if os.path.isfile(os.path.join(c, "gs66_common.py")):
+        if os.path.isfile(os.path.join(c, "msi_control.py")):
             c = os.path.realpath(c)
             if c not in sys.path:
                 sys.path.insert(0, c)
@@ -64,10 +64,10 @@ def _add_lib_path() -> str:
 
 _add_lib_path()
 
-import gs66_common as core                                     # noqa: E402
-from gs66_common import ValidationError                        # noqa: E402
+import msi_control as core                                     # noqa: E402
+from msi_control import ValidationError                        # noqa: E402
 
-log = logging.getLogger("gs66d")
+log = logging.getLogger("msi-controld")
 
 
 class BackendError(RuntimeError):
@@ -89,7 +89,7 @@ FS_IMMUTABLE_FL = 0x00000010
 class MsiEc:
     def __init__(self, sysfs_root: str | None = None):
         if sysfs_root:
-            os.environ["GS66_SYSFS"] = sysfs_root   # keeps core.* in sync
+            os.environ["MSI_SYSFS"] = sysfs_root   # keeps core.* in sync
         self.lock = threading.Lock()
         self._bat = None
 
@@ -236,7 +236,7 @@ class MsiEc:
     # -- graphics mode (MUX) ------------------------------------------------
     #
     # Everything here writes bytes the driver's G1_3 config does not describe
-    # (see the comment on MUX_EC_ADDR in gs66_common).  The EC half is a
+    # (see the comment on MUX_EC_ADDR in msi_control).  The EC half is a
     # read-modify-write of exactly one bit, so the neighbouring bits — 0x2e
     # bit 1 is the webcam — survive untouched, and every write goes through
     # ec_write, which reads the byte back and refuses to report success unless
@@ -527,11 +527,11 @@ class Service:
     def __init__(self, args):
         self.args = args
         if args.sysfs:
-            os.environ["GS66_SYSFS"] = args.sysfs
+            os.environ["MSI_SYSFS"] = args.sysfs
         if args.config:
-            os.environ["GS66_CONFIG"] = args.config
+            os.environ["MSI_CONFIG"] = args.config
         if args.state:
-            os.environ["GS66_STATE"] = args.state
+            os.environ["MSI_STATE"] = args.state
         self.cfg = core.load_config()
         self.ec = MsiEc()
         self.profiles = Profiles(os.path.join(core.state_dir(), "profiles"))
@@ -1082,7 +1082,7 @@ def wait_for_driver(timeout: float) -> bool:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="gs66d", description=__doc__)
+    ap = argparse.ArgumentParser(prog="msi-controld", description=__doc__)
     ap.add_argument("--socket", default=None, help="socket path")
     ap.add_argument("--sysfs", default=None, help="sysfs root (testing)")
     ap.add_argument("--config", default=None, help="config path")
@@ -1099,12 +1099,12 @@ def main(argv=None) -> int:
         format="%(asctime)s %(name)s: %(message)s", stream=sys.stdout)
 
     if args.socket:
-        os.environ["GS66_SOCK"] = args.socket
+        os.environ["MSI_SOCK"] = args.socket
     path = core.sock_path()
 
     # Single instance: talk to an existing daemon before touching its socket.
     if already_running(path):
-        log.error("another gs66d is already listening on %s", path)
+        log.error("another msi-controld is already listening on %s", path)
         return 1
 
     service = Service(args)

@@ -33,11 +33,11 @@ print("=== baseline ===")
 b_t, b_d = snapshot("base")
 
 # Cooler boost ON -> every fan 100%
-os.system("gs66-center boost on >/dev/null 2>&1")
+os.system("msi-control boost on >/dev/null 2>&1")
 time.sleep(2.0)
 print("=== cooler boost ON ===")
 c_t, c_d = snapshot("boost")
-os.system("gs66-center boost off >/dev/null 2>&1")
+os.system("msi-control boost off >/dev/null 2>&1")
 time.sleep(1.5)
 
 print()

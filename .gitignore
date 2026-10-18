@@ -1,4 +1,4 @@
-# GS66 Center — ignore rules
+# MSI Linux Control — ignore rules
 #
 # The repo ships the *source* of the driver, daemon, CLI and GUI.  Anything a
 # build or a test run produces is disposable and must never be committed.

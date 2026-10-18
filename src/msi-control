@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""gs66-center — command line control for the MSI GS66 on Linux.
+"""msi-control — command line control for MSI laptops running Linux.
 
 Reads work without the daemon (plain sysfs); anything that changes a setting
-needs gs66d running as root.
+needs msi-controld running as root.
 
 Examples:
-    gs66-center status                 # full state (daemon) or degraded view
-    gs66-center mode                   # show performance mode
-    gs66-center mode sport             # eco | comfort | sport | turbo
-    gs66-center fan advanced           # auto | silent | advanced
-    gs66-center boost on               # Cooler Boost
-    gs66-center battery 80             # stop charging at 80 %
-    gs66-center curve show
-    gs66-center curve cpu --temps 55,60,65,70,78,85 --speeds 0,40,55,65,75,85,100
-    gs66-center profile list
-    gs66-center profile apply gaming
-    gs66-center profile save quiet-office
-    gs66-center graphics               # graphics mode (MUX): hybrid | discrete
-    gs66-center monitor                # live temperature / fan view
+    msi-control status                 # full state (daemon) or degraded view
+    msi-control mode                   # show performance mode
+    msi-control mode sport             # eco | comfort | sport | turbo
+    msi-control fan advanced           # auto | silent | advanced
+    msi-control boost on               # Cooler Boost
+    msi-control battery 80             # stop charging at 80 %
+    msi-control curve show
+    msi-control curve cpu --temps 55,60,65,70,78,85 --speeds 0,40,55,65,75,85,100
+    msi-control profile list
+    msi-control profile apply gaming
+    msi-control profile save quiet-office
+    msi-control graphics               # graphics mode (MUX): hybrid | discrete
+    msi-control monitor                # live temperature / fan view
 """
 
 from __future__ import annotations
@@ -30,19 +30,19 @@ import time
 
 
 def _add_lib_path() -> str:
-    """Find gs66_common.py, whether run from the source tree or installed.
+    """Find msi_control.py, whether run from the source tree or installed.
 
-    Installed layout puts the shared module in /usr/local/lib/gs66-center
+    Installed layout puts the shared module in /usr/local/lib/msi-control
     while the wrappers live in /usr/local/bin — so dirname(__file__) alone
     is not enough, and the CLI would die with ModuleNotFoundError.
     """
     here = os.path.dirname(os.path.realpath(__file__))
     candidates = [here,
-                  os.path.join(here, "..", "lib", "gs66-center"),
-                  "/usr/local/lib/gs66-center",
-                  "/usr/lib/gs66-center"]
+                  os.path.join(here, "..", "lib", "msi-control"),
+                  "/usr/local/lib/msi-control",
+                  "/usr/lib/msi-control"]
     for c in candidates:
-        if os.path.isfile(os.path.join(c, "gs66_common.py")):
+        if os.path.isfile(os.path.join(c, "msi_control.py")):
             c = os.path.realpath(c)
             if c not in sys.path:
                 sys.path.insert(0, c)
@@ -53,9 +53,9 @@ def _add_lib_path() -> str:
 
 _add_lib_path()
 
-import gs66_common as core                                     # noqa: E402
-from gs66_common import ProtocolError, ValidationError        # noqa: E402
-from gs66_common import (BAND_COOL, BAND_CRIT, BAND_HOT,      # noqa: E402
+import msi_control as core                                     # noqa: E402
+from msi_control import ProtocolError, ValidationError        # noqa: E402
+from msi_control import (BAND_COOL, BAND_CRIT, BAND_HOT,      # noqa: E402
                          BAND_WARM)
 
 
@@ -82,8 +82,8 @@ def die(msg: str, code: int = 1):
 
 
 def need_daemon_hint() -> str:
-    return ("gs66d is not running — start it with\n"
-            "    sudo systemctl start gs66-centerd\n"
+    return ("msi-controld is not running — start it with\n"
+            "    sudo systemctl start msi-controld\n"
             "(settings can only be changed by the privileged daemon)")
 
 
@@ -308,7 +308,7 @@ def cmd_curve(args):
         st = status(args)
         curve = st.get("curve")
         if not curve:
-            die("fan curve unavailable — is gs66d running with debug=1?")
+            die("fan curve unavailable — is msi-controld running with debug=1?")
         if args.json:
             print(json.dumps(curve, indent=2))
             return
@@ -399,7 +399,7 @@ def _print_graphics(g: dict) -> None:
     """
     print(bold("Graphics (MUX)"))
     if not g:
-        print(f"  {dim('unavailable — is gs66d running?')}")
+        print(f"  {dim('unavailable — is msi-controld running?')}")
         return
     if g.get("supported") is False:
         print(f"  {dim('this firmware exposes no graphics switch')}")
@@ -427,7 +427,7 @@ def _print_graphics(g: dict) -> None:
         print("  " + yellow("⚠ a reboot is required for this to take effect"))
     if g.get("enabled"):
         print(f"  {bold('switch'.ljust(11))}{green('enabled')}  "
-              + dim("gs66-center graphics hybrid|discrete"))
+              + dim("msi-control graphics hybrid|discrete"))
     else:
         print(f"  {bold('switch'.ljust(11))}{dim('disabled')}  "
               + dim(f'set "AllowMuxSwitch": true in {core.config_path()}'))
@@ -465,7 +465,7 @@ def cmd_graphics(args):
             "  A switch writes EC 0x2e and the UEFI variable MsiDCVarData and\n"
             "  only takes effect at the next reboot.  On a model whose MUX was\n"
             "  never reverse engineered it can leave the machine with no\n"
-            "  display.  Re-run as `gs66-center graphics " + args.value
+            "  display.  Re-run as `msi-control graphics " + args.value
             + " --yes`\n  once you have read the Graphics (MUX) section of "
             "README.md.")
     try:
@@ -526,7 +526,7 @@ def cmd_wait(args):
 
 def build_parser() -> argparse.ArgumentParser:
     # Global flags are accepted BOTH before and after the subcommand
-    # (`gs66-center --json status` and `gs66-center status --json`).
+    # (`msi-control --json status` and `msi-control status --json`).
     # SUPPRESS keeps a subparser from resetting a flag given on the outer
     # parser — argparse would otherwise clobber it with the default.
     common = argparse.ArgumentParser(add_help=False)
@@ -537,7 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="read sysfs locally, never talk to the daemon")
 
     ap = argparse.ArgumentParser(
-        prog="gs66-center", description="MSI GS66 control center (CLI)",
+        prog="msi-control", description="MSI Linux Control (CLI)",
         parents=[common])
     # Do NOT set_defaults() the three shared flags here.  set_defaults()
     # mutates the *action object's* .default, and these actions are shared
@@ -545,7 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
     # written onto the same --json action each subparser reuses, and the
     # subparser then planted json=False into the namespace, clobbering a
     # `--json` given before the subcommand.  The flag was silently dropped
-    # (`gs66-center --json mode sport` printed human text).  SUPPRESS leaves
+    # (`msi-control --json mode sport` printed human text).  SUPPRESS leaves
     # the attribute absent unless the user passed it; main() fills in the
     # fallbacks.  Found by trying to read JSON out of the deployed CLI.
     sub = ap.add_subparsers(dest="cmd", required=True)

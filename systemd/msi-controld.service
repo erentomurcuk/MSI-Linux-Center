@@ -1,13 +1,13 @@
 [Unit]
-Description=GS66 Center daemon (EC control: fans, performance modes, charge limit)
-Documentation=file:///usr/local/share/doc/gs66-center/README.md
+Description=MSI Linux Control daemon (EC control: fans, performance modes, charge limit)
+Documentation=file:///usr/local/share/doc/msi-control/README.md
 # The EC sysfs attributes only exist once the msi-ec driver has bound.
 Wants=systemd-modules-load.service
 After=systemd-modules-load.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/lib/gs66-center/gs66d.py
+ExecStart=/usr/bin/python3 /usr/local/lib/msi-control/msi_controld.py
 Restart=on-failure
 RestartSec=3
 
@@ -18,7 +18,7 @@ RestrictSUIDSGID=yes
 NoNewPrivileges=yes
 
 # /usr, /boot and /etc become read-only; /run stays writable for the socket
-# and /var/lib/gs66-center is created and granted by StateDirectory.
+# and /var/lib/msi-control is created and granted by StateDirectory.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -28,7 +28,7 @@ ProtectKernelTunables=no
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ReadWritePaths=/sys
-StateDirectory=gs66-center
+StateDirectory=msi-control
 
 [Install]
 WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-# APP_DETAILS — GS66 Control Center
+# APP_DETAILS — MSI Linux Control Center
 
 Everything the next session needs to know about this project, without
 re-deriving it. Companion to [`TODO.md`](TODO.md).
@@ -19,7 +19,7 @@ performance (shift) modes, Cooler Boost, live monitoring.
 | OS | Fedora 44, kernel `7.2.9-201.fc44.x86_64`, KDE Plasma 6 (Wayland) |
 | User | `eren`, uid 1000, in `wheel` |
 | Secure Boot | **disabled** (out-of-tree module requires this) |
-| Project root | `~/Projects/GS66Control` (moved from `~/gs66-center` on 2026-10-14) |
+| Project root | `~/Projects/MSIControl` (moved from `~/msi-control` on 2026-10-14) |
 
 **GUI toolkit: PySide6 6.11.2** — the user asked for PyQt6; PySide6 was
 substituted because it was already installed. The difference is licensing
@@ -34,27 +34,27 @@ Three programs, one shared module. The daemon owns *every* EC write; the CLI
 and GUI are unprivileged clients.
 
 ```
-   gs66-gui (PySide6)  ─┐
-                        ├── JSON over Unix socket ──> gs66d (root, systemd)
-   gs66-center (CLI)  ──┘                                  │
+   msi-control-gui (PySide6)  ─┐
+                        ├── JSON over Unix socket ──> msi-controld (root, systemd)
+   msi-control (CLI)  ──┘                                  │
                                                            ▼
                                     msi-ec kernel driver sysfs + debug iface
 ```
 
-* **`src/gs66d.py`** — root daemon, systemd system service `gs66-centerd`.
+* **`src/msi_controld.py`** — root daemon, systemd system service `msi-controld`.
   One JSON object per line, one request per connection. Validates every
   client value, serialises all EC access under one lock, and **verifies each
   write by reading it back**.
-* **`src/gs66-center`** — stdlib-only CLI. Reads work without the daemon
+* **`src/msi-control`** — stdlib-only CLI. Reads work without the daemon
   (plain sysfs); writes need it.
-* **`src/gs66-gui`** — PySide6 GUI, six sections. Never privileged, never
+* **`src/msi-control-gui`** — PySide6 GUI, six sections. Never privileged, never
   touches sysfs. All daemon traffic runs on one worker thread.
-* **`src/gs66_common.py`** — the EC register map, validation, protocol and
+* **`src/msi_control.py`** — the EC register map, validation, protocol and
   paths. Single source of truth so daemon/CLI/GUI can never disagree.
 
 ### Design rules (enforced, not aspirational)
 
-1. Never trust a client — everything is validated in `gs66_common`.
+1. Never trust a client — everything is validated in `msi_control`.
 2. Every EC write is followed by a read-back. An EC that silently ignores a
    byte is indistinguishable from one that accepted it.
 3. Nothing is written optimistically in the UI — the GUI re-reads state after
@@ -64,7 +64,7 @@ and GUI are unprivileged clients.
 
 ### Environment overrides (testability)
 
-`GS66_SYSFS`, `GS66_SOCK`, `GS66_CONFIG`, `GS66_STATE` — let the whole stack
+`MSI_SYSFS`, `MSI_SOCK`, `MSI_CONFIG`, `MSI_STATE` — let the whole stack
 run against a fake sysfs tree and a RAM-backed EC with no root at all.
 
 ---
@@ -130,7 +130,7 @@ spawns nothing.
 
 Reading the mode needs no privileges at all except for the EC bit:
 `/sys/firmware/efi/efivars/…` and `/sys/bus/pci/devices/*/vendor` are both
-world-readable, which is how `gs66-center status` still reports the mode with
+world-readable, which is how `msi-control status` still reports the mode with
 the daemon down. **`debug/ec_dump` is deliberately not used for this** — it is
 world-readable but costs **~120 ms per read** (the driver walks all 256
 registers), which is far too much for a 1.5 s UI poll.
@@ -154,11 +154,11 @@ when the module is loaded with `debug=1` (install.sh sets this in
 
 | Installed path | Source |
 |---|---|
-| `/usr/local/lib/gs66-center/` | `gs66_common.py`, `gs66d.py` |
-| `/usr/local/bin/gs66-center` | `src/gs66-center` |
-| `/usr/local/bin/gs66-gui` | `src/gs66-gui` |
-| `/etc/gs66-center/config.json` | created by install.sh if absent |
-| `/var/lib/gs66-center/` | state: `last.json`, `profiles/*.json` |
+| `/usr/local/lib/msi-control/` | `msi_control.py`, `msi_controld.py` |
+| `/usr/local/bin/msi-control` | `src/msi-control` |
+| `/usr/local/bin/msi-control-gui` | `src/msi-control-gui` |
+| `/etc/msi-control/config.json` | created by install.sh if absent |
+| `/var/lib/msi-control/` | state: `last.json`, `profiles/*.json` |
 | `/usr/src/msi-ec-0.13/` | DKMS source (driver v0.13) |
 
 * **The kernel driver is out-of-tree `teackot/msi-ec` v0.13 via DKMS**, not
@@ -172,9 +172,9 @@ when the module is loaded with `debug=1` (install.sh sets this in
 
 All three programs open with the same helper: the wrappers live in
 `/usr/local/bin` while the shared module lives in
-`/usr/local/lib/gs66-center`, so `dirname(__file__)` alone is not enough.
+`/usr/local/lib/msi-control`, so `dirname(__file__)` alone is not enough.
 Without it the installed CLI/GUI dies with `ModuleNotFoundError:
-gs66_common`. It searches the script dir, `../lib/gs66-center`, then the two
+msi_control`. It searches the script dir, `../lib/msi-control`, then the two
 absolute candidates.
 
 ---
@@ -200,19 +200,19 @@ One JSON object per line, one request per connection.
 
 Response is always `{"ok":true,"data":{…}}` or `{"ok":false,"error":"…"}`.
 
-Socket is `/run/gs66-centerd.sock`, mode `0660`, owner `root:<SocketGroup>`
+Socket is `/run/msi-controld.sock`, mode `0660`, owner `root:<SocketGroup>`
 (default `wheel`) — so socket access grants nothing its holder could not
 already get.
 
 ---
 
-## 6. Config — `/etc/gs66-center/config.json`
+## 6. Config — `/etc/msi-control/config.json`
 
 | Key | Default | Meaning |
 |---|---|---|
 | `RestoreLast` | `true` | re-apply last known state at daemon start (boot) |
 | `DefaultProfile` | `null` | explicit profile at boot; wins over `RestoreLast` |
-| `AllowRaw` | `false` | expose `gs66-center raw` — an unvalidated EC byte is the one way this program can hurt you |
+| `AllowRaw` | `false` | expose `msi-control raw` — an unvalidated EC byte is the one way this program can hurt you |
 | `AllowMuxSwitch` | `false` | allow the graphics-mode (MUX) switch | 
 | `SocketGroup` | `wheel` | group allowed to talk to the socket |
 | `ReapplyOnResume` | `true` | re-apply after S3, which sometimes resets the EC |
@@ -291,7 +291,7 @@ Status   transient actions (left) · daemon + firmware (right, permanent)
 ### Themes
 
 **One token set per theme**, and every widget colour is read from it. The theme
-is chosen by `GS66_THEME=light|dark`, else `styleHints().colorScheme()`, else
+is chosen by `MSI_THEME=light|dark`, else `styleHints().colorScheme()`, else
 **dark** when the platform reports *Unknown* (which is what an offscreen run
 reports — so a headless screenshot is deterministic). `apply_theme(app)` is
 called from both `MainWindow.__init__` and `main()`; the smoke test never calls
@@ -397,7 +397,7 @@ the unchecked one and these are read at a glance from a laptop screen at an
 angle.
 
 The status bar carries the daemon readout **permanently**, on the right
-(`gs66-centerd · fw 16V1EMS1.118`, or `offline — read-only (…)` in red). It
+(`msi-controld · fw 16V1EMS1.118`, or `offline — read-only (…)` in red). It
 used to be pushed as a transient message on every poll — and the poll is 1.5 s
 — so an action's confirmation was wiped off the bar within a second and a half
 of appearing.
@@ -433,26 +433,26 @@ both had a live-write bug:
 
 ## 9. Tests
 
-**`tests/test_gs66.py` — 114 tests, offline, unprivileged, ~6 s.**
+**`tests/test_msi_control.py` — 114 tests, offline, unprivileged, ~6 s.**
 
 Runs the *real* daemon (Service + Unix socket server + protocol), the real
 validation and the real CLI as a subprocess, against a fake sysfs tree and a
 RAM-backed EC (`FakeEc`). `MsiEc._xfer_read/_xfer_write` are monkeypatched.
 
 ```bash
-python3 tests/test_gs66.py
+python3 tests/test_msi_control.py
 ```
 
 **`tests/gui_smoke.py`** — headless GUI construction + one PNG per section:
 
 ```bash
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py   # -> tests/shots/
-GS66_THEME=light QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py "$PWD/tests/shots/light"
+MSI_THEME=light QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py "$PWD/tests/shots/light"
 ```
 
 > Pass an **absolute** outdir for the light run. A relative one makes Qt ignore
 > the redirected `XDG_CONFIG_HOME`, and the run then writes the developer's
-> real `~/.config/gs66-center/gs66-center.conf`.
+> real `~/.config/msi-control/msi-control.conf`.
 
 Beyond rendering, it drives behaviour a screenshot cannot show: contrast
 ratios, the battery's pending-vs-applied state machine, keyboard access to the
@@ -465,7 +465,7 @@ It also pins the things that are invisible by construction:
 | Check | What it would otherwise allow |
 |---|---|
 | `check_theme_tokens` | a theme that silently lost a token (the stylesheet interpolates an empty string, so a widget just loses its border) or an accent whose ink fails AA |
-| `check_brand_mark` | `icons/gs66-center.svg` drifting from the mark the GUI paints — measured, by rasterising both and comparing the ink boxes. Also pins that the corners are still transparent (the tile has not crept back) and that the tray's `9` / `62` / `100` fit inside the badge |
+| `check_brand_mark` | `icons/msi-control.svg` drifting from the mark the GUI paints — measured, by rasterising both and comparing the ink boxes. Also pins that the corners are still transparent (the tile has not crept back) and that the tray's `9` / `62` / `100` fit inside the badge |
 | `check_glyphs` | a typo in `Sidebar.ITEMS`: `glyph_pixmap` falls through its if-chain and returns a transparent pixmap, so the sidebar shows a label with a hole beside it |
 | `check_nav_matches_tabs` | a section with no nav entry (unreachable) or a nav entry with no section (a dead click) |
 | `check_type_scale` | the five dashboard tiles disagreeing about `TYPE_DISPLAY`, or a card caption that is not `TYPE_CAPTION` bold |
@@ -483,7 +483,7 @@ Add tests for anything new here; they run in seconds and cost nothing.
 ## 10. Hardware gotchas (real ones, already paid for)
 
 1. **`pkexec` sanitises `PATH` and drops `/usr/local/bin`** — any script run
-   via pkexec that shells out to `gs66-center` dies with `FileNotFoundError`.
+   via pkexec that shells out to `msi-control` dies with `FileNotFoundError`.
    Use: `pkexec env PATH=/usr/local/bin:/usr/bin:/bin python3 …`
 2. **`pkexec` needs an absolute path.** A relative `$0` fails; resolve with
    `SELF="$(readlink -f "${BASH_SOURCE[0]}")"`.
@@ -502,14 +502,14 @@ Add tests for anything new here; they run in seconds and cost nothing.
    in registers (`0x68`/`0x80` for temps, `0x71`/`0x89` for fan duty,
    `0xcc`/`0xca` for tachometers); anything that shells out to a monitoring
    daemon adds its own refresh lag on top. That is why the CLI and GUI pull
-   from `gs66d`.
+   from `msi-controld`.
 8. **Cooler Boost does not update the duty registers.** Measured 2026-10-16:
    with boost on, `0x71`/`0x89` stayed at `70` while the tachometers read
    **~8100 RPM**. So `fan_pct` is "the curve's request", not "what the fan is
    doing", and a UI that shows fan % alone will under-report a boosted machine
    — which is why the dashboard shows **RPM** next to it. Do not "fix" the
    duty read; it is not wrong, it is a different fact.
-9. **`0xc8` is not a fan.** It was suspected to be the GS66's third fan
+9. **`0xc8` is not a fan.** It was suspected to be the MSI's third fan
    (LibreHardwareMonitor reports 3 on this model). It is not: under Cooler
    Boost `0xca`/`0xcc` jump from ~3700 to ~8100 while `0xc8` sits at ~1900.
    `msi-ec`'s `CONF_G1_3` maps exactly two fans (`cpu` 0x71, `gpu` 0x89) and
@@ -525,16 +525,16 @@ Add tests for anything new here; they run in seconds and cost nothing.
 ## 11. Project layout
 
 ```
-GS66Control/
-├── src/            gs66_common.py · gs66d.py · gs66-center · gs66-gui
-├── tests/          test_gs66.py · gui_smoke.py · shots/ (dark + light/)
+MSIControl/
+├── src/            msi_control.py · msi_controld.py · msi-control · msi-control-gui
+├── tests/          test_msi_control.py · gui_smoke.py · shots/ (dark + light/)
 ├── tools/          hardware probes (need root) — see TODO §third-fan
 │                   ecdump.py · ecprobe.py · fanprobe.py · scan_ec.py
 │                   fixup.sh · recapture.sh
-├── systemd/        gs66-centerd.service · gs66-center-sleep
+├── systemd/        msi-controld.service · msi-control-sleep
 ├── modprobe/       msi-ec.conf
-├── desktop/        gs66-center.desktop
-├── icons/          gs66-center.svg — the red shield mark, drawn for the
+├── desktop/        msi-control.desktop
+├── icons/          msi-control.svg — the red shield mark, drawn for the
 │                   installed icon and mirrored by brand_pixmap()/MARK_BOX
 ├── etc/            config.json (the default install.sh copies in)
 ├── third_party/    msi-ec/   vendored teackot driver v0.13
@@ -556,7 +556,7 @@ GS66Control/
 
 * **Back up before changing** anything on the device — Tier B style copies
   into the project or `~/backup-pre-upgrade-*/`.
-* **Run the test suite after every change.** `python3 tests/test_gs66.py`.
+* **Run the test suite after every change.** `python3 tests/test_msi_control.py`.
 * **`verify.sh` must report ALL CHECKS PASSED** before a change counts as
   done on real hardware.
 * **Report the PySide6 substitution** in the final summary — the user asked

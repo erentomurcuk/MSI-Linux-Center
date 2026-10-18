@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Offline test suite for gs66-center.
+"""Offline test suite for msi-control.
 
 Runs entirely unprivileged against a fake sysfs tree and a RAM-backed EC,
 so it exercises the real daemon (Service + Unix socket server + protocol),
 the real validation code and the real CLI — without touching hardware.
 
-    python3 tests/test_gs66.py
+    python3 tests/test_msi_control.py
 """
 
 from __future__ import annotations
@@ -29,16 +29,16 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")
 sys.path.insert(0, SRC)
 
-import gs66_common as core                      # noqa: E402
-import gs66d                                    # noqa: E402
-from gs66d import MsiEc, Service, Server, Handler  # noqa: E402
-from gs66_common import ValidationError         # noqa: E402
+import msi_control as core                      # noqa: E402
+import msi_controld                                    # noqa: E402
+from msi_controld import MsiEc, Service, Server, Handler  # noqa: E402
+from msi_control import ValidationError         # noqa: E402
 
 # --------------------------------------------------------------------------
 # fake hardware
 # --------------------------------------------------------------------------
 
-# A plausible GS66 EC image: isw's documented GS66 fan curve.
+# A plausible MSI EC image: isw's documented MSI fan curve.
 FAKE_EC_INIT = {}
 for i, v in enumerate([58, 63, 68, 73, 78, 83]):            # cpu temps 0x6a
     FAKE_EC_INIT[0x6A + i] = v
@@ -50,7 +50,7 @@ for i, v in enumerate([0, 55, 65, 70, 80, 85, 90]):         # gpu speeds 0x8a
     FAKE_EC_INIT[0x8A + i] = v
 # tachometer periods: cpu 0xcc/0xcd = 0x012c (300), gpu 0xca/0xcb = 0x00fa (250)
 FAKE_EC_INIT.update({0xCC: 0x01, 0xCD: 0x2C, 0xCA: 0x00, 0xCB: 0xFA})
-# EC graphics state bit: 0x40 set = discrete, matching the real GS66 10SE.
+# EC graphics state bit: 0x40 set = discrete, matching the real MSI 10SE.
 FAKE_EC_INIT.update({core.MUX_EC_ADDR: core.MUX_EC_MASK, core.MUX_TRIGGER_ADDR: 0x00})
 
 
@@ -93,7 +93,7 @@ def build_fake_sysfs(root: str):
 
     # efivarfs + PCI: the two world-readable sources of the graphics mode.
     # One NVIDIA display controller and no Intel one, which is what the real
-    # GS66 10SE looks like in discrete mode; tests that need the other answer
+    # MSI 10SE looks like in discrete mode; tests that need the other answer
     # add an Intel device themselves.
     efivars = os.path.join(root, "firmware", "efi", "efivars")
     os.makedirs(efivars, exist_ok=True)
@@ -117,7 +117,7 @@ def add_fake_igpu(root: str):
 
 def no_ec_access(addr):
     """What ec_read does when the msi-ec debug interface is not there."""
-    raise gs66d.BackendError("no EC debug interface")
+    raise msi_controld.BackendError("no EC debug interface")
 
 
 class FakeEc:
@@ -140,23 +140,23 @@ class FakeEc:
 # base fixture: fake sysfs + fake EC + live daemon in-process
 # --------------------------------------------------------------------------
 
-ENV_VARS = ("GS66_SYSFS", "GS66_SOCK", "GS66_CONFIG", "GS66_STATE")
+ENV_VARS = ("MSI_SYSFS", "MSI_SOCK", "MSI_CONFIG", "MSI_STATE")
 
 
 class DaemonTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="gs66-test-")
+        self.tmp = tempfile.mkdtemp(prefix="msi-test-")
         self.sysfs = os.path.join(self.tmp, "sys")
-        self.sock = os.path.join(self.tmp, "gs66.sock")
+        self.sock = os.path.join(self.tmp, "msi.sock")
         self.cfg = os.path.join(self.tmp, "config.json")
         self.state = os.path.join(self.tmp, "state")
         build_fake_sysfs(self.sysfs)
 
         self._env = {k: os.environ.get(k) for k in ENV_VARS}
-        os.environ["GS66_SYSFS"] = self.sysfs
-        os.environ["GS66_SOCK"] = self.sock
-        os.environ["GS66_CONFIG"] = self.cfg
-        os.environ["GS66_STATE"] = self.state
+        os.environ["MSI_SYSFS"] = self.sysfs
+        os.environ["MSI_SOCK"] = self.sock
+        os.environ["MSI_CONFIG"] = self.cfg
+        os.environ["MSI_STATE"] = self.state
 
         self.ec = FakeEc()
         self._orig = (MsiEc._xfer_read, MsiEc._xfer_write)
@@ -198,10 +198,10 @@ class DaemonTest(unittest.TestCase):
         return core.call(cmd)
 
     def run_cli(self, *argv, expect_rc=0):
-        """Drive the real `gs66-center` against this fixture."""
+        """Drive the real `msi-control` against this fixture."""
         env = dict(os.environ)
         proc = subprocess.run(
-            [sys.executable, os.path.join(SRC, "gs66-center"), *argv],
+            [sys.executable, os.path.join(SRC, "msi-control"), *argv],
             capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(proc.returncode, expect_rc,
                          f"cli {argv} rc={proc.returncode}\n"
@@ -432,7 +432,7 @@ class TestSettings(DaemonTest):
 
 
 class TestDiffHelpers(unittest.TestCase):
-    """Pure-function coverage for the sentence builders in gs66_common."""
+    """Pure-function coverage for the sentence builders in msi_control."""
 
     def test_describe_change(self):
         self.assertEqual(core.describe_change("shift", "eco", "sport"),
@@ -866,7 +866,7 @@ class TestCli(DaemonTest):
         self.assertEqual(st["shift"]["current"], "comfort")
         # and a write must fail with a helpful hint
         proc = self.run_cli("mode", "eco", expect_rc=1)
-        self.assertIn("gs66d", proc.stderr)
+        self.assertIn("msi-controld", proc.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -1103,7 +1103,7 @@ class TestGraphicsWrite(DaemonTest):
         self.assertIn("reboot", out["activity"])
 
     def test_revert_without_a_backup_is_an_error_not_a_shrug(self):
-        with self.assertRaises(gs66d.BackendError) as ctx:
+        with self.assertRaises(msi_controld.BackendError) as ctx:
             self.svc.handle({"cmd": "graphics", "action": "revert"})
         self.assertIn("backup", str(ctx.exception))
 
@@ -1113,7 +1113,7 @@ class TestGraphicsWrite(DaemonTest):
         path = os.path.join(self.state, "mux-backup.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"requested": "hybrid", "var": "not hex"}, fh)
-        with self.assertRaises(gs66d.BackendError):
+        with self.assertRaises(msi_controld.BackendError):
             self.svc.handle({"cmd": "graphics", "action": "revert"})
 
     def test_switching_to_the_mode_you_are_already_in_is_a_no_op(self):
@@ -1143,7 +1143,7 @@ class TestGraphicsWrite(DaemonTest):
         os.remove(core.mux_var_path())
         MsiEc._xfer_read = lambda _s, addr: no_ec_access(addr)
         svc = self.make_service(config={"AllowMuxSwitch": True})
-        with self.assertRaises(gs66d.BackendError) as ctx:
+        with self.assertRaises(msi_controld.BackendError) as ctx:
             svc.handle({"cmd": "graphics", "action": "set",
                         "mode": core.MUX_HYBRID})
         self.assertIn("not available", str(ctx.exception))
@@ -1152,7 +1152,7 @@ class TestGraphicsWrite(DaemonTest):
         with open(core.mux_var_path(), "wb") as fh:
             fh.write(b"\x07\x00\x00\x00\x01")
         svc = self.make_service(config={"AllowMuxSwitch": True})
-        with self.assertRaises(gs66d.BackendError) as ctx:
+        with self.assertRaises(msi_controld.BackendError) as ctx:
             svc.handle({"cmd": "graphics", "action": "set",
                         "mode": core.MUX_HYBRID})
         self.assertIn("too short", str(ctx.exception))
@@ -1162,7 +1162,7 @@ class TestEfivarWrite(unittest.TestCase):
     """The efivarfs write itself: one syscall, flag off, flag back on."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="gs66-efi-")
+        self.tmp = tempfile.mkdtemp(prefix="msi-efi-")
         self.path = os.path.join(self.tmp, "MsiDCVarData")
         with open(self.path, "wb") as fh:
             fh.write(b"\x07\x00\x00\x00" + bytes([0x01, 0x01]) + bytes(20))
@@ -1172,10 +1172,10 @@ class TestEfivarWrite(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def fake_ioctl(self, fd, req, arg=b"\x00\x00\x00\x00"):
-        if req == gs66d.FS_IOC_GETFLAGS:
+        if req == msi_controld.FS_IOC_GETFLAGS:
             self.calls.append(("get", struct.unpack("I", arg)[0]))
-            return struct.pack("I", gs66d.FS_IMMUTABLE_FL)
-        if req == gs66d.FS_IOC_SETFLAGS:
+            return struct.pack("I", msi_controld.FS_IMMUTABLE_FL)
+        if req == msi_controld.FS_IOC_SETFLAGS:
             flags = struct.unpack("I", arg)[0]
             self.calls.append(("set", flags))
             return 0
@@ -1183,41 +1183,41 @@ class TestEfivarWrite(unittest.TestCase):
 
     def test_immutable_is_cleared_around_the_write_and_restored(self):
         payload = b"\x07\x00\x00\x00" + bytes([0x01, 0x00]) + bytes(20)
-        with mock.patch.object(gs66d.fcntl, "ioctl",
+        with mock.patch.object(msi_controld.fcntl, "ioctl",
                                side_effect=self.fake_ioctl):
             MsiEc._efivar_write(self.path, payload)
         self.assertEqual([c[0] for c in self.calls], ["get", "set", "set"])
-        self.assertFalse(self.calls[1][1] & gs66d.FS_IMMUTABLE_FL)
-        self.assertTrue(self.calls[2][1] & gs66d.FS_IMMUTABLE_FL)
+        self.assertFalse(self.calls[1][1] & msi_controld.FS_IMMUTABLE_FL)
+        self.assertTrue(self.calls[2][1] & msi_controld.FS_IMMUTABLE_FL)
         with open(self.path, "rb") as fh:
             self.assertEqual(fh.read(), payload)
 
     def test_flag_goes_back_on_even_when_the_write_fails(self):
-        with mock.patch.object(gs66d.fcntl, "ioctl",
+        with mock.patch.object(msi_controld.fcntl, "ioctl",
                                side_effect=self.fake_ioctl), \
-             mock.patch.object(gs66d.os, "write",
+             mock.patch.object(msi_controld.os, "write",
                                side_effect=OSError(errno.EIO, "no")), \
-             self.assertRaises(gs66d.BackendError):
+             self.assertRaises(msi_controld.BackendError):
             MsiEc._efivar_write(self.path, b"x")
         # A variable left permanently mutable is worse than a failed switch.
         self.assertEqual([c[0] for c in self.calls], ["get", "set", "set"])
-        self.assertTrue(self.calls[2][1] & gs66d.FS_IMMUTABLE_FL)
+        self.assertTrue(self.calls[2][1] & msi_controld.FS_IMMUTABLE_FL)
 
     def test_a_filesystem_without_inode_flags_still_writes(self):
         def enotty(fd, req, arg=b""):
             raise OSError(errno.ENOTTY, "not a tty")
 
         payload = b"\x07\x00\x00\x00" + bytes([0x01, 0x00]) + bytes(20)
-        with mock.patch.object(gs66d.fcntl, "ioctl", side_effect=enotty):
+        with mock.patch.object(msi_controld.fcntl, "ioctl", side_effect=enotty):
             MsiEc._efivar_write(self.path, payload)
         with open(self.path, "rb") as fh:
             self.assertEqual(fh.read(), payload)
 
     def test_a_short_write_is_an_error_not_a_success(self):
-        with mock.patch.object(gs66d.fcntl, "ioctl",
+        with mock.patch.object(msi_controld.fcntl, "ioctl",
                                side_effect=self.fake_ioctl), \
-             mock.patch.object(gs66d.os, "write", return_value=3), \
-             self.assertRaises(gs66d.BackendError) as ctx:
+             mock.patch.object(msi_controld.os, "write", return_value=3), \
+             self.assertRaises(msi_controld.BackendError) as ctx:
             MsiEc._efivar_write(self.path, b"0123456789")
         self.assertIn("short write", str(ctx.exception))
 
@@ -1260,21 +1260,21 @@ class TestGraphicsCli(DaemonTest):
 
 class TestDaemonProcess(unittest.TestCase):
     def test_start_ping_stop(self):
-        tmp = tempfile.mkdtemp(prefix="gs66-proc-")
-        old = {k: os.environ.get(k) for k in ("GS66_SOCK", "GS66_CONFIG",
-                                              "GS66_STATE")}
+        tmp = tempfile.mkdtemp(prefix="msi-proc-")
+        old = {k: os.environ.get(k) for k in ("MSI_SOCK", "MSI_CONFIG",
+                                              "MSI_STATE")}
         try:
             sysfs = os.path.join(tmp, "sys")
             sock = os.path.join(tmp, "d.sock")
             build_fake_sysfs(sysfs)
             env = dict(os.environ)
-            env.update({"GS66_SYSFS": sysfs, "GS66_SOCK": sock,
-                        "GS66_CONFIG": os.path.join(tmp, "cfg.json"),
-                        "GS66_STATE": os.path.join(tmp, "state")})
+            env.update({"MSI_SYSFS": sysfs, "MSI_SOCK": sock,
+                        "MSI_CONFIG": os.path.join(tmp, "cfg.json"),
+                        "MSI_STATE": os.path.join(tmp, "state")})
             # the *parent* must look at the same socket as the child
-            os.environ["GS66_SOCK"] = sock
+            os.environ["MSI_SOCK"] = sock
             proc = subprocess.Popen(
-                [sys.executable, os.path.join(SRC, "gs66d.py"),
+                [sys.executable, os.path.join(SRC, "msi_controld.py"),
                  "--no-restore", "--wait", "2", "-v"],
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True)

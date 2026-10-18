@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gs66-center — shared core: EC register map, paths, protocol, validation.
+"""msi-control — shared core: EC register map, paths, protocol, validation.
 
 Everything userspace knows about the MSI GS66 10SE embedded controller lives
 here, in one place, so the daemon, the CLI and the GUI can never disagree
@@ -31,19 +31,19 @@ import socket
 # --------------------------------------------------------------------------
 
 def sysfs_root() -> str:
-    return os.environ.get("GS66_SYSFS", "/sys")
+    return os.environ.get("MSI_SYSFS", "/sys")
 
 
 def sock_path() -> str:
-    return os.environ.get("GS66_SOCK", "/run/gs66-centerd.sock")
+    return os.environ.get("MSI_SOCK", "/run/msi-controld.sock")
 
 
 def config_path() -> str:
-    return os.environ.get("GS66_CONFIG", "/etc/gs66-center/config.json")
+    return os.environ.get("MSI_CONFIG", "/etc/msi-control/config.json")
 
 
 def state_dir() -> str:
-    return os.environ.get("GS66_STATE", "/var/lib/gs66-center")
+    return os.environ.get("MSI_STATE", "/var/lib/msi-control")
 
 
 def msi_ec_dir() -> str:
@@ -99,7 +99,7 @@ N_SPEEDS = 7
 # ⚠️ 0x2e bit 6, 0xd1 and that one UEFI byte are the *only* addresses outside
 # the documented setting map this program will ever write, and a graphics
 # switch is the only setting here that cannot be taken back without a reboot.
-# Everything else stays behind AllowRaw.  See gs66d.Service.set_graphics().
+# Everything else stays behind AllowRaw.  See msi_controld.Service.set_graphics().
 MUX_EC_ADDR = 0x2E
 MUX_EC_MASK = 0x40             # bit 6: 1 = discrete, 0 = hybrid
 MUX_TRIGGER_ADDR = 0xD1
@@ -274,7 +274,7 @@ SPEED_MIN, SPEED_MAX = 0, 100
 
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
-# Built-in profiles.  Curves are sane defaults derived from isw's GS66
+# Built-in profiles.  Curves are sane defaults derived from isw's MSI
 # section; "factory" is not here — it is captured from the EC on first run
 # so the original firmware curve can always be restored.
 #
@@ -324,7 +324,7 @@ DEFAULT_CONFIG = {
     "RestoreLast": True,
     # Explicit profile to apply at boot; wins over RestoreLast when set.
     "DefaultProfile": None,
-    # Expose the raw EC peek/poke (`gs66-center raw`).  Off by default:
+    # Expose the raw EC peek/poke (`msi-control raw`).  Off by default:
     # an unvalidated EC byte is the one way this program can hurt you.
     "AllowRaw": False,
     # Allow the graphics-mode (MUX) switch.  Off by default for a different
@@ -431,7 +431,7 @@ class ProtocolError(RuntimeError):
 
 
 def send_cmd(cmd: dict, timeout: float = 5.0) -> dict:
-    """Talk to gs66d.  Returns the response dict; raises on transport error."""
+    """Talk to msi-controld.  Returns the response dict; raises on transport error."""
     payload = (json.dumps(cmd) + "\n").encode("utf-8")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)

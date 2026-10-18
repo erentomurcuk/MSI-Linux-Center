@@ -1,4 +1,4 @@
-# Contributing to GS66 Center
+# Contributing to MSI Linux Control
 
 Thanks for looking. This is a small, opinionated project that controls real
 hardware, so the bar is *"prove it"*, not *"it compiles"*. Everything below
@@ -16,9 +16,9 @@ only the *how to work here*; that one is the *what is here*.
 **The daemon owns every EC write, and every write is read back.**
 
 Nothing in this project may write to the embedded controller except
-`gs66d.py`, through the validated path. If you are tempted to poke a byte from
+`msi_controld.py`, through the validated path. If you are tempted to poke a byte from
 the GUI, the CLI, a script, or a test, stop — that is the one way this program
-can hard-crash the machine. New registers, if any, go in `gs66_common.py`'s
+can hard-crash the machine. New registers, if any, go in `msi_control.py`'s
 map and are written through the daemon like everything else.
 
 Read-modify-write **one bit at a time** for any register you share with another
@@ -32,7 +32,7 @@ webcam, and a whole-byte poke would drag the webcam along with it.
 No build step. The three programs are Python and are run from the checkout:
 
 ```bash
-python3 tests/test_gs66.py                              # daemon + CLI, offline
+python3 tests/test_msi_control.py                              # daemon + CLI, offline
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py    # GUI, headless
 ```
 
@@ -45,7 +45,7 @@ make smoke        # GUI build + one screenshot per tab
 make verify       # live hardware checks — root, safe and reversible
 ```
 
-`tests/test_gs66.py` needs **no root and no hardware**: it builds a fake sysfs
+`tests/test_msi_control.py` needs **no root and no hardware**: it builds a fake sysfs
 tree and a RAM-backed EC and runs the *real* daemon over the *real* socket.
 `gui_smoke.py` needs PySide6 and a Qt platform plugin (`offscreen` is enough).
 
@@ -69,7 +69,7 @@ tree and a RAM-backed EC and runs the *real* daemon over the *real* socket.
 
 ## Tests
 
-`tests/test_gs66.py` is not a formality — it is where the ugly cases live, and
+`tests/test_msi_control.py` is not a formality — it is where the ugly cases live, and
 they are all there because one of them shipped:
 
 * an EC byte that **refuses to be written** (read-back must catch it);
@@ -96,7 +96,7 @@ Both the test suite and the smoke test take the same view: a test must
 **never touch the user's real config**. `gui_smoke.py` redirects
 `XDG_CONFIG_HOME` into the shots directory before anything constructs a
 `QSettings`, and drops any stale file first. Do not remove that — without it a
-test run rewrites `~/.config/gs66-center/gs66-center.conf` and opens the
+test run rewrites `~/.config/msi-control/msi-control.conf` and opens the
 developer's next real window on whatever tab the test ended on.
 
 ---
@@ -113,7 +113,7 @@ developer's next real window on whatever tab the test ended on.
   the kind of thing that saves the next reader an hour.
 * Keep the runbook voice: plain sentences, real numbers, and the measurement
   written next to the conclusion so the next person can re-check it.
-* Paths and constants are imported from `gs66_common.py`, never re-typed. If
+* Paths and constants are imported from `msi_control.py`, never re-typed. If
   the CLI and the GUI disagree about what "warm" means, they are both reading
   the same helper — that is the point.
 

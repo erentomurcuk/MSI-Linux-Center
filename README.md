@@ -1,4 +1,4 @@
-# GS66 Center
+# MSI Linux Control
 
 A Linux control centre for the **MSI GS66 Stealth 10SE** — the things MSI's
 Dragon Center does on Windows, on Fedora/KDE, without Dragon Center:
@@ -19,14 +19,14 @@ Dragon Center does on Windows, on Fedora/KDE, without Dragon Center:
 Three pieces, deliberately separate:
 
 ```
-gs66-gui  ──┐
-gs66-center ─┼──► Unix socket ──► gs66d (root) ──► /sys/.../msi-ec + BAT*
+msi-control-gui  ──┐
+msi-control ─┼──► Unix socket ──► msi-controld (root) ──► /sys/.../msi-ec + BAT*
             ┘        JSON             ▲
                                  msi-ec kernel driver
                                  (out-of-tree, debug=1)
 ```
 
-Only **`gs66d`** runs as root and only it writes to the EC. The GUI and the
+Only **`msi-controld`** runs as root and only it writes to the EC. The GUI and the
 CLI are unprivileged clients. Every value they send is validated, every EC
 write is read back, and with the daemon down the GUI degrades to read-only
 rather than lying to you.
@@ -131,8 +131,8 @@ Prerequisites, all checked before anything is written:
 What it does: builds and installs the driver via DKMS, writes
 `/etc/modprobe.d/msi-ec.conf` (`options msi-ec debug=1`) and a
 `modules-load.d` entry, copies the daemon/CLI/GUI to `/usr/local`, writes a
-default `/etc/gs66-center/config.json` (only if none exists), enables the
-`gs66-centerd` systemd service, and installs a resume hook so settings
+default `/etc/msi-control/config.json` (only if none exists), enables the
+`msi-controld` systemd service, and installs a resume hook so settings
 survive suspend.
 
 `uninstall.sh` reverses all of it; `--purge` also removes your profiles and
@@ -141,9 +141,9 @@ config.
 ### Verify
 
 ```bash
-gs66-center status            # everything, from the daemon
+msi-control status            # everything, from the daemon
 ls /sys/devices/platform/msi-ec/debug   # present ⇒ RPM + curves available
-systemctl status gs66-centerd
+systemctl status msi-controld
 ```
 
 ---
@@ -151,23 +151,23 @@ systemctl status gs66-centerd
 ## Use
 
 ```bash
-gs66-center status                       # full state
-gs66-center monitor                      # live view
-gs66-center mode sport                   # eco|comfort|sport|turbo
-gs66-center fan advanced                 # auto|silent|advanced
-gs66-center boost on                     # Cooler Boost
-gs66-center battery 80                   # stop charging at 80%
-gs66-center curve                        # show both curves
-gs66-center curve cpu --temps 58,63,68,73,78,83 --speeds 0,50,60,65,70,80,85
-gs66-center profile list
-gs66-center profile save quiet-office
-gs66-center profile apply gaming
-gs66-center graphics                      # graphics mode (MUX): hybrid | discrete
-gs66-center graphics discrete --yes       # switch it (reboot to apply)
-gs66-center reapply                      # push persisted state back into the EC
+msi-control status                       # full state
+msi-control monitor                      # live view
+msi-control mode sport                   # eco|comfort|sport|turbo
+msi-control fan advanced                 # auto|silent|advanced
+msi-control boost on                     # Cooler Boost
+msi-control battery 80                   # stop charging at 80%
+msi-control curve                        # show both curves
+msi-control curve cpu --temps 58,63,68,73,78,83 --speeds 0,50,60,65,70,80,85
+msi-control profile list
+msi-control profile save quiet-office
+msi-control profile apply gaming
+msi-control graphics                      # graphics mode (MUX): hybrid | discrete
+msi-control graphics discrete --yes       # switch it (reboot to apply)
+msi-control reapply                      # push persisted state back into the EC
 ```
 
-…or run `gs66-gui` (also in your application menu as **GS66 Center**). It has
+…or run `msi-control-gui` (also in your application menu as **MSI Linux Control**). It has
 six sections, reached from a sidebar: Dashboard, Performance, Fans, Battery,
 Profiles, Settings. The window, the menu entry and the tray all carry the same
 mark — a centred red shield, and nothing else: it is built to be read at the
@@ -189,7 +189,7 @@ tabs — so the window reads as one system at any size:
   and not a temperature, wears the accent instead. The offline banner and the
   offline pill share one red, because they describe one condition.
 * **Light and dark themes from one token set each.** The theme follows your
-  desktop's colour scheme; set `GS66_THEME=light` or `GS66_THEME=dark` to force
+  desktop's colour scheme; set `MSI_THEME=light` or `MSI_THEME=dark` to force
   one. Every colour in the app comes from that set, so a theme change cannot
   leave a hardcoded grey stranded on a white background — and the *contrast*
   between text and its background is asserted in the test suite (the amber
@@ -247,7 +247,7 @@ profile has no business moving it — previously all three carried
 picked. The rule is uniform: **a profile that does not mention a charge limit
 does not touch one.**
 
-### Config — `/etc/gs66-center/config.json`
+### Config — `/etc/msi-control/config.json`
 
 The default is the repo's [`etc/config.json`](etc/config.json); `install.sh`
 copies it in on first install and never overwrites an existing one.
@@ -256,7 +256,7 @@ copies it in on first install and never overwrites an existing one.
 {
   "RestoreLast": true,        // re-apply last state at boot
   "DefaultProfile": null,     // apply this profile at boot instead (wins over RestoreLast)
-  "AllowRaw": false,          // expose the raw EC peek/poke (`gs66-center raw`)
+  "AllowRaw": false,          // expose the raw EC peek/poke (`msi-control raw`)
   "AllowMuxSwitch": false,    // allow the graphics-mode (MUX) switch
   "SocketGroup": "wheel",     // who may talk to the daemon
   "ReapplyOnResume": true     // re-apply after suspend
@@ -279,9 +279,9 @@ A laptop with two GPUs has to pick which one drives the built-in panel:
 | **Discrete** | The NVIDIA GPU drives the panel directly; the iGPU is switched off | maximum frame rate, no compositing hop, every frame through the dGPU |
 
 ```bash
-gs66-center graphics                 # show it
-gs66-center graphics hybrid  --yes   # request it; takes effect at next boot
-gs66-center graphics revert          # undo the last switch
+msi-control graphics                 # show it
+msi-control graphics hybrid  --yes   # request it; takes effect at next boot
+msi-control graphics revert          # undo the last switch
 ```
 
 It needs `"AllowMuxSwitch": true` in the config **and** `--yes` on the command
@@ -300,7 +300,7 @@ take effect, and this program will never reboot your machine for you.
   [`ElXreno/msi-gpu-switcher`](https://github.com/ElXreno/msi-gpu-switcher),
   which drives the identical trio — but that tool was developed and tested on
   an **AMD** MSI Alpha 17 C7VG, not on this model.
-* **MSI's own MUX documentation does not list a 10th-generation GS66.**
+* **MSI's own MUX documentation does not list a 10th-generation MSI.**
   ArchWiki's *MSI GS66 11UX* page records reverse-engineering this switch
   **failing** for that machine. A wrong value can leave you with **no display
   at all**.
@@ -309,8 +309,8 @@ take effect, and this program will never reboot your machine for you.
   hybrid setting. This program cannot help you from a machine with no screen.
 
 Given all of that it is deliberately awkward to reach, it backs the current
-value up to `/var/lib/gs66-center/mux-backup.json` (the raw efivarfs image,
-byte for byte) before it writes anything, `gs66-center graphics revert`
+value up to `/var/lib/msi-control/mux-backup.json` (the raw efivarfs image,
+byte for byte) before it writes anything, `msi-control graphics revert`
 puts that back, and it is **never** applied automatically — not at boot, not
 on resume, not from a profile. A graphics switch is a decision, not a setting.
 
@@ -331,7 +331,7 @@ you have requested but not yet rebooted into is visible as exactly that,
 instead of the UI pretending the change already happened.
 
 Reading all three needs no root (the variable and the PCI bus are
-world-readable), so `gs66-center status` still reports the mode with the
+world-readable), so `msi-control status` still reports the mode with the
 daemon down. Only the EC register needs the daemon, and the offline view says
 so rather than guessing.
 
@@ -339,7 +339,7 @@ so rather than guessing.
 
 ## Safety model
 
-1. **Validation.** Every client value passes `gs66_common.check_*` on the
+1. **Validation.** Every client value passes `msi_control.check_*` on the
    *daemon* side — the GUI and CLI validate too, but the daemon never trusts
    them. Curves must be 6 strictly-increasing temperatures and 7
    non-decreasing speeds, all in range; charge limits are 20–100.
@@ -348,7 +348,7 @@ so rather than guessing.
    daemon refuses to report success unless the byte really stuck.
 3. **Serialisation.** All EC writes take one lock — the kernel's ACPI code
    talks to the same controller.
-4. **Least privilege.** Only `gs66d` is root. The socket is `0660
+4. **Least privilege.** Only `msi-controld` is root. The socket is `0660
    root:wheel`, and `wheel` already implies admin, so socket access grants
    nothing new. **Nothing over HTTP can reach the EC** — there is no web
    surface at all.
@@ -360,11 +360,11 @@ so rather than guessing.
 ## Layout
 
 ```
-src/gs66_common.py     EC register map, validation, protocol  (shared)
-src/gs66d.py           the privileged daemon
-src/gs66-center        CLI
-src/gs66-gui           PySide6 GUI
-tests/test_gs66.py     114 offline tests — fake sysfs + RAM-backed EC
+src/msi_control.py     EC register map, validation, protocol  (shared)
+src/msi_controld.py           the privileged daemon
+src/msi-control        CLI
+src/msi-control-gui           PySide6 GUI
+tests/test_msi_control.py     114 offline tests — fake sysfs + RAM-backed EC
 tests/gui_smoke.py     headless GUI construction + behaviour + screenshots
 tests/shots/           committed screenshots — dark, and light/ beside it
 tools/                 hardware probes (need root) + fixup/recapture helpers
@@ -381,7 +381,7 @@ README.md CONTRIBUTING.md CHANGELOG.md TODO.md APP_DETAILS.md
 ### Tests
 
 ```bash
-python3 tests/test_gs66.py                     # 114 tests, no root, no hardware
+python3 tests/test_msi_control.py                     # 114 tests, no root, no hardware
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py   # needs PySide6
 
 make check                                     # both of the above + a syntax check
@@ -406,8 +406,8 @@ the two checked-in sets.
 The suite builds a **fake sysfs tree** and a **RAM-backed EC**, then runs the
 real daemon in-process and drives it over the real socket, so protocol,
 validation, profiles, restore-after-reboot and the CLI are all exercised
-end-to-end. The environment variables `GS66_SYSFS`, `GS66_SOCK`,
-`GS66_CONFIG` and `GS66_STATE` redirect every path, which is what makes this
+end-to-end. The environment variables `MSI_SYSFS`, `MSI_SOCK`,
+`MSI_CONFIG` and `MSI_STATE` redirect every path, which is what makes this
 possible without root.
 
 It deliberately covers the ugly cases: an EC byte that refuses to be written
@@ -428,13 +428,13 @@ back, and must not leave the UEFI variable mutable if the write fails.
 
 | Symptom | Cause / fix |
 |---|---|
-| `gs66-center status` says the daemon is down | `systemctl status gs66-centerd`; check `journalctl -u gs66-centerd` |
+| `msi-control status` says the daemon is down | `systemctl status msi-controld`; check `journalctl -u msi-controld` |
 | Status shows no RPM, no curves | the driver's `debug` interface is off — check `cat /sys/module/msi_ec/parameters/debug`; it needs `debug=1` **at load time** (`modprobe -r msi-ec && modprobe msi-ec`) |
 | `permission denied` on the socket | you are not in `wheel` (or `SocketGroup` was changed) |
 | Driver not present at all | `modprobe msi-ec`; if that fails, `dmesg \| tail -20` — most likely Secure Boot, or headers for a *different* kernel than the one running |
 | DKMS build failed | `dkms build msi-ec/0.13 -k $(uname -r)` for the real error; the installer falls back to a direct build automatically |
 | Settings reset after suspend | expected if the firmware resets the EC; the resume hook re-applies them — check `ReapplyOnResume` is still `true` |
 | GUI does not start | `python3 -c 'import PySide6'` — install `python3-pyside6`. The CLI works regardless |
-| The graphics switch is greyed out | it is off by default — set `"AllowMuxSwitch": true` in the config and restart `gs66-centerd` |
+| The graphics switch is greyed out | it is off by default — set `"AllowMuxSwitch": true` in the config and restart `msi-controld` |
 | Switched the graphics mode but nothing changed | that is by design: it applies at the **next reboot**. The card says `reboot required` until it does |
-| No display after a graphics switch | reset the firmware (clear CMOS / BIOS defaults) from an external screen, then `gs66-center graphics revert` |
+| No display after a graphics switch | reset the firmware (clear CMOS / BIOS defaults) from an external screen, then `msi-control graphics revert` |

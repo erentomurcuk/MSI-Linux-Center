@@ -1,4 +1,4 @@
-# TODO — GS66 Control Center
+# TODO — MSI Linux Control Center
 
 Companion to [`APP_DETAILS.md`](APP_DETAILS.md), which holds all the context
 this list assumes. Status markers: `[x]` done · `[~]` deferred · `[ ]` open.
@@ -11,9 +11,9 @@ Last updated: 2026-10-17.
 
 - [x] **Research + design** — EC map cross-checked against isw, teackot's
       msi-ec and the in-tree driver. Daemon + CLI + PySide6 GUI chosen.
-- [x] **All source written** — `gs66_common.py`, `gs66d.py`, `gs66-center`,
-      `gs66-gui`.
-- [x] **114 offline tests passing** — `python3 tests/test_gs66.py`.
+- [x] **All source written** — `msi_control.py`, `msi_controld.py`, `msi-control`,
+      `msi-control-gui`.
+- [x] **114 offline tests passing** — `python3 tests/test_msi_control.py`.
 - [x] **GUI smoke test with behaviour assertions** — contrast, the battery
       state machine, the curve keyboard path, every confirmation's wording,
       the dashboard's numbers against their labels, and four MUX states. Since
@@ -33,11 +33,11 @@ Last updated: 2026-10-17.
 - [x] **GUI smoke test passing** — renders one PNG per tab to `tests/shots/`.
 - [x] **Installed and verified on real hardware** — driver bound
       (`16V1EMS1.118`, debug interface on), DKMS `msi-ec/0.13 installed`,
-      `gs66-centerd` active, all 5 profiles apply correctly, `factory`
+      `msi-controld` active, all 5 profiles apply correctly, `factory`
       captured honestly.
 - [x] **`verify.sh` reports ALL CHECKS PASSED** — every shift mode, fan mode,
       cooler boost, charge threshold, fan-curve write-back round-trip.
-- [x] **Moved project** `~/gs66-center` → `~/Projects/GS66Control`.
+- [x] **Moved project** `~/msi-control` → `~/Projects/MSIControl`.
 - [x] **Moved hardware probes** out of `/tmp/opencode/` (wiped nightly) into
       `tools/`.
 - [x] **GUI/UX overhaul + repo preparation** — see *Done in the 2026-10-16
@@ -48,10 +48,10 @@ Last updated: 2026-10-17.
 ### Bugs found and fixed along the way — do not reintroduce
 
 - pkexec relative-path failure → `SELF="$(readlink -f "${BASH_SOURCE[0]}")"`.
-- `ModuleNotFoundError: gs66_common` in the *installed* CLI/GUI → added
-  `_add_lib_path()` searching script dir + `/usr/local/lib/gs66-center` to
+- `ModuleNotFoundError: msi_control` in the *installed* CLI/GUI → added
+  `_add_lib_path()` searching script dir + `/usr/local/lib/msi-control` to
   all three programs.
-- `QTimer() takes at most 1 argument` in `gs66-gui main()` → removed a stray
+- `QTimer() takes at most 1 argument` in `msi-control-gui main()` → removed a stray
   `QTimer()` and dead `sig`.
 - `verify.sh` `head()` shadowed the `head` binary → renamed `section()`.
 - DKMS `@VERSION@` placeholder and `msi_ec` / `msi-ec` name mismatch.
@@ -117,7 +117,7 @@ pkexec env PATH=/usr/local/bin:/usr/bin:/bin python3 tools/scan_ec.py
 ```
 
 The `env PATH=…` prefix is **mandatory** — pkexec sanitises `PATH` and drops
-`/usr/local/bin`, so the script dies with `FileNotFoundError: gs66-center`.
+`/usr/local/bin`, so the script dies with `FileNotFoundError: msi-control`.
 Both restore what they touch (fanprobe restores the original curves;
 scan_ec only toggles the Cooler Boost bit).
 
@@ -134,7 +134,7 @@ By-hand rollback point: `~/backup-pre-ui-overhaul-20261017-112844/`.
 
 ### [x] The app mark — a centred red shield, and nothing else
 
-- `icons/gs66-center.svg` is the installed icon (`install.sh` puts it in the
+- `icons/msi-control.svg` is the installed icon (`install.sh` puts it in the
   menu entry and `hicolor/scalable`), and the GUI paints the **same** shield for
   the window icon, the header and the tray: one `_mark_frame()`, one
   `_mark_shield()` gradient, three consumers. `MARK_BOX` is the four numbers all
@@ -215,7 +215,7 @@ Each one guards a failure that a screenshot cannot show:
 | Check | Guards against |
 |---|---|
 | `check_theme_tokens` | a theme that silently lost a token, or an accent ink below AA |
-| `check_brand_mark` | `icons/gs66-center.svg` drifting from the painted mark |
+| `check_brand_mark` | `icons/msi-control.svg` drifting from the painted mark |
 | `check_glyphs` | a typo in `Sidebar.ITEMS` → a transparent pixmap beside a label |
 | `check_nav_matches_tabs` | an unreachable section, or a dead nav click |
 | `check_type_scale` | the tiles disagreeing about `TYPE_DISPLAY` |
@@ -234,14 +234,14 @@ goes stale.
 
 ## Done in the 2026-10-16 UI/UX overhaul
 
-The GUI was rebuilt (`src/gs66-gui`, ~2 700 lines) around one token set per
+The GUI was rebuilt (`src/msi-control-gui`, ~2 700 lines) around one token set per
 theme and a sidebar + stacked-page shell. The daemon protocol is untouched and
 both suites stay green.
 
 ### [x] A real theme system — light and dark
 
 * **One token set per theme**, fed into a `QPalette` and one application
-  stylesheet. Choice order: `GS66_THEME=light|dark` → the desktop's colour
+  stylesheet. Choice order: `MSI_THEME=light|dark` → the desktop's colour
   scheme → **dark** when the platform reports *Unknown* (an offscreen test run
   reports exactly that, so headless screenshots are deterministic).
 * `apply_theme(app)` is called from **both** `MainWindow.__init__` and
@@ -341,10 +341,10 @@ matters here:
 
 * Gated behind **`AllowMuxSwitch`** (default `false`) **and** `--yes` / a
   confirmation dialog. It can leave a laptop with no display, and MSI's own
-  MUX model list excludes the 10th-gen GS66.
+  MUX model list excludes the 10th-gen MSI.
 * **Never automatic** — excluded from `RestoreLast`, `ReapplyOnResume` and
   every profile, with a comment on `snapshot()` saying why.
-* Backs the raw efivarfs image up to `/var/lib/gs66-center/mux-backup.json`
+* Backs the raw efivarfs image up to `/var/lib/msi-control/mux-backup.json`
   before writing; `graphics revert` puts it back byte for byte.
 * Read-modify-write of one bit, so the webcam bit beside it survives.
 * The write path itself is **unproven on this model** — it needs a reboot to
@@ -371,7 +371,7 @@ matters here:
   (`mark_checked()`).
 * **Settings showed only part of the config** — the daemon's `status()`
   omitted `SocketGroup` and now omitted `AllowMuxSwitch` too. Both published.
-* **`gs66-center profile show` printed compact JSON** while every other
+* **`msi-control profile show` printed compact JSON** while every other
   `--json` path indents. Now consistent.
 * **Config box had a scrollbar** at six keys. Height now measured from the
   document and capped, so a seventh key cannot reintroduce it.
@@ -383,7 +383,7 @@ matters here:
 * **`fan_pct` under Cooler Boost.** `0x71`/`0x89` stay at 70 while the fans
   run at ~8100 RPM. That is not a bug to fix; RPM is displayed next to it for
   exactly this reason. Recorded in `APP_DETAILS.md` §10.
-* **`status` polling was not "optimised".** 20 `gs66-center status --json`
+* **`status` polling was not "optimised".** 20 `msi-control status --json`
   calls cost 1.935 s total (~97 ms each), and the daemon used 743 ms of CPU
   across 3 h. There is nothing here worth making more complex.
 
@@ -417,7 +417,7 @@ both before and after a write.
 * `MsiEc.get(key)` reads a setting back through the same path `set` writes
   it; `set` now returns `{key, was, now, changed, summary}`.
 * `describe_change()` / `diff_settings()` / `curve_points_changed()` live in
-  `gs66_common`, so the CLI and the GUI can never phrase the same event
+  `msi_control`, so the CLI and the GUI can never phrase the same event
   differently. Both render the daemon's `summary` verbatim.
 * `profile apply` returns a `changes` list — only the keys that actually
   moved, plus `cpu curve (3 points)`. A setting the profile never mentions
@@ -458,11 +458,11 @@ both before and after a write.
 * `verify.sh` hardcoded `BAT1`; it now discovers the battery, and its RPM
   check accepts 0 (a stopped fan is a real reading).
 * `tools/fixup.sh` derived its source path from `BASH_SOURCE` instead of the
-  stale `/home/eren/gs66-center`.
+  stale `/home/eren/msi-control`.
 * CLI and GUI disagreed about temperature bands (CLI called 62 °C "warm",
   GUI called it "cool"). Both now use `core.temp_band()`.
 * `curve set` now honours `--json`.
-* Two unused imports in `test_gs66.py`.
+* Two unused imports in `test_msi_control.py`.
 
 ### [x] Profiles no longer touch the charge limit
 
@@ -471,7 +471,7 @@ any of them silently reset a limit the user had deliberately picked. The
 daemon's own journal recorded it happening:
 
 ```
-Oct 14 22:32:54  gs66d: applied profile balanced: charge limit 60% -> 100%
+Oct 14 22:32:54  msi-controld: applied profile balanced: charge limit 60% -> 100%
 ```
 
 Fixed at the **table**, not in the apply path: `_apply_profile_dict` already
@@ -504,7 +504,7 @@ reverse-engineered from a tool developed on a *different* MSI laptop, and
 testing it requires a reboot that can plausibly leave the machine with no
 display. That is a decision for the user, not a thing to try quietly.
 
-If they want to take it: switch, reboot, and check `gs66-center graphics`
+If they want to take it: switch, reboot, and check `msi-control graphics`
 reports `running now: Hybrid` (an Intel controller will appear on the PCI
 bus). Recovery is a firmware reset if it does not come back.
 
@@ -513,7 +513,7 @@ bus). Recovery is a firmware reset if it does not come back.
 The user set the charge limit to **60%** themselves. Checked against the live
 daemon on 2026-10-17: the Battery tab shows the slider at 60, reads
 `Limit stop at 60%, start at 50%`, `Apply` is **disabled** and the line under it
-says `60% applied — no pending change`; `gs66-center battery` agrees.
+says `60% applied — no pending change`; `msi-control battery` agrees.
 
 The GUI's reading and the CLI's reading of the same EC value are the two things
 that had to agree, and they do. The **restore** side is covered offline rather
@@ -527,18 +527,18 @@ applies all three performance profiles, asserts the limit is still 80% in the EC
 The GUI rewritten in this pass needed to reach the desktop, and it did — without
 touching the daemon:
 
-* **Minimal targeted install, one `pkexec` prompt, three files.** `src/gs66-gui`
-  → `/usr/local/bin/gs66-gui`, `icons/gs66-center.svg` →
-  `/usr/share/icons/hicolor/scalable/apps/`, `desktop/gs66-center.desktop` →
+* **Minimal targeted install, one `pkexec` prompt, three files.** `src/msi-control-gui`
+  → `/usr/local/bin/msi-control-gui`, `icons/msi-control.svg` →
+  `/usr/share/icons/hicolor/scalable/apps/`, `desktop/msi-control.desktop` →
   `/usr/share/applications/`, then `gtk-update-icon-cache -f -t
   /usr/share/icons/hicolor`.
-* **No `install.sh` run, and no daemon restart.** `gs66d.py`, `gs66-center` and
-  `gs66_common.py` were *already* md5-identical to `src/`, and this pass changed
+* **No `install.sh` run, and no daemon restart.** `msi_controld.py`, `msi-control` and
+  `msi_control.py` were *already* md5-identical to `src/`, and this pass changed
   no protocol, so a DKMS rebuild / module reload / service bounce would have been
   risk with no benefit. The old GUI process was stopped, the new one started on
   the live Plasma Wayland session, and all six md5 pairs were verified equal.
 * ⚠️ **A replaced icon does not appear in the menu until the shell re-reads it.**
-  After the install, `kiconfinder6 gs66-center` already resolved to the new file
+  After the install, `kiconfinder6 msi-control` already resolved to the new file
   and the `ksycoca6` database had already been rebuilt — yet the launcher kept
   painting the **old** dark tile with `66`, while the panel's task entry (whose
   icon comes from `setWindowIcon()`) was new immediately. A running Plasma caches
@@ -550,16 +550,16 @@ touching the daemon:
   `StatusNotifierWatcher` by itself, so the shell restart costs nothing.
 
 ```bash
-cd /home/eren/Projects/GS66Control
+cd /home/eren/Projects/MSIControl
 make check        # 114 offline + GUI smoke (also: make shots-light)
 
 # 1. deploy — installs only, so no DKMS rebuild and no daemon bounce.
 #    NOTE the absolute paths (and --keep-cwd): pkexec runs PROGRAM in $HOME,
 #    so a bare `install src/...` cannot stat its source — see Housekeeping.
-R=/home/eren/Projects/GS66Control
-pkexec bash -c "install -m 755 $R/src/gs66-gui /usr/local/bin/gs66-gui
-                install -m 644 $R/icons/gs66-center.svg /usr/share/icons/hicolor/scalable/apps/
-                install -m 644 $R/desktop/gs66-center.desktop /usr/share/applications/
+R=/home/eren/Projects/MSIControl
+pkexec bash -c "install -m 755 $R/src/msi-control-gui /usr/local/bin/msi-control-gui
+                install -m 644 $R/icons/msi-control.svg /usr/share/icons/hicolor/scalable/apps/
+                install -m 644 $R/desktop/msi-control.desktop /usr/share/applications/
                 /usr/bin/gtk-update-icon-cache -f -t /usr/share/icons/hicolor"
 
 # 2. make the new menu icon visible (see the gotcha above)
@@ -568,7 +568,7 @@ systemctl --user restart plasma-plasmashell.service
 # 3. relaunch the GUI on the live session — find it first; never pgrep -f,
 #    whose pattern self-matches the shell running it
 ps -eo pid,args | awk '/[g]s66-gui/ {print $1}'
-setsid /usr/local/bin/gs66-gui >/dev/null 2>&1 &
+setsid /usr/local/bin/msi-control-gui >/dev/null 2>&1 &
 ```
 
 For a **daemon** change instead, `./install.sh` is still the whole answer (it
@@ -578,8 +578,8 @@ also enables the service and installs the resume hook), and the full recipe —
 
 ### [x] `tools/fixup.sh` has a stale source path — FIXED
 
-`tools/fixup.sh:5` said `SRC=/home/eren/gs66-center` after the project moved
-to `/home/eren/Projects/GS66Control`. It now derives the root from its own
+`tools/fixup.sh:5` said `SRC=/home/eren/msi-control` after the project moved
+to `/home/eren/Projects/MSIControl`. It now derives the root from its own
 location, so it survives the next move:
 
 ```bash
@@ -608,17 +608,17 @@ it through a path that is itself a link.
   *after* parsing; pinned by `TestCli.test_json_flag_before_the_subcommand_is_not_dropped`.
 * **A GUI smoke test must never write the user's real config.** Adding
   `QSettings` geometry/tab persistence made `tests/gui_smoke.py` rewrite
-  `~/.config/gs66-center/gs66-center.conf`, which would have opened the next
+  `~/.config/msi-control/msi-control.conf`, which would have opened the next
   real window on whatever tab a test run ended on. `main()` now points
   `XDG_CONFIG_HOME` at a scratch dir under `tests/shots/` before anything
   constructs a `QSettings`.
 * **Run the light screenshots with an *absolute* outdir.** A **relative** outdir
   makes Qt ignore the redirected `XDG_CONFIG_HOME`, so the run writes the real
-  `~/.config/gs66-center/gs66-center.conf` after all — the exact leak the
+  `~/.config/msi-control/msi-control.conf` after all — the exact leak the
   previous bullet prevents. Use:
-  `GS66_THEME=light QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py "$PWD/tests/shots/light"`.
+  `MSI_THEME=light QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py "$PWD/tests/shots/light"`.
 * **Replacing the app icon does not update the menu until the shell restarts.**
-  The file on disk, `ksycoca6` and `kiconfinder6 gs66-center` can all be correct
+  The file on disk, `ksycoca6` and `kiconfinder6 msi-control` can all be correct
   while the launcher keeps painting the *previous* pixmap: a running Plasma caches
   the rendered icon in memory and nothing on disk invalidates that. It is not a
   second icon file, a theme override or a bad `Icon=` key, and it is not

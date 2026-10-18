@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — install GS66 Center on this machine.
+# install.sh — install MSI Linux Control on this machine.
 #
 # Run this as root (sudo ./install.sh), or let install.sh re-exec itself
 # through pkexec so the password prompt appears on your desktop.
@@ -17,9 +17,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX=/usr/local
-LIBDIR=$PREFIX/lib/gs66-center
+LIBDIR=$PREFIX/lib/msi-control
 BINDIR=$PREFIX/bin
-DOCDIR=$PREFIX/share/doc/gs66-center
+DOCDIR=$PREFIX/share/doc/msi-control
 DRIVER_SRC=$HERE/third_party/msi-ec
 DRIVER_VER=0.13
 # dkms.conf declares PACKAGE_NAME="msi-ec", and dkms looks for its source at
@@ -140,10 +140,10 @@ modprobe msi-ec || warn "modprobe msi-ec failed — will retry at boot"
 # --------------------------------------------------------------- programs --
 log "installing programs to $LIBDIR"
 install -d "$LIBDIR" "$BINDIR" "$DOCDIR"
-install -m 644 "$HERE/src/gs66_common.py" "$LIBDIR/"
-install -m 644 "$HERE/src/gs66d.py"       "$LIBDIR/"
-install -m 755 "$HERE/src/gs66-center"    "$BINDIR/gs66-center"
-install -m 755 "$HERE/src/gs66-gui"       "$BINDIR/gs66-gui"
+install -m 644 "$HERE/src/msi_control.py" "$LIBDIR/"
+install -m 644 "$HERE/src/msi_controld.py"       "$LIBDIR/"
+install -m 755 "$HERE/src/msi-control"    "$BINDIR/msi-control"
+install -m 755 "$HERE/src/msi-control-gui"       "$BINDIR/msi-control-gui"
 
 # The GUI's shebang uses env python3; make sure PySide6 is present.
 if ! python3 -c 'import PySide6' >/dev/null 2>&1; then
@@ -155,16 +155,16 @@ fi
 install -m 644 "$HERE/README.md" "$DOCDIR/" 2>/dev/null || true
 
 # ---------------------------------------------------------------- config ---
-install -d /etc/gs66-center /var/lib/gs66-center
-if [ ! -f /etc/gs66-center/config.json ]; then
+install -d /etc/msi-control /var/lib/msi-control
+if [ ! -f /etc/msi-control/config.json ]; then
     log "writing default config"
     # The template lives in the repo (etc/config.json) so the shipped defaults
     # and the documented ones cannot drift apart.  Fall back to an inline copy
     # only if the template is somehow missing from the checkout.
     if [ -f "$HERE/etc/config.json" ]; then
-        install -m 644 "$HERE/etc/config.json" /etc/gs66-center/config.json
+        install -m 644 "$HERE/etc/config.json" /etc/msi-control/config.json
     else
-        cat > /etc/gs66-center/config.json <<'EOF'
+        cat > /etc/msi-control/config.json <<'EOF'
 {
   "RestoreLast": true,
   "DefaultProfile": null,
@@ -174,32 +174,32 @@ if [ ! -f /etc/gs66-center/config.json ]; then
   "ReapplyOnResume": true
 }
 EOF
-        chmod 644 /etc/gs66-center/config.json
+        chmod 644 /etc/msi-control/config.json
     fi
 else
-    log "keeping existing /etc/gs66-center/config.json"
+    log "keeping existing /etc/msi-control/config.json"
 fi
 
 # --------------------------------------------------------------- service ---
 log "enabling systemd service"
-install -m 644 "$HERE/systemd/gs66-centerd.service" /etc/systemd/system/
-install -m 755 "$HERE/systemd/gs66-center-sleep" /usr/lib/systemd/system-sleep/gs66-center
+install -m 644 "$HERE/systemd/msi-controld.service" /etc/systemd/system/
+install -m 755 "$HERE/systemd/msi-control-sleep" /usr/lib/systemd/system-sleep/msi-control
 systemctl daemon-reload
-systemctl enable gs66-centerd.service
-systemctl restart gs66-centerd.service
+systemctl enable msi-controld.service
+systemctl restart msi-controld.service
 
 # ---------------------------------------------------------------- desktop --
 log "installing desktop entry + icon"
 install -d /usr/share/applications /usr/share/icons/hicolor/scalable/apps
-install -m 644 "$HERE/desktop/gs66-center.desktop" /usr/share/applications/
-install -m 644 "$HERE/icons/gs66-center.svg" \
-    /usr/share/icons/hicolor/scalable/apps/gs66-center.svg
+install -m 644 "$HERE/desktop/msi-control.desktop" /usr/share/applications/
+install -m 644 "$HERE/icons/msi-control.svg" \
+    /usr/share/icons/hicolor/scalable/apps/msi-control.svg
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 
 # ------------------------------------------------------------------ done ---
 log "waiting for the daemon"
 for _ in $(seq 1 15); do
-    if "$BINDIR/gs66-center" wait --seconds 1 >/dev/null 2>&1; then break; fi
+    if "$BINDIR/msi-control" wait --seconds 1 >/dev/null 2>&1; then break; fi
 done
 
 echo
@@ -212,6 +212,6 @@ else
        Check:  dmesg | tail -20        and:  modinfo msi-ec"
 fi
 echo
-"$BINDIR/gs66-center" status 2>/dev/null || true
+"$BINDIR/msi-control" status 2>/dev/null || true
 echo
-log "done.  Try:  gs66-center status   ·   gs66-gui"
+log "done.  Try:  msi-control status   ·   msi-control-gui"

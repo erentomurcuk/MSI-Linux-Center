@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Identify the GS66's three fans: which tach is which, and who drives them.
 
-The GS66 Stealth has 3 fans (LibreHardwareMonitor reports "GS66 Stealth
-10SG: 3").  The EC exposes three 16-bit big-endian tachometers at
+The GS66 Stealth has 3 fans (LibreHardwareMonitor reports "GS66
+Stealth 10SG: 3").  The EC exposes three 16-bit big-endian tachometers at
 0xc8 / 0xca / 0xcc, but only two fan *curves* (cpu 0x6a/0x72, gpu
 0x82/0x8a) and two duty registers are documented.  This script settles it
 by experiment instead of guesswork:
@@ -37,7 +37,7 @@ EC = "/sys/devices/platform/msi-ec/debug"
 # ~2000-8000 RPM, which is exactly what laptop fans do.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.realpath(__file__))), "src"))
-import gs66_common as core                                # noqa: E402
+import msi_control as core                                # noqa: E402
 
 N = core.RPM_NUMERATOR
 
@@ -98,7 +98,7 @@ def settle(seconds: float = 4.0) -> dict:
 
 
 def cli(*args) -> None:
-    subprocess.run(["gs66-center", *args], capture_output=True, text=True)
+    subprocess.run(["msi-control", *args], capture_output=True, text=True)
 
 
 def read_curve(which: str) -> dict:

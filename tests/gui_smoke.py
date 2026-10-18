@@ -6,7 +6,7 @@ without a display or the hardware.
     QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py [outdir]
 
 Not part of the CI suite (needs PySide6); the daemon/CLI contract is covered
-by test_gs66.py.
+by test_msi_control.py.
 """
 import importlib.machinery
 import importlib.util
@@ -17,9 +17,9 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")
 sys.path.insert(0, SRC)
 
-loader = importlib.machinery.SourceFileLoader("gs66gui",
-                                              os.path.join(SRC, "gs66-gui"))
-spec = importlib.util.spec_from_loader("gs66gui", loader)
+loader = importlib.machinery.SourceFileLoader("msigui",
+                                              os.path.join(SRC, "msi-control-gui"))
+spec = importlib.util.spec_from_loader("msigui", loader)
 gui = importlib.util.module_from_spec(spec)
 loader.exec_module(gui)
 
@@ -189,7 +189,7 @@ def check_brand_mark() -> None:
     from PySide6.QtGui import QFontMetrics, QImage, QPainter
     from PySide6.QtSvg import QSvgRenderer
 
-    svg = os.path.join(os.path.dirname(HERE), "icons", "gs66-center.svg")
+    svg = os.path.join(os.path.dirname(HERE), "icons", "msi-control.svg")
     assert os.path.isfile(svg), f"icon missing: {svg}"
     assert os.path.getsize(svg) > 400, "icon looks truncated"
     assert QSvgRenderer(svg).isValid(), "icon does not parse as SVG"
@@ -724,7 +724,7 @@ def check_settings_persistence(app) -> None:
     than clamped into some tab they never opened.
     """
     conf = os.path.join(os.environ["XDG_CONFIG_HOME"],
-                        "gs66-center", "gs66-center.conf")
+                        "msi-control", "msi-control.conf")
     assert not os.path.exists(conf), f"stale config leaked in: {conf}"
 
     probe = gui.MainWindow()
@@ -835,7 +835,7 @@ def main() -> int:
     # a previous run so check_settings_persistence() starts from nothing.
     cfg = os.path.join(outdir, "_xdg_config")
     os.makedirs(cfg, exist_ok=True)
-    stale_conf = os.path.join(cfg, "gs66-center", "gs66-center.conf")
+    stale_conf = os.path.join(cfg, "msi-control", "msi-control.conf")
     if os.path.exists(stale_conf):
         os.remove(stale_conf)
     os.environ["XDG_CONFIG_HOME"] = cfg

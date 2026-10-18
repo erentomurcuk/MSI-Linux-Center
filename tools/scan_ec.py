@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find every fan-related EC register on the GS66, by measurement.
+"""Find every fan-related EC register on the MSI, by measurement.
 
 Read-only except for the cooler-boost bit (0x98.7), which the tool sets and
 clears.  Answers three questions the earlier probes could not:

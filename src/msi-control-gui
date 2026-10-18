@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""gs66-gui — Qt control centre for the MSI GS66 10SE.
+"""msi-control-gui — Qt control centre for MSI laptops running Linux.
 
-Front-end to gs66d (which owns every EC write); this process is never
+Front-end to msi-controld (which owns every EC write); this process is never
 privileged and never touches sysfs directly.  All daemon traffic runs on one
 worker thread so a slow EC transfer can never freeze the UI.
 
@@ -14,14 +14,14 @@ Sections (sidebar):
   Settings     daemon state, re-apply, factory capture, raw EC console
 
 Design rules (same ones the daemon enforces — the GUI is just a client):
-  * every value is validated by gs66_common before it is sent;
+  * every value is validated by msi_control before it is sent;
   * nothing is written optimistically — the UI re-reads state after each
     command, so what you see is what the EC actually holds;
   * with the daemon down the GUI degrades to read-only instead of lying.
 
 Theme: one token set per theme (light/dark), applied as a QPalette plus a
 single application stylesheet, so every colour, radius and border comes from
-one place and the two themes cannot drift apart.  `GS66_THEME=light|dark`
+one place and the two themes cannot drift apart.  `MSI_THEME=light|dark`
 forces one; otherwise the desktop's own colour scheme decides, defaulting to
 dark when the platform does not report one (as offscreen does not).
 
@@ -53,19 +53,19 @@ import threading
 
 
 def _add_lib_path() -> str:
-    """Find gs66_common.py, whether run from the source tree or installed.
+    """Find msi_control.py, whether run from the source tree or installed.
 
-    Installed layout puts the shared module in /usr/local/lib/gs66-center
+    Installed layout puts the shared module in /usr/local/lib/msi-control
     while the wrappers live in /usr/local/bin — so dirname(__file__) alone
     is not enough.
     """
     here = os.path.dirname(os.path.realpath(__file__))
     candidates = [here,
-                  os.path.join(here, "..", "lib", "gs66-center"),
-                  "/usr/local/lib/gs66-center",
-                  "/usr/lib/gs66-center"]
+                  os.path.join(here, "..", "lib", "msi-control"),
+                  "/usr/local/lib/msi-control",
+                  "/usr/lib/msi-control"]
     for c in candidates:
-        if os.path.isfile(os.path.join(c, "gs66_common.py")):
+        if os.path.isfile(os.path.join(c, "msi_control.py")):
             c = os.path.realpath(c)
             if c not in sys.path:
                 sys.path.insert(0, c)
@@ -89,13 +89,13 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QGridLayout,
                                QSpinBox, QStackedWidget, QStatusBar,
                                QSystemTrayIcon, QVBoxLayout, QWidget)
 
-import gs66_common as core                                     # noqa: E402
+import msi_control as core                                     # noqa: E402
 
 POLL_MS = 1500
 
 # --------------------------------------------------------------------------
 # Temperature palette — the SEMANTIC colours.  They are status, not chrome,
-# so they are fixed across themes and shared with the CLI via gs66_common's
+# so they are fixed across themes and shared with the CLI via msi_control's
 # bands: 62 °C is "warm" in every front-end, which they used to disagree on.
 # --------------------------------------------------------------------------
 COL_OK = "#2e9e5b"        # cool
@@ -454,8 +454,8 @@ def _palette(t: dict) -> QPalette:
 
 
 def resolve_theme(app) -> str:
-    """`GS66_THEME` wins; else the desktop's scheme; else dark."""
-    env = os.environ.get("GS66_THEME", "").strip().lower()
+    """`MSI_THEME` wins; else the desktop's scheme; else dark."""
+    env = os.environ.get("MSI_THEME", "").strip().lower()
     if env in ("light", "dark"):
         return env
     try:
@@ -481,7 +481,7 @@ def apply_theme(app=None, force: str | None = None) -> str:
     THEME = THEMES.get(name, THEMES["dark"])
     app.setPalette(_palette(THEME))
     app.setStyleSheet(QSS % THEME)
-    app.setProperty("gs66_theme", THEME["name"])
+    app.setProperty("msi_theme", THEME["name"])
     return THEME["name"]
 
 
@@ -612,7 +612,7 @@ def shield_path(rect: QRectF) -> QPainterPath:
     """The MSI-style heraldic shield: square shoulders, curving to a point.
 
     One description shared by the painted app mark, the tray fallback and
-    (as hand-written path data) `icons/gs66-center.svg`, so the mark in the
+    (as hand-written path data) `icons/msi-control.svg`, so the mark in the
     window and the icon in the menu cannot look like two different apps.
     Control points are the SVG's, normalised to the box.
     """
@@ -635,7 +635,7 @@ def shield_path(rect: QRectF) -> QPainterPath:
 # fractions.  Sized so the shape fills the canvas with an even margin — the
 # mark *is* the shield, so whatever is left over is wasted — and centred, so
 # it sits level with its neighbours in a taskbar.  The same four numbers are
-# baked into `icons/gs66-center.svg`; `check_brand_mark` rasterises both and
+# baked into `icons/msi-control.svg`; `check_brand_mark` rasterises both and
 # compares the outlines, so the two cannot drift apart.
 MARK_BOX = (19.0 / 128, 12.0 / 128, 90.0 / 128, 104.0 / 128)
 
@@ -681,7 +681,7 @@ def _mark_shield(p: QPainter, box: QRectF, stops) -> None:
 def brand_pixmap(size: int = 32) -> QPixmap:
     """The app mark: a centred MSI-red shield, and nothing else.
 
-    Matching `icons/gs66-center.svg` shape for shape.  Painted rather than
+    Matching `icons/msi-control.svg` shape for shape.  Painted rather than
     loaded so the GUI keeps its no-icon-theme dependency, and so the window
     icon, the header mark and the tray all agree without shipping a second
     file.
@@ -796,7 +796,7 @@ class Client(QObject):
         super().__init__(parent)
         self._q: queue.Queue = queue.Queue()
         threading.Thread(target=self._loop, daemon=True,
-                         name="gs66-client").start()
+                         name="msi-control-client").start()
 
     def submit(self, cmd: dict, tag: str | None = None):
         cmd = dict(cmd)
@@ -1637,7 +1637,7 @@ class PerformanceTab(QWidget):
             style = notice_style(COL_CRIT, COL_CRIT)
         elif not g.get("enabled"):
             note = ("switching is disabled — set “AllowMuxSwitch”: true in "
-                    f"{core.config_path()} and restart gs66-centerd")
+                    f"{core.config_path()} and restart msi-controld")
             style = notice_style(muted_color(self))
         elif not online:
             note = "the daemon is offline, so nothing can be written"
@@ -2519,10 +2519,10 @@ class Header(QWidget):
 
         mark = QLabel()
         mark.setPixmap(brand_pixmap(36))
-        mark.setToolTip("GS66 Center")
+        mark.setToolTip("MSI Linux Control")
         titlebox = QVBoxLayout()
         titlebox.setSpacing(1)
-        title = QLabel("GS66 Center")
+        title = QLabel("MSI Linux Control")
         title.setFont(ui_font(TYPE_H2, bold=True))
         sub = QLabel("MSI GS66 Stealth 10SE · embedded-controller control")
         sub.setFont(ui_font(TYPE_CAPTION))
@@ -2555,7 +2555,7 @@ class Header(QWidget):
         self.quit_btn.setIcon(QIcon(glyph_pixmap("power", ICON_SM,
                                                  THEME["text_dim"])))
         self.quit_btn.setIconSize(QSize(ICON_SM, ICON_SM))
-        self.quit_btn.setToolTip("Quit GS66 Center (Ctrl+Q)")
+        self.quit_btn.setToolTip("Quit MSI Linux Control (Ctrl+Q)")
         self.quit_btn.clicked.connect(QApplication.quit)
         lay.addWidget(self.quit_btn)
 
@@ -2573,7 +2573,7 @@ class Header(QWidget):
             f"color:{text_on(colour)};background:{colour};"
             f"border-radius:{R_PILL}px;padding:4px 11px;")
         self.pill.setToolTip(
-            "The gs66-centerd daemon is answering" if online else
+            "The msi-controld daemon is answering" if online else
             "Waiting for the daemon's first reply" if online is None else
             "The daemon is not reachable — the app is read-only")
 
@@ -2595,9 +2595,9 @@ class Banner(QFrame):
         icon = QLabel()
         icon.setPixmap(glyph_pixmap("warn", ICON_SM, text_on(COL_CRIT)))
         text = QLabel(
-            "The gs66-centerd daemon is not reachable — every reading below is "
+            "The msi-controld daemon is not reachable — every reading below is "
             "read-only and no setting can be written.  Start it with "
-            "<code>sudo systemctl start gs66-centerd</code>.")
+            "<code>sudo systemctl start msi-controld</code>.")
         text.setWordWrap(True)
         text.setFont(ui_font(TYPE_BODY))
         text.setStyleSheet(f"color:{text_on(COL_CRIT)}")
@@ -2658,7 +2658,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         apply_theme(QApplication.instance())
 
-        self.setWindowTitle("GS66 Center")
+        self.setWindowTitle("MSI Linux Control")
         self.online = None                  # None = not yet heard from it
         self.profile_cache: dict = {}
         self._pending_status = False
@@ -2669,7 +2669,7 @@ class MainWindow(QMainWindow):
         # window that forgets both every time is the most-returned-to
         # annoyance there is.  Scoped to this app and written only on a
         # real close, so a hide-to-tray never saves a hidden state.
-        self._qs = QSettings("gs66-center", "gs66-center")
+        self._qs = QSettings("msi-control", "msi-control")
 
         self.client = Client(self)
         self.client.reply.connect(self._on_reply)
@@ -2746,7 +2746,7 @@ class MainWindow(QMainWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self)
             self.tray.setIcon(QIcon(brand_pixmap(64)))
-            self.tray.setToolTip("GS66 Center")
+            self.tray.setToolTip("MSI Linux Control")
             self.tray.activated.connect(self._tray_activated)
             # A context menu is not decoration here: closing the window
             # only hides it (see closeEvent), so without this a user whose
@@ -2801,7 +2801,7 @@ class MainWindow(QMainWindow):
         """
         self.statusBar().showMessage(text, 8000)
         if not ok and self.tray:
-            self.tray.showMessage("GS66 Center — failed", text,
+            self.tray.showMessage("MSI Linux Control — failed", text,
                                   QSystemTrayIcon.Warning)
 
     def set_key(self, key: str, value):
@@ -2930,7 +2930,7 @@ class MainWindow(QMainWindow):
             self.tray.setIcon(QIcon(brand_pixmap(64) if worst is None
                                     else temp_pixmap(64, worst, str(worst))))
             self.tray.setToolTip(
-                f"GS66 · CPU {t[0] if t[0] is not None else '?'}°C · "
+                f"MSI · CPU {t[0] if t[0] is not None else '?'}°C · "
                 f"GPU {t[1] if t[1] is not None else '?'}°C")
 
     @staticmethod
@@ -2939,7 +2939,7 @@ class MainWindow(QMainWindow):
         hand side, where it stays instead of being overwritten every poll."""
         drv = st.get("driver") or {}
         return " · ".join(x for x in (
-            "gs66-centerd",
+            "msi-controld",
             f"fw {drv['fw']}" if drv.get("fw") else "",
             "driver not loaded" if drv.get("present") is False else "",
             "partial" if st.get("partial") else "",
@@ -2974,7 +2974,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("gs66-center")
+    app.setApplicationName("msi-control")
     apply_theme(app)
     win = MainWindow()
     win.show()

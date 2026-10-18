@@ -3,19 +3,19 @@
 # registration (so the module rebuilds on kernel updates), restart the daemon.
 set -euo pipefail
 # Derive the project root from this script rather than hard-coding it: the
-# tree moved to ~/Projects/GS66Control and a stale path here would make
+# tree moved to ~/Projects/MSIControl and a stale path here would make
 # pkexec fail on a missing file while everything else still looked fine.
 SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-LIBDIR=/usr/local/lib/gs66-center
+LIBDIR=/usr/local/lib/msi-control
 VER=0.13
 DST=/usr/src/msi-ec-$VER
 KREL="$(uname -r)"
 
 echo "==> redeploy programs"
-install -m 644 "$SRC/src/gs66_common.py" "$LIBDIR/"
-install -m 644 "$SRC/src/gs66d.py"       "$LIBDIR/"
-install -m 755 "$SRC/src/gs66-center"    /usr/local/bin/gs66-center
-install -m 755 "$SRC/src/gs66-gui"       /usr/local/bin/gs66-gui
+install -m 644 "$SRC/src/msi_control.py" "$LIBDIR/"
+install -m 644 "$SRC/src/msi_controld.py"       "$LIBDIR/"
+install -m 755 "$SRC/src/msi-control"    /usr/local/bin/msi-control
+install -m 755 "$SRC/src/msi-control-gui"       /usr/local/bin/msi-control-gui
 
 echo "==> DKMS registration"
 # Start clean so a re-run is idempotent.
@@ -36,7 +36,7 @@ dkms install "msi-ec/$VER" -k "$KREL"
 dkms status | grep msi-ec || true
 
 echo "==> restart daemon"
-systemctl restart gs66-centerd
+systemctl restart msi-controld
 sleep 2
-systemctl is-active gs66-centerd
+systemctl is-active msi-controld
 echo "==> done"

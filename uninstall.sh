@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # uninstall.sh — remove everything install.sh put on this machine.
 #
-# Does NOT touch: your saved profiles (/var/lib/gs66-center), your config
-# (/etc/gs66-center), or the DKMS registration of a driver you may have
+# Does NOT touch: your saved profiles (/var/lib/msi-control), your config
+# (/etc/msi-control), or the DKMS registration of a driver you may have
 # installed from elsewhere.  Pass --purge to remove those too.
 set -euo pipefail
 
 PURGE=0
 [ "${1:-}" = "--purge" ] && PURGE=1
 
-LIBDIR=/usr/local/lib/gs66-center
+LIBDIR=/usr/local/lib/msi-control
 # Both spellings: the installer uses the dkms-conformant hyphen, but an
 # earlier layout used an underscore — clean up whichever is present.
 DRIVER_DST_HYPHEN=/usr/src/msi-ec-0.13
@@ -26,18 +26,18 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 log "stopping service"
-systemctl disable --now gs66-centerd.service 2>/dev/null || true
-rm -f /etc/systemd/system/gs66-centerd.service
-rm -f /usr/lib/systemd/system-sleep/gs66-center
+systemctl disable --now msi-controld.service 2>/dev/null || true
+rm -f /etc/systemd/system/msi-controld.service
+rm -f /usr/lib/systemd/system-sleep/msi-control
 systemctl daemon-reload
 
 log "removing programs"
-rm -f /usr/local/bin/gs66-center /usr/local/bin/gs66-gui
-rm -rf "$LIBDIR" /usr/local/share/doc/gs66-center
+rm -f /usr/local/bin/msi-control /usr/local/bin/msi-control-gui
+rm -rf "$LIBDIR" /usr/local/share/doc/msi-control
 
 log "removing desktop entry + icon"
-rm -f /usr/share/applications/gs66-center.desktop
-rm -f /usr/share/icons/hicolor/scalable/apps/gs66-center.svg
+rm -f /usr/share/applications/msi-control.desktop
+rm -f /usr/share/icons/hicolor/scalable/apps/msi-control.svg
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
 
 log "unloading + removing the msi-ec driver"
@@ -57,9 +57,9 @@ rm -f /etc/modprobe.d/msi-ec.conf /etc/modules-load.d/msi-ec.conf
 
 if [ "$PURGE" -eq 1 ]; then
     log "purging state + config"
-    rm -rf /var/lib/gs66-center /etc/gs66-center
+    rm -rf /var/lib/msi-control /etc/msi-control
 else
-    log "kept /var/lib/gs66-center (profiles) and /etc/gs66-center (config)"
+    log "kept /var/lib/msi-control (profiles) and /etc/msi-control (config)"
     log "run with --purge to remove them too"
 fi
 

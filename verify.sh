@@ -11,7 +11,7 @@
 # Nothing here leaves the machine in a state other than the one it found.
 set -uo pipefail
 
-BIN=/usr/local/bin/gs66-center
+BIN=/usr/local/bin/msi-control
 EC=/sys/devices/platform/msi-ec
 fail=0
 
@@ -35,8 +35,8 @@ section "driver"
                    || bad "debug interface MISSING — RPM/curves unavailable"
 
 section "daemon"
-systemctl is-active --quiet gs66-centerd && ok "gs66-centerd active" \
-                                        || bad "gs66-centerd not active"
+systemctl is-active --quiet msi-controld && ok "msi-controld active" \
+                                        || bad "msi-controld not active"
 "$BIN" wait --seconds 3 >/dev/null 2>&1 && ok "socket answering" || bad "socket not answering"
 
 section "status"

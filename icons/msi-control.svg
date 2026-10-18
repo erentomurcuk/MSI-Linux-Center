@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  GS66 Center — application icon.
+  MSI Linux Control — application icon.
 
   One shape: MSI's heraldic shield, in MSI red, centred on a transparent
   square.  There is deliberately no tile behind it and no lettering on it —
@@ -23,8 +23,8 @@
   (x + 0.25·w, y + h) — exactly the `QLinearGradient` the GUI builds.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"
-     viewBox="0 0 128 128" role="img" aria-label="GS66 Center">
-  <title>GS66 Center</title>
+     viewBox="0 0 128 128" role="img" aria-label="MSI Linux Control">
+  <title>MSI Linux Control</title>
   <defs>
     <linearGradient id="shield" x1="19" y1="12" x2="41.5" y2="116"
                     gradientUnits="userSpaceOnUse">

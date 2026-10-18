@@ -1,4 +1,4 @@
-# GS66 Center — editor configuration
+# MSI Linux Control — editor configuration
 # https://EditorConfig.org
 root = true
 
@@ -15,10 +15,10 @@ max_line_length = 79
 [*.py]
 indent_size = 4
 
-[src/gs66-center]
+[src/msi-control]
 indent_size = 4
 
-[src/gs66-gui]
+[src/msi-control-gui]
 indent_size = 4
 
 [*.{sh,bash}]
