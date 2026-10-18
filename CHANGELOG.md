@@ -1,14 +1,74 @@
 # Changelog
 
-All notable changes to GS66 Center are recorded here. The format follows
+All notable changes to MSI Linux Control (formerly GS66 Center) are recorded
+here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
-`YYYY-MM-DD` dates.
+`YYYY-MM-DD` dates. Older rows keep the names of their time — `GS66 Center`,
+`gs66-centerd` — because they are history, not stale references.
 
 **Read this file before you trust the tree.** This project has no version
 numbers yet — the sections are dated passes, newest first, and each one is a
 rollback point that matches a by-hand backup taken before the change. Every
 upgrade, fix, or configuration change gets a row here **in the same session**
 it was made; the runbook convention is documented in `CONTRIBUTING.md`.
+
+---
+
+## 2026-10-18 — renamed to MSI Linux Control, and made model-driven
+
+The app is no longer "GS66 Center". It is **MSI Linux Control**, it works on
+any MSI laptop through a model registry, and there are two new documents —
+`AGENTS.md` (for an AI agent working in the tree) and a rewritten
+`CONTRIBUTING.md` (for a person) — that both describe how to add your model and
+open a pull request. 138 offline tests and the GUI smoke suite are green.
+
+### Added
+- **`models/` — the model registry.** One `models/<id>/model.json` per laptop,
+  describing only what differs between machines: the `match` rules (DMI
+  product/board name + EC firmware glob, weighted 50/40/30), the `ec` block
+  (fan-curve and tachometer addresses, RPM constant), the `charge` bounds, the
+  `features` flags, and the model's built-in `profiles`. Loaded and validated at
+  import; the best-scoring model for this machine wins.
+- **`models/gs66-stealth-10se/`** — the worked example: the GS66's `model.json`
+  (the map the old code hard-coded) plus a README recording where each address
+  came from and what was confirmed on hardware.
+- **Unsupported-model mode.** A laptop with no matching model is a *working*
+  state, not a broken one: everything the `msi-ec` driver exposes by itself
+  (temperatures, shift and fan modes, Cooler Boost, the charge limit) keeps
+  working, and fan curves, RPM and the graphics switch are **refused** with a
+  `NotSupported` error instead of being guessed at. The GUI shows an amber
+  banner, a read-only Fans tab and the model in Settings.
+- **`msi-control detect`** — identification and diagnostics: the human report,
+  `--json`, `--write DIR` (a valid draft model), and `--ec-dump` (the
+  256-register map). Needs no root and no running daemon.
+- **`AGENTS.md`** — the repository map written for an AI agent, including the
+  step-by-step "Adding a model" procedure and the PR flow.
+- **`models/README.md`** — the model-file format, field by field.
+- **Tux on the shield.** The app mark is now MSI's red shield with Tux on it;
+  `brand_pixmap()` and `icons/msi-control.svg` carry the same picture and the
+  smoke test still compares them. The tray copy stays the plain tinted shield.
+
+### Changed
+- **Renamed everything user-facing.** CLI `msi-control`, GUI
+  `msi-control-gui`, daemon and service `msi-controld`, socket
+  `/run/msi-controld.sock`, config `/etc/msi-control/`, state
+  `/var/lib/msi-control/`, environment variables `MSI_*`. The daemon *module*
+  is `src/msi_controld.py` (underscore) so it stays importable.
+- **The GS66 is now a profile, not the program.** Its EC addresses moved out of
+  `msi_control.py` into `models/gs66-stealth-10se/model.json`; the code reads
+  them from the active model. The MUX addresses stay in the core because the
+  whole MSI family shares one block; a model only sets `"mux": true`.
+- `README.md`, `APP_DETAILS.md`, `TODO.md`, `CONTRIBUTING.md` generalised from
+  "the GS66" to "MSI laptops", with the GS66 kept as the worked example.
+- `install.sh` copies `models/` into `/usr/local/lib/msi-control/models` and
+  prints a `detect` hint; `verify.sh` gained a model section and only tests the
+  fan-curve write-back when the active model actually has curve registers.
+
+### Not changed on purpose
+- **The hardware's own name.** `GS66 Stealth 10SE`, `MS-16V1`, `16V1EMS1.118`
+  are facts about the laptop and stay as they are.
+- **`third_party/msi-ec/`.** The vendored teackot driver is upstream code; its
+  device strings and file names are not ours to rename.
 
 ---
 

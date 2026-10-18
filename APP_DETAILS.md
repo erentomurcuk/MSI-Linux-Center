@@ -7,19 +7,21 @@ re-deriving it. Companion to [`TODO.md`](TODO.md).
 
 ## 1. What this is
 
-A Linux control centre for the **MSI GS66 Stealth 10SE** laptop, replacing
-MSI Dragon Center: battery charge thresholds, fan speeds / modes / curves,
-performance (shift) modes, Cooler Boost, live monitoring.
+A Linux control centre for **MSI laptops**, replacing MSI Dragon Center:
+battery charge thresholds, fan speeds / modes / curves, performance (shift)
+modes, Cooler Boost, live monitoring. It was written for one machine and then
+generalised, so the laptop-specific facts live in a **model registry**
+(`models/<id>/model.json`) rather than in the code — see §2a.
 
 | Fact | Value |
 |---|---|
-| Target machine | MSI GS66 Stealth 10SE — the dev machine itself |
+| Reference machine | MSI GS66 Stealth 10SE — the dev machine, and the worked example |
 | EC firmware | `16V1EMS1.118` |
 | BIOS | `E16V1IMS.112` |
 | OS | Fedora 44, kernel `7.2.9-201.fc44.x86_64`, KDE Plasma 6 (Wayland) |
 | User | `eren`, uid 1000, in `wheel` |
 | Secure Boot | **disabled** (out-of-tree module requires this) |
-| Project root | `~/Projects/MSIControl` (moved from `~/msi-control` on 2026-10-14) |
+| Project root | `~/Projects/MSI-Linux-Control` (renamed from `~/Projects/MSIControl`, itself moved from `~/msi-control`) |
 
 **GUI toolkit: PySide6 6.11.2** — the user asked for PyQt6; PySide6 was
 substituted because it was already installed. The difference is licensing
@@ -49,8 +51,9 @@ and GUI are unprivileged clients.
   (plain sysfs); writes need it.
 * **`src/msi-control-gui`** — PySide6 GUI, six sections. Never privileged, never
   touches sysfs. All daemon traffic runs on one worker thread.
-* **`src/msi_control.py`** — the EC register map, validation, protocol and
-  paths. Single source of truth so daemon/CLI/GUI can never disagree.
+* **`src/msi_control.py`** — the model registry, the EC register map,
+  validation, protocol and paths. Single source of truth so daemon/CLI/GUI can
+  never disagree, and the place a model file is loaded and validated.
 
 ### Design rules (enforced, not aspirational)
 
@@ -66,10 +69,59 @@ and GUI are unprivileged clients.
 
 `MSI_SYSFS`, `MSI_SOCK`, `MSI_CONFIG`, `MSI_STATE` — let the whole stack
 run against a fake sysfs tree and a RAM-backed EC with no root at all.
+`MSI_MODELS` overrides the model-registry directory, and `MSI_MODEL` forces a
+model id (§2a).
+
+---
+
+## 2a. The model registry
+
+The program is about MSI laptops in general; a **model file** is what makes it
+about *this* laptop. One JSON object per model under `models/<id>/model.json`,
+loaded and validated at import:
+
+| Section | Holds |
+|---|---|
+| `match` | how a machine is recognised — DMI `product_name` (weight 50), `board_name` (40), EC `ec_firmware` glob (30); case-insensitive anchored globs, highest total wins |
+| `ec` | per-model registers: `curve` (cpu/gpu temps + speeds) and `rpm` (`numerator`, cpu/gpu tach addresses) |
+| `charge` | the charge-threshold bounds this firmware accepts |
+| `features` | twelve flags — the four driver ones, the three register-backed, and five optional |
+| `profiles` | this model's built-in profiles (curves are model-specific) |
+
+Full field-by-field reference: [`models/README.md`](models/README.md). The
+worked example is [`models/gs66-stealth-10se/`](models/gs66-stealth-10se/).
+
+Key behaviours:
+
+* **Validated at load, not at use.** A typo in a register is a message naming
+  the file and the field, never a wrong number written to the EC. `fan_curve:
+  true` requires `ec.curve`; `rpm: true` requires `ec.rpm`; `id` must match its
+  directory; no profile may be called `factory`.
+* **Matching nothing is a working state.** The built-in `unknown` model enables
+  everything the `msi-ec` driver exposes by itself (temps, shift/fan modes,
+  Cooler Boost, charge limit) and **refuses** fan curves, RPM and the graphics
+  switch — `NotSupported(feature)` — instead of guessing.
+* **`MSI_MODEL` forcing a missing id is a hard error**, so a typo cannot look
+  like "unsupported". An empty `MSI_MODEL` means auto-detect.
+* Model values are published as module-level globals at the **end** of
+  `msi_control.py` (`MODEL`, `CURVE_REGS`, `N_TEMPS`, `N_SPEEDS`, `RPM_REGS`,
+  `RPM_NUMERATOR`, `CHARGE_MIN`, `CHARGE_MAX`, `BUILTIN_PROFILES`) once every
+  helper they need exists, so the parser can call `clean_profile` et al. while
+  it is still building the model.
+* `msi-control detect` (no root, works with the daemon down) prints the report a
+  contributor pastes into a PR; `--json` machine output; `--write DIR` a valid
+  draft; `--ec-dump` the 256-register map.
+
+The MUX addresses are **not** per-model — the whole MSI family shares one block
+(§3), so a model only sets `"mux": true`.
 
 ---
 
 ## 3. EC register map
+
+> This map is the **GS66 Stealth 10SE's**, and in the program it lives in
+> `models/gs66-stealth-10se/model.json`, not in the code (§2a). It is kept here
+> in full because it is the reasoning and the provenance, not just the numbers.
 
 Cross-checked against YoyPa/isw's `[16V1EMS1]` section + `MSI_ADDRESS_DEFAULT`
 (which carries a real EC dump from a GS66-10SE), teackot/msi-ec `CONF_G1_3`,
@@ -155,6 +207,7 @@ when the module is loaded with `debug=1` (install.sh sets this in
 | Installed path | Source |
 |---|---|
 | `/usr/local/lib/msi-control/` | `msi_control.py`, `msi_controld.py` |
+| `/usr/local/lib/msi-control/models/` | the model registry (`models/<id>/…`), copied whole |
 | `/usr/local/bin/msi-control` | `src/msi-control` |
 | `/usr/local/bin/msi-control-gui` | `src/msi-control-gui` |
 | `/etc/msi-control/config.json` | created by install.sh if absent |
@@ -433,11 +486,17 @@ both had a live-write bug:
 
 ## 9. Tests
 
-**`tests/test_msi_control.py` — 114 tests, offline, unprivileged, ~6 s.**
+**`tests/test_msi_control.py` — 138 tests, offline, unprivileged, ~6 s.**
 
 Runs the *real* daemon (Service + Unix socket server + protocol), the real
 validation and the real CLI as a subprocess, against a fake sysfs tree and a
 RAM-backed EC (`FakeEc`). `MsiEc._xfer_read/_xfer_write` are monkeypatched.
+`MSI_MODELS` points at the repo's `models/` and `MSI_MODEL` pins the GS66 entry,
+so the suite is deterministic on any machine — the model-registry tests
+(`TestRegistry`, `TestModelSelection`, `TestDetectAndDraft`,
+`TestUnsupportedModelGating`) cover validation errors, match scoring, the
+detect/draft round-trip, and that an unsupported model refuses exactly the
+register-backed features and keeps the driver ones.
 
 ```bash
 python3 tests/test_msi_control.py
@@ -525,8 +584,10 @@ Add tests for anything new here; they run in seconds and cost nothing.
 ## 11. Project layout
 
 ```
-MSIControl/
+MSI-Linux-Control/
 ├── src/            msi_control.py · msi_controld.py · msi-control · msi-control-gui
+├── models/         <id>/model.json — the per-model registry (§2a)
+│                   README.md (format) · gs66-stealth-10se/ (worked example)
 ├── tests/          test_msi_control.py · gui_smoke.py · shots/ (dark + light/)
 ├── tools/          hardware probes (need root) — see TODO §third-fan
 │                   ecdump.py · ecprobe.py · fanprobe.py · scan_ec.py
@@ -534,17 +595,18 @@ MSIControl/
 ├── systemd/        msi-controld.service · msi-control-sleep
 ├── modprobe/       msi-ec.conf
 ├── desktop/        msi-control.desktop
-├── icons/          msi-control.svg — the red shield mark, drawn for the
+├── icons/          msi-control.svg — the red shield + Tux mark, drawn for the
 │                   installed icon and mirrored by brand_pixmap()/MARK_BOX
 ├── etc/            config.json (the default install.sh copies in)
 ├── third_party/    msi-ec/   vendored teackot driver v0.13
-├── install.sh      privileged install (DKMS + deploy + services)
+├── install.sh      privileged install (DKMS + deploy + services + models/)
 ├── uninstall.sh    clean removal
 ├── verify.sh       live hardware verification — every shift/fan/charge
 │                   mode, cooler boost, fan-curve write-back round-trip
 ├── Makefile        check / test / smoke / lint / verify / install / clean
 ├── README.md       full research write-up + EC map + safety docs
-├── CONTRIBUTING.md how to work here (tests, style, the one rule)
+├── CONTRIBUTING.md how to work here (tests, style, adding your model, PR flow)
+├── AGENTS.md       the same map for an AI agent — model procedure §6
 ├── CHANGELOG.md    dated passes, newest first
 ├── TODO.md         what is left to do
 └── APP_DETAILS.md  this file

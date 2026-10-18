@@ -1,7 +1,7 @@
 # MSI Linux Control
 
-A Linux control centre for the **MSI GS66 Stealth 10SE** — the things MSI's
-Dragon Center does on Windows, on Fedora/KDE, without Dragon Center:
+A Linux control centre for **MSI laptops** — the things MSI's Dragon Center
+does on Windows, on Linux, without Dragon Center:
 
 * **Battery charge threshold** ("stop charging at 60/80/100%") — the single
   biggest thing you can do for a laptop battery's long-term health.
@@ -15,6 +15,23 @@ Dragon Center does on Windows, on Fedora/KDE, without Dragon Center:
 * **Graphics mode (MUX)** — run the panel off the Intel iGPU (hybrid) or the
   NVIDIA GPU alone (discrete). Off by default; read the warning first.
 * **Live monitoring** — CPU/GPU temperature, fan duty and **RPM**.
+
+Not every laptop is the same, so the laptop-specific facts live in a **model
+registry** under `models/` — one small JSON file per model, holding that
+machine's EC addresses, the features its firmware has, and its built-in
+profiles. Not sure whether yours is supported?
+
+```bash
+msi-control detect          # what laptop am I, and is there a model for it?
+```
+
+A laptop with no model file still **works**: everything the `msi-ec` driver
+exposes by itself — temperatures, shift and fan modes, Cooler Boost, the charge
+limit — keeps going, and only the parts that need per-model registers (fan
+curves, RPM, the graphics switch) are switched off rather than guessed at. The
+GUI says so and points you at `detect`. Adding your model is a documented,
+maybe-an-hour job — see [`CONTRIBUTING.md`](CONTRIBUTING.md) §
+"Adding your model".
 
 Three pieces, deliberately separate:
 
@@ -65,7 +82,13 @@ which **shadows** the in-tree driver. That is intended and reversible
 
 ---
 
-## The EC register map (GS66, firmware family 16V1EMS1)
+## The EC register map (worked example: GS66, firmware family 16V1EMS1)
+
+Every register below is one **model's** — the GS66 Stealth 10SE's — and in the
+program it lives in [`models/gs66-stealth-10se/model.json`](models/gs66-stealth-10se/model.json),
+not in the code. The section is kept here because it is the detailed write-up
+of the map and the reasoning behind it; a model for another laptop is the same
+shape with different addresses (see [`models/README.md`](models/README.md)).
 
 Cross-checked between three independent sources: the [isw](https://github.com/YoyPa/isw)
 project's `16V1EMS1` section (which carries a real EC dump from a GS66-10SE,
@@ -142,6 +165,7 @@ config.
 
 ```bash
 msi-control status            # everything, from the daemon
+msi-control detect            # is this laptop's model file present?
 ls /sys/devices/platform/msi-ec/debug   # present ⇒ RPM + curves available
 systemctl status msi-controld
 ```
@@ -152,6 +176,7 @@ systemctl status msi-controld
 
 ```bash
 msi-control status                       # full state
+msi-control detect                       # identify this laptop + its model file
 msi-control monitor                      # live view
 msi-control mode sport                   # eco|comfort|sport|turbo
 msi-control fan advanced                 # auto|silent|advanced
@@ -170,12 +195,17 @@ msi-control reapply                      # push persisted state back into the EC
 …or run `msi-control-gui` (also in your application menu as **MSI Linux Control**). It has
 six sections, reached from a sidebar: Dashboard, Performance, Fans, Battery,
 Profiles, Settings. The window, the menu entry and the tray all carry the same
-mark — a centred red shield, and nothing else: it is built to be read at the
-16–22 px a taskbar actually renders, where a tile and a model number turn into
-a dark square with a smudge in it — and the tray's copy is tinted by the
-hottest temperature and labelled with it, so you can read the machine's heat
-without opening anything. The Performance section also carries the graphics
-switch, for the same reason MSI Center puts it there.
+mark — MSI's red shield with **Tux** on it, and nothing else: it is built to be
+read at the 16–22 px a taskbar actually renders, where a tile and a model
+number turn into a dark square with a smudge in it — and the tray's copy is
+tinted by the hottest temperature and labelled with it, so you can read the
+machine's heat without opening anything. The Performance section also carries
+the graphics switch, for the same reason MSI Center puts it there.
+
+If no model file matches your laptop, the window carries an amber banner saying
+so, the Fans section goes read-only with a notice, and the Settings section
+shows the model and where to get one — the app degrades to what the firmware
+really supports instead of offering controls it cannot honour.
 
 ### The GUI
 
@@ -360,11 +390,14 @@ so rather than guessing.
 ## Layout
 
 ```
-src/msi_control.py     EC register map, validation, protocol  (shared)
+src/msi_control.py     model registry, EC map, validation, protocol  (shared)
 src/msi_controld.py           the privileged daemon
-src/msi-control        CLI
+src/msi-control        CLI (status · detect · monitor · mode · fan · boost ·
+                       battery · curve · profile · graphics · reapply · raw · wait)
 src/msi-control-gui           PySide6 GUI
-tests/test_msi_control.py     114 offline tests — fake sysfs + RAM-backed EC
+models/<id>/model.json one laptop model — the per-model EC map + features
+models/README.md       the model-file format, field by field
+tests/test_msi_control.py     138 offline tests — fake sysfs + RAM-backed EC
 tests/gui_smoke.py     headless GUI construction + behaviour + screenshots
 tests/shots/           committed screenshots — dark, and light/ beside it
 tools/                 hardware probes (need root) + fixup/recapture helpers
@@ -375,13 +408,13 @@ desktop/ icons/        menu entry + SVG icon
 etc/config.json        the default config template install.sh installs
 install.sh uninstall.sh verify.sh
 Makefile               make check / test / smoke / verify / install …
-README.md CONTRIBUTING.md CHANGELOG.md TODO.md APP_DETAILS.md
+README.md CONTRIBUTING.md AGENTS.md CHANGELOG.md TODO.md APP_DETAILS.md
 ```
 
 ### Tests
 
 ```bash
-python3 tests/test_msi_control.py                     # 114 tests, no root, no hardware
+python3 tests/test_msi_control.py                     # 138 tests, no root, no hardware
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py   # needs PySide6
 
 make check                                     # both of the above + a syntax check
@@ -429,6 +462,8 @@ back, and must not leave the UEFI variable mutable if the write fails.
 | Symptom | Cause / fix |
 |---|---|
 | `msi-control status` says the daemon is down | `systemctl status msi-controld`; check `journalctl -u msi-controld` |
+| The window shows an amber "no model" banner | this laptop has no model file yet — run `msi-control detect`; fan curves, RPM and the graphics switch are off until you add one (see `CONTRIBUTING.md`) |
+| `msi-control detect` reports `matched: NOTHING` | as above — temperatures, shift/fan modes, Cooler Boost and the charge limit still work; a draft is `msi-control detect --write DIR` |
 | Status shows no RPM, no curves | the driver's `debug` interface is off — check `cat /sys/module/msi_ec/parameters/debug`; it needs `debug=1` **at load time** (`modprobe -r msi-ec && modprobe msi-ec`) |
 | `permission denied` on the socket | you are not in `wheel` (or `SocketGroup` was changed) |
 | Driver not present at all | `modprobe msi-ec`; if that fails, `dmesg \| tail -20` — most likely Secure Boot, or headers for a *different* kernel than the one running |

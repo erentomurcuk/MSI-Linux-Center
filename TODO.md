@@ -3,7 +3,7 @@
 Companion to [`APP_DETAILS.md`](APP_DETAILS.md), which holds all the context
 this list assumes. Status markers: `[x]` done · `[~]` deferred · `[ ]` open.
 
-Last updated: 2026-10-17.
+Last updated: 2026-10-18.
 
 ---
 
@@ -13,7 +13,10 @@ Last updated: 2026-10-17.
       msi-ec and the in-tree driver. Daemon + CLI + PySide6 GUI chosen.
 - [x] **All source written** — `msi_control.py`, `msi_controld.py`, `msi-control`,
       `msi-control-gui`.
-- [x] **114 offline tests passing** — `python3 tests/test_msi_control.py`.
+- [x] **Model-driven core + registry** — the laptop-specific facts moved out of
+      the code into `models/<id>/model.json`; 138 offline tests passing. See
+      *Done in the 2026-10-18 rename + model pass* below.
+- [x] **138 offline tests passing** — `python3 tests/test_msi_control.py`.
 - [x] **GUI smoke test with behaviour assertions** — contrast, the battery
       state machine, the curve keyboard path, every confirmation's wording,
       the dashboard's numbers against their labels, and four MUX states. Since
@@ -37,7 +40,8 @@ Last updated: 2026-10-17.
       captured honestly.
 - [x] **`verify.sh` reports ALL CHECKS PASSED** — every shift mode, fan mode,
       cooler boost, charge threshold, fan-curve write-back round-trip.
-- [x] **Moved project** `~/msi-control` → `~/Projects/MSIControl`.
+- [x] **Moved project** `~/msi-control` → `~/Projects/MSIControl` (later
+      renamed in place to `~/Projects/MSI-Linux-Control`, 2026-10-18).
 - [x] **Moved hardware probes** out of `/tmp/opencode/` (wiped nightly) into
       `tools/`.
 - [x] **GUI/UX overhaul + repo preparation** — see *Done in the 2026-10-16
@@ -120,6 +124,43 @@ The `env PATH=…` prefix is **mandatory** — pkexec sanitises `PATH` and drops
 `/usr/local/bin`, so the script dies with `FileNotFoundError: msi-control`.
 Both restore what they touch (fanprobe restores the original curves;
 scan_ec only toggles the Cooler Boost bit).
+
+---
+
+## Done in the 2026-10-18 rename + model pass
+
+The app stopped being "GS66 Center" and became **MSI Linux Control**: renamed,
+generalised to any MSI laptop through a model registry, and documented so the
+next person (or agent) can add their own model.
+
+- [x] **Renamed** — `GS66 Center` → `MSI Linux Control`; CLI `msi-control`, GUI
+      `msi-control-gui`, daemon/service `msi-controld`, socket
+      `/run/msi-controld.sock`, config `/etc/msi-control/`, state
+      `/var/lib/msi-control/`, environment `MSI_*`. The daemon module is
+      `src/msi_controld.py` (underscore) so it stays importable. The hardware's
+      own name (GS66 Stealth 10SE, 16V1EMS1) is a fact and was **not** renamed;
+      neither was anything in `third_party/msi-ec/`.
+- [x] **Model registry** — `models/<id>/model.json` holds `match`, `ec`,
+      `charge`, `features` and `profiles`; loaded and validated at import, scored
+      against DMI + EC firmware, highest score wins.
+- [x] **Unsupported mode** — no matching model is a working state: the driver-
+      provided features keep working, and fan curves / RPM / MUX are refused with
+      `NotSupported` instead of guessed. The GUI shows an amber banner, a
+      read-only Fans tab and the model in Settings.
+- [x] **`msi-control detect`** — `--json`, `--write DIR` (a valid draft model) and
+      `--ec-dump` (the 256-register map). Needs no root and no daemon.
+- [x] **GS66 profile** — `models/gs66-stealth-10se/` with `model.json` and a
+      README recording where every address came from and what was confirmed on
+      hardware.
+- [x] **Tux on the shield** — `brand_pixmap()` draws the mark from one unit-box
+      description (black body, white belly/face, orange beak/feet) and
+      `icons/msi-control.svg` mirrors it; the smoke test compares them. The tray
+      copy stays the plain tinted shield + number.
+- [x] **Docs for contributors and agents** — new `AGENTS.md` (the procedure),
+      a rewritten `CONTRIBUTING.md` ("Adding your model" + PR flow),
+      `models/README.md` (the format, field by field) and a model README.
+- [x] **138 offline tests** — added `TestRegistry`, `TestModelSelection`,
+      `TestDetectAndDraft` and `TestUnsupportedModelGating`.
 
 ---
 
@@ -550,13 +591,13 @@ touching the daemon:
   `StatusNotifierWatcher` by itself, so the shell restart costs nothing.
 
 ```bash
-cd /home/eren/Projects/MSIControl
-make check        # 114 offline + GUI smoke (also: make shots-light)
+cd /home/eren/Projects/MSI-Linux-Control
+make check        # 138 offline + GUI smoke (also: make shots-light)
 
 # 1. deploy — installs only, so no DKMS rebuild and no daemon bounce.
 #    NOTE the absolute paths (and --keep-cwd): pkexec runs PROGRAM in $HOME,
 #    so a bare `install src/...` cannot stat its source — see Housekeeping.
-R=/home/eren/Projects/MSIControl
+R=/home/eren/Projects/MSI-Linux-Control
 pkexec bash -c "install -m 755 $R/src/msi-control-gui /usr/local/bin/msi-control-gui
                 install -m 644 $R/icons/msi-control.svg /usr/share/icons/hicolor/scalable/apps/
                 install -m 644 $R/desktop/msi-control.desktop /usr/share/applications/
