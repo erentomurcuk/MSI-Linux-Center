@@ -29,6 +29,14 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")
 sys.path.insert(0, SRC)
 
+# The registry is model-driven now, and "which model is this machine" is
+# decided at *import* of msi_control.  A test run must not depend on the
+# machine it happens to be on, so pin the model and the registry directory
+# before the import — exactly the escape hatch MSI_MODEL/MSI_MODELS exist for.
+REPO = os.path.dirname(HERE)
+os.environ["MSI_MODELS"] = os.path.join(REPO, "models")
+os.environ["MSI_MODEL"] = "gs66-stealth-10se"
+
 import msi_control as core                      # noqa: E402
 import msi_controld                                    # noqa: E402
 from msi_controld import MsiEc, Service, Server, Handler  # noqa: E402
@@ -1311,6 +1319,303 @@ class TestDaemonProcess(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+# --------------------------------------------------------------------------
+# The model registry
+# --------------------------------------------------------------------------
+
+class TestRegistry(unittest.TestCase):
+    """The model files, and the names they publish into msi_control."""
+
+    def test_tests_pin_a_model_regardless_of_the_machine(self):
+        # A test run must never depend on the laptop it is running on; the
+        # sysfs here is fake and the DMI unknown.  MSI_MODEL is the pin.
+        self.assertEqual(core.MODEL.id, "gs66-stealth-10se")
+        self.assertTrue(core.model_supported())
+
+    def test_the_gs66_registers_are_the_documented_ones(self):
+        # This is the one place a register address may be spelled; the whole
+        # point of the registry is that a wrong address is caught here rather
+        # than written into somebody's EC.
+        c = core.CURVE_REGS
+        self.assertEqual(c["cpu"]["temps"],
+                         [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F])
+        self.assertEqual(c["cpu"]["speeds"],
+                         [0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78])
+        self.assertEqual(c["gpu"]["temps"],
+                         [0x82, 0x83, 0x84, 0x85, 0x86, 0x87])
+        self.assertEqual(c["gpu"]["speeds"],
+                         [0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90])
+        self.assertEqual((core.N_TEMPS, core.N_SPEEDS), (6, 7))
+        self.assertEqual(core.RPM_REGS, {"cpu": 0xCC, "gpu": 0xCA})
+        self.assertEqual(core.RPM_NUMERATOR, 478000)
+        self.assertEqual((core.CHARGE_MIN, core.CHARGE_MAX), (20, 100))
+
+    def test_the_model_declares_the_features_the_gs66_has(self):
+        for name in ("shift", "fan", "cooler_boost", "charge_limit",
+                     "fan_curve", "rpm", "mux"):
+            self.assertTrue(core.feature(name), name)
+        # Nothing here has been proven about these on the GS66.
+        for name in ("webcam", "webcam_block", "super_battery"):
+            self.assertFalse(core.feature(name), name)
+
+    def test_builtin_profiles_are_all_valid(self):
+        self.assertEqual(sorted(core.BUILTIN_PROFILES),
+                         ["balanced", "battery", "gaming", "silent"])
+        for name, prof in core.BUILTIN_PROFILES.items():
+            cleaned = core.clean_profile(prof)
+            self.assertIn("shift", cleaned, name)
+
+    def test_model_json_has_no_pseudo_comment_keys(self):
+        # `// comment` keys are a JSON5 habit; json.load would accept the
+        # string key and the loader would silently ignore it.  Prose belongs
+        # in the README beside the file.
+        path = os.path.join(REPO, "models", "gs66-stealth-10se", "model.json")
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        def walk(node):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    self.assertFalse(str(k).startswith("//"),
+                                     f"pseudo-comment key {k!r}")
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(data)
+
+    def test_the_mux_addresses_live_in_core_not_in_a_model(self):
+        # Every model that enables "mux" drives the same trio, so the
+        # addresses must be shared rather than copied into each model file.
+        for name in ("MUX_EC_ADDR", "MUX_TRIGGER_ADDR", "MUX_EC_MASK"):
+            self.assertTrue(hasattr(core, name), name)
+        path = os.path.join(REPO, "models", "gs66-stealth-10se", "model.json")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        for name in ("MUX_EC_ADDR", "MUX_TRIGGER_ADDR", "\"0x2e\""):
+            self.assertNotIn(name, text)
+
+
+class TestModelSelection(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="msi-models-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _write(self, model_id, data):
+        d = os.path.join(self.tmp, model_id)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "model.json"), "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def _minimal(self, model_id, **match):
+        return {"schema": 1, "id": model_id, "name": model_id.title(),
+                "match": match or {"product_name": ["*"]},
+                "ec": {}, "features": {}}
+
+    def test_a_missing_registry_yields_the_unsupported_model(self):
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty, exist_ok=True)
+        model = core.select_model(hint="", root=empty)
+        self.assertFalse(model.supported)
+        self.assertEqual(model.id, core.UNKNOWN_ID)
+        # and the unsupported model is deliberately conservative
+        self.assertTrue(model.feature("shift"))
+        self.assertFalse(model.feature("fan_curve"))
+        self.assertFalse(model.feature("rpm"))
+        self.assertFalse(model.feature("mux"))
+
+    def test_an_explicit_unknown_id_is_a_loud_error(self):
+        # A typo must not look like "a laptop the registry has never heard
+        # of" — that would hide a broken model file behind a blank screen.
+        with self.assertRaises(core.ModelError):
+            core.select_model(hint="does-not-exist", root=self.tmp)
+
+    def test_id_must_match_the_directory(self):
+        self._write("right-name", self._minimal("wrong-name"))
+        _models, errors = core.load_models(self.tmp)
+        self.assertTrue(any("does not match its directory" in e
+                            for e in errors), errors)
+
+    def test_a_broken_file_is_reported_never_raised(self):
+        good = os.path.join(self.tmp, "good")
+        os.makedirs(good, exist_ok=True)
+        with open(os.path.join(good, "model.json"), "w", encoding="utf-8") as fh:
+            fh.write("{ this is not json")
+        models, errors = core.load_models(self.tmp)
+        self.assertEqual(models, [])
+        self.assertTrue(errors)
+        # select_model on a registry with no usable model is still a state,
+        # not a crash.
+        self.assertFalse(core.select_model(hint="", root=self.tmp).supported)
+
+    def test_the_strongest_match_wins(self):
+        self._write("alpha", {"schema": 1, "id": "alpha", "name": "Alpha",
+                              "match": {"product_name": ["GS66 Stealth 10SE"]},
+                              "ec": {}, "features": {}})
+        self._write("beta", {"schema": 1, "id": "beta", "name": "Beta",
+                             "match": {"product_name": ["GS66 Stealth 10SE"],
+                                       "board_name": ["MS-16V1"]},
+                             "ec": {}, "features": {}})
+        facts = {"product_name": "GS66 Stealth 10SE", "board_name": "MS-16V1"}
+        self.assertGreater(core.match_score(
+            core.load_model_file(os.path.join(self.tmp, "beta", "model.json")),
+            facts),
+            core.match_score(core.load_model_file(
+                os.path.join(self.tmp, "alpha", "model.json")), facts))
+        self.assertEqual(core.select_model(hint="beta", root=self.tmp).id,
+                         "beta")
+
+    def test_a_model_that_claims_a_feature_without_registers_is_rejected(self):
+        with self.assertRaises(core.ModelError):
+            core.Model({"schema": 1, "id": "x", "name": "X",
+                        "match": {"product_name": ["*"]}, "ec": {},
+                        "features": {"fan_curve": True}})
+        with self.assertRaises(core.ModelError):
+            core.Model({"schema": 1, "id": "x", "name": "X",
+                        "match": {"product_name": ["*"]}, "ec": {},
+                        "features": {"rpm": True}})
+
+    def test_an_unknown_feature_flag_is_rejected(self):
+        with self.assertRaises(core.ModelError):
+            core.Model({"schema": 1, "id": "x", "name": "X",
+                        "match": {"product_name": ["*"]}, "ec": {},
+                        "features": {"teleport": True}})
+
+    def test_curve_shape_must_be_consistent_between_fans(self):
+        with self.assertRaises(core.ModelError):
+            core.Model({
+                "schema": 1, "id": "x", "name": "X",
+                "match": {"product_name": ["*"]},
+                "ec": {"curve": {
+                    "cpu": {"temps": [0x6A, 0x6B], "speeds": [0, 1, 2]},
+                    "gpu": {"temps": [0x82], "speeds": [0, 1]},
+                }},
+                "features": {"fan_curve": True}})
+
+    def test_a_factory_named_builtin_profile_is_rejected(self):
+        with self.assertRaises(core.ModelError):
+            core.Model({"schema": 1, "id": "x", "name": "X",
+                        "match": {"product_name": ["*"]}, "ec": {},
+                        "profiles": {"factory": {"shift": "eco"}}})
+
+
+class TestDetectAndDraft(unittest.TestCase):
+    FACTS = {"sys_vendor": "Micro-Star International Co., Ltd.",
+             "product_name": "GS66 Stealth 10SE",
+             "product_version": "REV:1.0",
+             "board_vendor": "Micro-Star International Co., Ltd.",
+             "board_name": "MS-16V1", "board_version": "REV:1.0",
+             "bios_version": "E16V1IMS.112",
+             "ec_firmware": "16V1EMS1.118",
+             "ec_firmware_date": "2021-02-04T16:46:37"}
+
+    def test_model_id_from_name(self):
+        self.assertEqual(core.model_id_from_name("GS66 Stealth 10SE"),
+                         "gs66-stealth-10se")
+        self.assertEqual(core.model_id_from_name("  MSI  ??  "),
+                         "msi")
+        self.assertEqual(core.model_id_from_name(""), "my-msi-laptop")
+
+    def test_firmware_glob_drops_the_revision(self):
+        # A pinned revision stops matching the moment the user updates the
+        # firmware, which is the opposite of a registry entry's job.
+        self.assertEqual(core.firmware_glob("16V1EMS1.118"), "16V1EMS1.*")
+        self.assertEqual(core.firmware_glob("16V1EMS1"), "16V1EMS1")
+        self.assertEqual(core.firmware_glob(""), "")
+
+    def test_the_draft_is_valid_and_modest(self):
+        draft = core.draft_model(self.FACTS)
+        # It must survive the same validation a hand-written model does.
+        model = core.Model(draft)
+        self.assertEqual(model.id, "gs66-stealth-10se")
+        # and it must claim nothing that needs a register nobody has found
+        for name in ("fan_curve", "rpm", "mux"):
+            self.assertFalse(model.feature(name), name)
+        for name in ("shift", "fan", "cooler_boost", "charge_limit"):
+            self.assertTrue(model.feature(name), name)
+        # the match rules come from the hardware
+        self.assertEqual(model.match["board_name"], ["MS-16V1"])
+        self.assertEqual(model.match["ec_firmware"], ["16V1EMS1.*"])
+
+    def test_write_draft_writes_the_file_and_refuses_to_clobber(self):
+        tmp = tempfile.mkdtemp(prefix="msi-draft-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        dest = os.path.join(tmp, "my-machine")
+        path = core.write_draft(dest, self.FACTS)
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["id"], "gs66-stealth-10se")
+        with self.assertRaises(core.ModelError):
+            core.write_draft(dest, self.FACTS)
+
+    def test_render_detect_names_the_machine_and_the_ec_map(self):
+        report = {
+            "machine": self.FACTS,
+            "driver": {"present": True, "debug": True,
+                       "shift_modes": ["eco", "sport"], "fan_modes": ["auto"],
+                       "attributes": ["shift_mode"], "missing_attributes": []},
+            "registry": {"dir": "/x/models", "models": ["gs66-stealth-10se"],
+                         "errors": []},
+            "matched": {"id": "gs66-stealth-10se",
+                        "name": "MSI GS66 Stealth 10SE", "score": 120},
+            "candidates": [{"id": "gs66-stealth-10se",
+                            "name": "MSI GS66 Stealth 10SE", "score": 120}],
+            "ec_dump": {"readable": True, "bytes": {"00": "00", "2e": "40"}},
+        }
+        text = core.render_detect(report)
+        self.assertIn("GS66 Stealth 10SE", text)
+        self.assertIn("EC dump (256 registers", text)
+        # the byte at 0x2e is rendered somewhere in the 0x20 row
+        self.assertIn("40", text)
+
+    def test_render_detect_says_so_when_nothing_matches(self):
+        report = {
+            "machine": {"product_name": "MSI Unknown"},
+            "driver": {"present": True, "debug": False, "shift_modes": [],
+                       "fan_modes": [], "attributes": [],
+                       "missing_attributes": []},
+            "registry": {"dir": "/x/models", "models": [], "errors": []},
+            "matched": None, "candidates": [],
+        }
+        text = core.render_detect(report)
+        self.assertIn("NOTHING", text)
+
+
+class TestUnsupportedModelGating(unittest.TestCase):
+    """With the unsupported model active, register-backed controls refuse."""
+
+    def setUp(self):
+        self._patch = mock.patch.object(core, "MODEL", core.Model.unknown())
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def test_core_features_are_off(self):
+        self.assertFalse(core.feature("fan_curve"))
+        self.assertFalse(core.feature("rpm"))
+        self.assertFalse(core.feature("mux"))
+        # driver-provided controls stay available
+        self.assertTrue(core.feature("shift"))
+        self.assertTrue(core.feature("cooler_boost"))
+
+    def test_the_daemon_refuses_a_curve_write(self):
+        ec = MsiEc()
+        from msi_controld import NotSupported
+        with self.assertRaises(NotSupported):
+            ec.set_curve("cpu", [1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 5, 6])
+        with self.assertRaises(NotSupported):
+            ec.curve("cpu")
+        with self.assertRaises(NotSupported):
+            ec.rpm("cpu")
+
+    def test_the_refusal_explains_itself(self):
+        from msi_controld import NotSupported
+        with self.assertRaises(NotSupported) as ctx:
+            raise NotSupported.feature("fan_curve")
+        text = str(ctx.exception)
+        self.assertIn("detect", text)
+        self.assertIn("models/README.md", text)
 
 
 if __name__ == "__main__":

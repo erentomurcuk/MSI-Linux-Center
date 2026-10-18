@@ -74,6 +74,28 @@ class BackendError(RuntimeError):
     """A hardware/driver-level failure.  Message is safe to show users."""
 
 
+class NotSupported(ValidationError):
+    """The active model does not declare a feature this request needs.
+
+    A `ValidationError` so the socket layer answers with the same
+    `{"ok": false, "error": …}` shape every other refusal uses, but a distinct
+    class so a caller (and a test) can tell *"you are not allowed to do that"*
+    from *"this laptop cannot do that at all"*.
+    """
+
+    @classmethod
+    def feature(cls, name: str, model=None) -> "NotSupported":
+        model = model or core.active_model()
+        if model.supported:
+            detail = (f"the {model.name} ({model.id}) model definition does "
+                      f"not enable {name!r}")
+        else:
+            detail = (f"no model definition matches this machine yet, so "
+                      f"{name!r} is off — run `msi-control detect` and "
+                      f"contribute one")
+        return cls(f"{detail}.  See models/README.md.")
+
+
 # fs ioctl numbers for the inode flags, used to lift the immutable attribute
 # off an efivarfs file and put it back (there is no os.chflags on Linux, and
 # the daemon spawns no subprocesses).  Values are from <linux/fs.h>.
@@ -205,6 +227,8 @@ class MsiEc:
 
     def curve(self, which: str) -> dict:
         core.check_choice(which, ("cpu", "gpu"), "fan curve")
+        if not core.feature("fan_curve"):
+            raise NotSupported.feature("fan_curve")
         regs = core.CURVE_REGS[which]
         with self.lock:
             temps = [self.ec_read(a) for a in regs["temps"]]
@@ -212,6 +236,8 @@ class MsiEc:
         return {"temps": temps, "speeds": speeds}
 
     def set_curve(self, which: str, temps, speeds) -> dict:
+        if not core.feature("fan_curve"):
+            raise NotSupported.feature("fan_curve")
         temps, speeds = core.check_curve(temps, speeds)
         regs = core.CURVE_REGS[which]
         with self.lock:
@@ -223,6 +249,8 @@ class MsiEc:
 
     def rpm(self, which: str) -> int | None:
         core.check_choice(which, ("cpu", "gpu"), "fan")
+        if not core.feature("rpm"):
+            raise NotSupported.feature("rpm")
         addr = core.RPM_REGS[which]
         try:
             hi, lo = self.ec_read(addr), self.ec_read(addr + 1)
@@ -472,7 +500,7 @@ class Profiles:
 
     def save(self, name: str, data: dict) -> None:
         core.check_profile_name(name)
-        prof = self.clean(data)
+        prof = core.clean_profile(data)
         prof["name"] = name
         tmp = self._path(name) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -488,35 +516,6 @@ class Profiles:
             os.unlink(self._path(name))
         except FileNotFoundError:
             raise ValidationError(f"profile {name!r} does not exist") from None
-
-    @staticmethod
-    def clean(data: dict) -> dict:
-        """Keep only known keys, validated — a stored profile is untrusted
-        input the next boot will replay into the EC."""
-        if not isinstance(data, dict):
-            raise ValidationError("profile must be an object")
-        out = {}
-        if "shift" in data and data["shift"] is not None:
-            out["shift"] = str(data["shift"])
-        if "fan" in data and data["fan"] is not None:
-            out["fan"] = str(data["fan"])
-        if "cooler_boost" in data and data["cooler_boost"] is not None:
-            out["cooler_boost"] = bool(data["cooler_boost"])
-        if "charge_end" in data and data["charge_end"] is not None:
-            out["charge_end"] = core.check_charge_end(data["charge_end"])
-        if "curve" in data and data["curve"] is not None:
-            curve = data["curve"]
-            if not isinstance(curve, dict):
-                raise ValidationError("curve must be an object")
-            out["curve"] = {}
-            for which in ("cpu", "gpu"):
-                if which in curve and curve[which] is not None:
-                    c = curve[which]
-                    t, s = core.check_curve(c.get("temps"), c.get("speeds"))
-                    out["curve"][which] = {"temps": t, "speeds": s}
-        if not out:
-            raise ValidationError("profile has no settings")
-        return out
 
 
 # --------------------------------------------------------------------------
@@ -545,12 +544,13 @@ class Service:
         st["partial"] = False
         debug = os.path.isdir(self.ec._p("debug"))
         st["driver"]["debug"] = debug
-        if debug:
+        if debug and core.feature("rpm"):
             for which in ("cpu", "gpu"):
                 try:
                     st[which]["rpm"] = self.ec.rpm(which)
                 except BackendError:
                     st[which]["rpm"] = None
+        if debug and core.feature("fan_curve"):
             st["curve"] = {}
             for which in ("cpu", "gpu"):
                 try:
@@ -588,7 +588,7 @@ class Service:
             snap["cooler_boost"] = st["cooler_boost"] == "on"
         if st["battery"] and st["battery"]["charge_end"] is not None:
             snap["charge_end"] = st["battery"]["charge_end"]
-        if st["curve"]:
+        if st.get("curve"):
             snap["curve"] = st["curve"]
         return snap
 
@@ -692,6 +692,8 @@ class Service:
             raise ValidationError(
                 "the graphics (MUX) switch is disabled — set "
                 f"\"AllowMuxSwitch\": true in {core.config_path()} first")
+        if not core.feature("mux"):
+            raise NotSupported.feature("mux")
         mode = core.check_mux_mode(mode)
         before = self.graphics()
         if not before["supported"]:
@@ -737,6 +739,8 @@ class Service:
             raise ValidationError(
                 "the graphics (MUX) switch is disabled — set "
                 f"\"AllowMuxSwitch\": true in {core.config_path()} first")
+        if not core.feature("mux"):
+            raise NotSupported.feature("mux")
         rec = self._mux_backup_read()
         if not rec:
             raise BackendError("no graphics-mode backup has been taken yet")
@@ -804,7 +808,7 @@ class Service:
             self.ec.set("shift", prof["shift"])
         if prof.get("fan") is not None:
             self.ec.set("fan", prof["fan"])
-        curve = prof.get("curve") or {}
+        curve = (prof.get("curve") or {}) if core.feature("fan_curve") else {}
         curve_notes = []
         curve_acts = []
         for which in ("cpu", "gpu"):
@@ -886,6 +890,9 @@ class Service:
 
     def capture_factory(self) -> None:
         """Save the untouched firmware curve once, so it can always come back."""
+        if not core.feature("fan_curve"):
+            # Nothing to capture: this model has no curve registers defined.
+            return
         if os.path.exists(self.profiles._path("factory")):
             return
         try:
@@ -985,8 +992,9 @@ class Service:
                     "shift": st["shift"]["current"],
                     "fan": st["fan"]["current"],
                     "cooler_boost": st["cooler_boost"] == "on",
-                    "curve": st["curve"],
                 }
+                if st.get("curve"):
+                    data["curve"] = st["curve"]
                 if st["battery"] and st["battery"]["charge_end"] is not None:
                     data["charge_end"] = st["battery"]["charge_end"]
                 self.profiles.save(name_, data)

@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""msi-control — shared core: EC register map, paths, protocol, validation.
+"""msi_control — shared core: model registry, registers, paths, protocol.
 
-Everything userspace knows about the MSI GS66 10SE embedded controller lives
-here, in one place, so the daemon, the CLI and the GUI can never disagree
-about a register address or a value range.
+Everything the daemon, the CLI and the GUI have to agree about lives here:
+the paths, the wire protocol, the validation, and the **model registry** —
+one JSON file per laptop model under `models/`, holding the EC addresses,
+feature flags and built-in profiles that differ between MSI machines.
 
-EC register map sources (cross-checked against each other):
-  * isw's [16V1EMS1] section + MSI_ADDRESS_DEFAULT profile (YoyPa/isw),
-    which carries a real EC dump from a GS66-10SE (EC 16V1EMS1).
-  * teackot/msi-ec CONF_G1_3, the out-of-tree msi-ec configuration that
-    explicitly lists "16V1EMS1.118 // GS66 Stealth 10SE".
-  * the in-tree drivers/platform/x86/msi-ec.c charge-control semantics
-    (start and end thresholds are one EC byte, always 10% apart).
+A model is chosen once, at import.  MSI_MODEL forces one by id (the tests
+use that); otherwise every `models/*/model.json` is scored against this
+machine's DMI identity and EC firmware.  Matching nothing is a working state
+rather than a broken one: the *unsupported* model still reads and writes
+everything the msi-ec driver exposes by itself (temperatures, shift and fan
+modes, cooler boost, the charge threshold) and refuses what needs
+model-specific register knowledge (fan curves, RPM, the graphics switch)
+instead of guessing at it.  `msi-control detect` prints the report a
+contributor needs in order to add their model to the registry.
 
 Everything here is stdlib-only on purpose: the daemon runs as root and the
-CLI must work in recovery shells.
+CLI must work in a recovery shell.
 """
 
 from __future__ import annotations
@@ -54,34 +57,739 @@ def power_dir() -> str:
     return os.path.join(sysfs_root(), "class", "power_supply")
 
 
+def dmi_dir() -> str:
+    return os.path.join(sysfs_root(), "class", "dmi", "id")
+
+
+def models_dir() -> str:
+    """Where `models/<id>/model.json` live.
+
+    Source tree: `<repo>/models`, since this file is `<repo>/src/...`.
+    Installed: `/usr/local/lib/msi-control/models`, beside this module.  The
+    first candidate that exists wins; `MSI_MODELS` overrides both, which is
+    how the tests point at a throwaway registry and how a contributor can
+    try out a model without installing it.
+    """
+    override = os.environ.get("MSI_MODELS")
+    if override:
+        return override
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [os.path.join(here, "models"),
+                  os.path.join(here, os.pardir, "models"),
+                  "/usr/local/lib/msi-control/models",
+                  "/usr/lib/msi-control/models"]
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return os.path.realpath(cand)
+    # Nothing on disk yet: name the source-tree location so an error message
+    # points at the directory a contributor would create.
+    return os.path.realpath(candidates[1])
+
+
 # --------------------------------------------------------------------------
-# EC register map for the GS66 (EC firmware family 16V1EMS1)
+# The model registry
+#
+# This is what makes the program about MSI laptops in general instead of
+# about one of them.  A model file describes only the parts that differ
+# between machines:
+#
+#   match      how a machine is recognised (DMI + EC firmware globs)
+#   ec         fan-curve and tachometer addresses, the RPM constant
+#   charge     the charge-threshold bounds the firmware accepts
+#   features   what this firmware can actually do
+#   profiles   this model's built-in profiles (curves are model-specific)
+#
+# Shift modes, fan modes, cooler boost and the charge threshold are NOT here,
+# because the msi-ec driver exposes them through sysfs on every machine it
+# binds to — they are model-independent facts, and the driver's own
+# `available_*_modes` attributes say which values a given firmware accepts.
+#
+# A model file is validated when it is loaded, not when it is used: a typo in
+# a register address is then a message naming the file and the field, rather
+# than a wrong number written into the embedded controller.
 # --------------------------------------------------------------------------
 
-# Fan-curve registers.  Six temperature thresholds and seven fan-speed
-# levels: the fan spins at speeds[0] until the temperature passes temps[0],
-# then speeds[1] … speeds[6].  Confirmed byte-for-byte against the EC dump
-# published in YoyPa/isw issue #220 (GS66-10SE).
-CURVE_REGS = {
-    "cpu": {"temps": list(range(0x6A, 0x70)), "speeds": list(range(0x72, 0x79))},
-    "gpu": {"temps": list(range(0x82, 0x88)), "speeds": list(range(0x8A, 0x91))},
+MODEL_SCHEMA = 1
+
+# Feature flags a model may declare.  The first four are driver-provided and
+# are additionally checked at runtime against the attributes that exist; the
+# next three need raw EC knowledge and are refused outright when false; the
+# last five are optional driver features that only some firmwares have.
+MODEL_FEATURES = (
+    "shift", "fan", "cooler_boost", "charge_limit",
+    "fan_curve", "rpm", "mux",
+    "webcam", "webcam_block", "super_battery", "fn_key", "win_key",
+)
+
+# What a machine can do when nobody has written a model file for it: exactly
+# what the driver exposes by itself.  Deliberately not optimistic — every
+# `False` here is a control the user would otherwise be offered and then
+# refused, and one of them (mux) can leave a laptop with no display.
+UNKNOWN_FEATURES = {
+    "shift": True, "fan": True, "cooler_boost": True, "charge_limit": True,
+    "fan_curve": False, "rpm": False, "mux": False,
+    "webcam": False, "webcam_block": False, "super_battery": False,
+    "fn_key": False, "win_key": False,
 }
 
-# Tachometer: two bytes, big-endian period count.  isw derives RPM as
-# 478000 // period — reproduced here verbatim because a wrong constant
-# silently prints plausible-looking nonsense.
-RPM_NUMERATOR = 478000
-RPM_REGS = {"cpu": 0xCC, "gpu": 0xCA}
+UNKNOWN_ID = "unknown"
 
-N_TEMPS = 6
-N_SPEEDS = 7
+CHARGE_MIN_DEFAULT = 20
+CHARGE_MAX_DEFAULT = 100
+
+# Fields of `match` and how much each one is worth when it hits.  The DMI
+# product name is the strongest signal; the EC firmware is weaker because
+# firmwares are shared across a model family, and it is what saves a machine
+# whose DMI string the vendor changed between BIOS revisions.
+MATCH_WEIGHTS = (("product_name", 50), ("board_name", 40), ("ec_firmware", 30))
+
+
+class ModelError(RuntimeError):
+    """A model file is malformed.  The message names the file and the field."""
+
+
+def _glob_match(pattern, value) -> bool:
+    """Case-insensitive glob, anchored at both ends (`16V1EMS1.*`)."""
+    if not isinstance(pattern, str) or not isinstance(value, str):
+        return False
+    return re.fullmatch(pattern.strip(), value.strip(), re.IGNORECASE) is not None
+
+
+def _as_addr(value, what: str = "EC address") -> int:
+    """An EC address as an int.  Accepts 106, "106" and "0x6a".
+
+    Addresses are written in hex in the model files because that is how the
+    EC documentation, the runbook and the driver's own `ec_get` all speak;
+    reading them back as ints is the one place that formatting stops.
+    """
+    if isinstance(value, bool):
+        raise ModelError(f"{what}: {value!r} is not an address")
+    if isinstance(value, int):
+        addr = value
+    elif isinstance(value, str):
+        text = value.strip().lower()
+        try:
+            addr = int(text, 16) if text.startswith("0x") else int(text, 10)
+        except ValueError:
+            raise ModelError(
+                f"{what}: {value!r} is not an address "
+                "(use hex like \"0x6a\", or a decimal integer)") from None
+    else:
+        raise ModelError(f"{what}: {value!r} is not an address")
+    if not 0 <= addr <= 0xFF:
+        raise ModelError(f"{what}: {value!r} is outside 0x00..0xff")
+    return addr
+
+
+def _as_int(value, what: str, lo: int, hi: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ModelError(f"{what}: {value!r} is not an integer")
+    if not lo <= value <= hi:
+        raise ModelError(f"{what}: {value} is outside {lo}..{hi}")
+    return value
+
+
+def _as_text(value, what: str, required: bool = False) -> str | None:
+    if value is None:
+        if required:
+            raise ModelError(f"missing required field {what!r}")
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ModelError(f"{what} must be a non-empty string")
+    return value.strip()
+
+
+class Model:
+    """One laptop model: its EC addresses, features and built-in profiles."""
+
+    def __init__(self, data: dict, source: str | None = None):
+        if not isinstance(data, dict):
+            raise ModelError("a model file must contain a JSON object")
+        self.source = source
+        self.where = source or "<built-in>"
+
+        schema = data.get("schema", MODEL_SCHEMA)
+        if schema != MODEL_SCHEMA:
+            raise ModelError(
+                f"unsupported model schema {schema!r} "
+                f"(this build understands schema {MODEL_SCHEMA})")
+
+        self.id = self._text(data, "id", required=True)
+        if not PROFILE_NAME_RE.match(self.id):
+            raise ModelError(
+                f"id {self.id!r} must be lower-case letters, digits and "
+                "hyphens (it is used as a directory name and a lookup key)")
+        self.name = self._text(data, "name") or self.id
+        self.vendor = self._text(data, "vendor") or \
+            "Micro-Star International Co., Ltd."
+        self.status = self._text(data, "status") or "stable"
+        self.notes = self._text(data, "notes") or ""
+        prov = data.get("provenance") or []
+        self.provenance = [str(p) for p in prov] if isinstance(prov, list) \
+            else [str(prov)]
+
+        self.match = self._match(data.get("match") or {})
+
+        ec = data.get("ec") or {}
+        if not isinstance(ec, dict):
+            raise ModelError("`ec` must be an object")
+        self.curve_regs, self._n_temps, self._n_speeds = \
+            self._curve(ec.get("curve") or {})
+        self.rpm_regs, self.rpm_numerator = self._rpm(ec.get("rpm") or {})
+
+        # `_features` cross-checks the flags against the registers, so it has
+        # to run *after* the EC block above.
+        self.features = dict(UNKNOWN_FEATURES)
+        self._features(data.get("features") or {})
+
+        charge = data.get("charge") or {}
+        if not isinstance(charge, dict):
+            raise ModelError("`charge` must be an object")
+        self.charge_min = _as_int(charge.get("min", CHARGE_MIN_DEFAULT),
+                                  "charge.min", 1, 100)
+        self.charge_max = _as_int(charge.get("max", CHARGE_MAX_DEFAULT),
+                                  "charge.max", 1, 100)
+        if self.charge_min >= self.charge_max:
+            raise ModelError(
+                f"charge: min {self.charge_min} is not below max "
+                f"{self.charge_max}")
+
+        self.profiles = self._profiles(data.get("profiles") or {})
+
+    # -- parsing helpers ---------------------------------------------------
+
+    def _text(self, data, key, required=False) -> str | None:
+        try:
+            return _as_text(data.get(key), key, required)
+        except ModelError as e:
+            raise ModelError(f"{self.where}: {e}") from None
+
+    def _match(self, match: dict) -> dict:
+        if not isinstance(match, dict):
+            raise ModelError(f"{self.where}: `match` must be an object")
+        out = {}
+        for field, _weight in MATCH_WEIGHTS:
+            raw = match.get(field) or []
+            if isinstance(raw, str):
+                raw = [raw]
+            if not isinstance(raw, list) or \
+                    not all(isinstance(p, str) and p.strip() for p in raw):
+                raise ModelError(
+                    f"{self.where}: match.{field} must be a string or a list "
+                    "of non-empty strings")
+            out[field] = [p.strip() for p in raw]
+        if not any(out.values()):
+            raise ModelError(
+                f"{self.where}: `match` names nothing, so this model could "
+                "never be selected")
+        return out
+
+    def _features(self, given: dict) -> None:
+        if not isinstance(given, dict):
+            raise ModelError(f"{self.where}: `features` must be an object")
+        for key, value in given.items():
+            if key not in MODEL_FEATURES:
+                raise ModelError(
+                    f"{self.where}: unknown feature {key!r} "
+                    f"(want one of {', '.join(MODEL_FEATURES)})")
+            if not isinstance(value, bool):
+                raise ModelError(
+                    f"{self.where}: feature {key!r} must be true or false")
+            self.features[key] = value
+        if self.features["rpm"] and not self.rpm_regs:
+            raise ModelError(
+                f"{self.where}: \"rpm\": true but ec.rpm has no addresses")
+        if self.features["fan_curve"] and not self.curve_regs:
+            raise ModelError(
+                f"{self.where}: \"fan_curve\": true but ec.curve has no "
+                "registers")
+
+    def _curve(self, curve) -> tuple:
+        """`{"cpu": {...}}` from the file; also the curve *shape*."""
+        if not curve:
+            return {}, N_TEMPS_DEFAULT, N_SPEEDS_DEFAULT
+        if not isinstance(curve, dict):
+            raise ModelError(f"{self.where}: ec.curve must be an object")
+        regs = {}
+        shape = None
+        for which, spec in curve.items():
+            if which not in ("cpu", "gpu"):
+                raise ModelError(
+                    f"{self.where}: ec.curve has unknown fan {which!r} "
+                    "(want cpu and/or gpu)")
+            if not isinstance(spec, dict):
+                raise ModelError(
+                    f"{self.where}: ec.curve.{which} must be an object")
+            temps = [_as_addr(a, f"ec.curve.{which}.temps")
+                     for a in spec.get("temps") or []]
+            speeds = [_as_addr(a, f"ec.curve.{which}.speeds")
+                      for a in spec.get("speeds") or []]
+            if len(speeds) != len(temps) + 1:
+                raise ModelError(
+                    f"{self.where}: ec.curve.{which} has {len(temps)} "
+                    f"thresholds and {len(speeds)} speeds — a step function "
+                    "always has one more speed than threshold")
+            if not temps:
+                raise ModelError(f"{self.where}: ec.curve.{which} is empty")
+            if shape is None:
+                shape = (len(temps), len(speeds))
+            elif shape != (len(temps), len(speeds)):
+                raise ModelError(
+                    f"{self.where}: every fan's curve must have the same "
+                    f"shape ({which} has {len(temps)}/{len(speeds)}, "
+                    f"another fan has {shape[0]}/{shape[1]})")
+            regs[which] = {"temps": temps, "speeds": speeds}
+        n_temps, n_speeds = shape
+        return regs, n_temps, n_speeds
+
+    def _rpm(self, rpm) -> tuple:
+        if not rpm:
+            return {}, RPM_NUMERATOR_DEFAULT
+        if not isinstance(rpm, dict):
+            raise ModelError(f"{self.where}: ec.rpm must be an object")
+        numerator = _as_int(rpm.get("numerator", RPM_NUMERATOR_DEFAULT),
+                            "ec.rpm.numerator", 1, 10 ** 9)
+        regs = {}
+        for which in ("cpu", "gpu"):
+            if which in rpm:
+                regs[which] = _as_addr(rpm[which], f"ec.rpm.{which}")
+        if not regs:
+            raise ModelError(
+                f"{self.where}: ec.rpm names no fan (want cpu and/or gpu)")
+        return regs, numerator
+
+    def _profiles(self, given: dict) -> dict:
+        if not isinstance(given, dict):
+            raise ModelError(f"{self.where}: `profiles` must be an object")
+        out = {}
+        for name, prof in given.items():
+            if name == "factory":
+                raise ModelError(
+                    f"{self.where}: a built-in profile may not be called "
+                    "\"factory\" — that name is reserved for the curve "
+                    "captured from the EC on first run")
+            if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+                raise ModelError(
+                    f"{self.where}: bad profile name {name!r} "
+                    "(want 1-32 chars of [A-Za-z0-9_-])")
+            try:
+                out[name] = clean_profile(prof, self.n_temps, self.n_speeds,
+                                          self.charge_min, self.charge_max)
+            except ValidationError as e:
+                raise ModelError(
+                    f"{self.where}: profile {name!r}: {e}") from None
+        return out
+
+    # -- what the rest of the program asks a model -------------------------
+
+    @property
+    def n_temps(self) -> int:
+        return self._n_temps
+
+    @property
+    def n_speeds(self) -> int:
+        return self._n_speeds
+
+    @property
+    def supported(self) -> bool:
+        return self.id != UNKNOWN_ID
+
+    def feature(self, name: str) -> bool:
+        return bool(self.features.get(name, False))
+
+    def summary(self) -> dict:
+        """The model as the front-ends and `/api`-style callers want it."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "vendor": self.vendor,
+            "status": self.status,
+            "supported": self.supported,
+            "source": self.source,
+            "features": dict(self.features),
+        }
+
+    @classmethod
+    def unknown(cls) -> "Model":
+        return cls({"id": UNKNOWN_ID,
+                    "name": "Unrecognised MSI laptop",
+                    "status": "unknown",
+                    "match": {"product_name": ["*"]}})
+
+    def __repr__(self) -> str:
+        return f"<Model {self.id} from {self.where}>"
+
+
+
+# --------------------------------------------------------------------------
+# Loading and choosing a model
+# --------------------------------------------------------------------------
+
+# Shape defaults, used only when a model declares no curve at all (in which
+# case `features.fan_curve` must be false and nothing ever asks the shape).
+N_TEMPS_DEFAULT, N_SPEEDS_DEFAULT = 6, 7
+RPM_NUMERATOR_DEFAULT = 478000
+
+
+def model_files(root: str | None = None) -> list:
+    """Every `models/<id>/model.json`, sorted by id."""
+    root = root or models_dir()
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        path = os.path.join(root, name, "model.json")
+        if os.path.isfile(path):
+            out.append((name, path))
+    return out
+
+
+def load_model_file(path: str) -> Model:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as e:
+        raise ModelError(f"cannot read {path}: {e.strerror or e}") from e
+    except json.JSONDecodeError as e:
+        raise ModelError(f"{path} is not valid JSON: {e}") from e
+    model = Model(data, source=path)
+    # The directory name and the `id` are two ways of saying the same thing;
+    # letting them disagree would make the registry depend on how it is read.
+    want = os.path.basename(os.path.dirname(os.path.realpath(path)))
+    if want != model.id:
+        raise ModelError(
+            f"{path}: id {model.id!r} does not match its directory {want!r}")
+    return model
+
+
+def load_models(root: str | None = None) -> tuple:
+    """`(models, errors)` — a broken model file never stops the others.
+
+    A malformed file is reported rather than raised, because the machine it
+    breaks for is most likely *not* the machine its author is sitting at, and
+    the person who can fix it is reading `msi-control detect` on theirs.
+    """
+    models, errors = [], []
+    for _id, path in model_files(root):
+        try:
+            models.append(load_model_file(path))
+        except ModelError as e:
+            errors.append(str(e))
+    return models, errors
+
+
+def machine_facts() -> dict:
+    """This machine's identity: DMI strings plus the EC firmware revision.
+
+    All of it is world-readable, so `detect` works without root and works
+    with the daemon down — which is exactly when somebody is most likely to
+    be asking what this laptop is.
+    """
+    ec = msi_ec_dir()
+
+    def dmi(field):
+        return _read_opt(os.path.join(dmi_dir(), field))
+
+    return {
+        "sys_vendor": dmi("sys_vendor"),
+        "product_name": dmi("product_name"),
+        "product_version": dmi("product_version"),
+        "board_vendor": dmi("board_vendor"),
+        "board_name": dmi("board_name"),
+        "board_version": dmi("board_version"),
+        "bios_version": dmi("bios_version"),
+        "ec_firmware": _read_opt(os.path.join(ec, "fw_version")),
+        "ec_firmware_date": _read_opt(os.path.join(ec, "fw_release_date")),
+    }
+
+
+def match_score(model: Model, facts: dict) -> int:
+    """How well `model` describes `facts`.  0 means "not this machine"."""
+    score = 0
+    for field, weight in MATCH_WEIGHTS:
+        value = facts.get(field)
+        if value and any(_glob_match(p, value)
+                         for p in model.match.get(field, [])):
+            score += weight
+    return score
+
+
+def select_model(hint: str | None = None, root: str | None = None) -> Model:
+    """Pick this machine's model, or the unsupported one.
+
+    `hint` (or MSI_MODEL) forces an id: an *explicit* request for a model
+    that is not there is an error, because silently falling back would make a
+    typo look like a machine the registry has never heard of.
+    """
+    models, errors = load_models(root)
+    hint = (hint if hint is not None
+            else os.environ.get("MSI_MODEL", "")).strip()
+    if hint:
+        for model in models:
+            if model.id == hint:
+                return model
+        known = ", ".join(m.id for m in models) or \
+            "none found in " + (root or models_dir())
+        raise ModelError(
+            f"MSI_MODEL={hint!r} is not in the registry (known models: "
+            f"{known})" + ("\n  " + "\n  ".join(errors) if errors else ""))
+    facts = machine_facts()
+    best, best_score = None, 0
+    for model in sorted(models, key=lambda m: m.id):
+        score = match_score(model, facts)
+        if score > best_score:
+            best, best_score = model, score
+    return best if best is not None else Model.unknown()
+
+
+# --------------------------------------------------------------------------
+# What the contributor-facing `detect` command reports
+# --------------------------------------------------------------------------
+
+# The sysfs attributes of the msi-ec driver this program cares about.
+# `detect` lists which of them a machine actually has, because absence is the
+# only reliable statement a firmware makes about a feature it lacks.
+DRIVER_ATTRS = ("shift_mode", "fan_mode", "cooler_boost", "webcam",
+                "webcam_block", "super_battery", "fn_key", "win_key",
+                "fw_version", "fw_release_date", "cpu", "gpu", "debug")
+
+
+def driver_facts() -> dict:
+    """What the msi-ec driver exposes here — no root, no daemon."""
+    ec = msi_ec_dir()
+    bat = find_battery()
+    present = [a for a in DRIVER_ATTRS if os.path.exists(os.path.join(ec, a))]
+    return {
+        "present": os.path.isdir(ec),
+        "debug": os.path.isdir(os.path.join(ec, "debug")),
+        "attributes": present,
+        "missing_attributes": [a for a in DRIVER_ATTRS if a not in present],
+        "shift_modes": _lines(_read_opt(os.path.join(
+            ec, "available_shift_modes"))),
+        "fan_modes": _lines(_read_opt(os.path.join(ec, "available_fan_modes"))),
+        "cpu": {"temp": _read_int(os.path.join(
+                    ec, "cpu", "realtime_temperature")),
+                "fan_pct": _read_int(os.path.join(
+                    ec, "cpu", "realtime_fan_speed"))},
+        "gpu": {"temp": _read_int(os.path.join(
+                    ec, "gpu", "realtime_temperature")),
+                "fan_pct": _read_int(os.path.join(
+                    ec, "gpu", "realtime_fan_speed"))},
+        "battery": bool(bat),
+        "charge_limit": bool(bat and os.path.exists(os.path.join(
+            bat, "charge_control_end_threshold"))),
+    }
+
+
+def detect(include_dump: bool = True) -> dict:
+    """Everything needed to tell whether a model exists, and to write one."""
+    models, errors = load_models()
+    facts = machine_facts()
+    scored = sorted(((match_score(m, facts), m) for m in models),
+                    key=lambda pair: (-pair[0], pair[1].id))
+    matched = next(({"id": m.id, "name": m.name, "score": s}
+                    for s, m in scored if s > 0), None)
+    report = {
+        "machine": facts,
+        "driver": driver_facts(),
+        "registry": {"dir": models_dir(),
+                     "models": [m.id for m in models],
+                     "errors": errors},
+        "matched": matched,
+        "candidates": [{"id": m.id, "name": m.name, "score": s}
+                       for s, m in scored],
+    }
+    if include_dump:
+        dump = read_ec_dump()
+        report["ec_dump"] = (
+            {"readable": True,
+             "bytes": {f"{a:02x}": f"{v:02x}" for a, v in sorted(dump.items())}}
+            if dump is not None else {"readable": False})
+    return report
+
+
+def render_detect(report: dict) -> str:
+    """The report as plain text — the block a contributor pastes into a PR."""
+    m, d = report["machine"], report["driver"]
+    add = []
+    add.append("MSI Linux Control — model detection")
+    add.append("=" * 38)
+    add.append("")
+    add.append("machine")
+    for key in ("sys_vendor", "product_name", "product_version", "board_name",
+                "board_version", "bios_version"):
+        add.append(f"  {key:<16} {m.get(key) or '-'}")
+    add.append(f"  {'ec_firmware':<16} {m.get('ec_firmware') or '-'}"
+               f"  {m.get('ec_firmware_date') or ''}".rstrip())
+    add.append("")
+    add.append("driver (msi-ec)")
+    add.append(f"  {'present':<16} {'yes' if d['present'] else 'NO'}"
+               f"   debug interface: {'yes' if d['debug'] else 'no'}")
+    add.append(f"  {'shift modes':<16} {', '.join(d['shift_modes']) or '-'}")
+    add.append(f"  {'fan modes':<16} {', '.join(d['fan_modes']) or '-'}")
+    add.append(f"  {'attributes':<16} {', '.join(d['attributes']) or '-'}")
+    if d["missing_attributes"]:
+        add.append(f"  {'absent':<16} {', '.join(d['missing_attributes'])}")
+    add.append("")
+    add.append("registry")
+    add.append(f"  directory       {report['registry']['dir']}")
+    add.append(f"  models          "
+               f"{', '.join(report['registry']['models']) or 'none'}")
+    for err in report["registry"]["errors"]:
+        add.append(f"  BROKEN          {err}")
+    add.append("")
+    if report["matched"]:
+        who = report["matched"]
+        add.append(f"matched: {who['name']}  ({who['id']}, score "
+                   f"{who['score']})")
+    else:
+        add.append("matched: NOTHING — this laptop has no model file yet.")
+        add.append("")
+        add.append("  Everything the msi-ec driver exposes already works:")
+        add.append("  temperatures, shift and fan modes, cooler boost and the")
+        add.append("  charge limit.  Fan curves, RPM and the graphics switch")
+        add.append("  need this model's registers.  See CONTRIBUTING.md ->")
+        add.append("  \"Adding your model\", or run")
+        add.append("      msi-control detect --write <dir>")
+        add.append("  for a model.json to fill in.")
+    if report["candidates"]:
+        add.append("")
+        add.append("candidates")
+        for cand in report["candidates"]:
+            add.append(f"  {cand['score']:>3}  {cand['id']:<24} {cand['name']}")
+    dump = report.get("ec_dump") or {}
+    if dump:
+        add.append("")
+        if dump.get("readable"):
+            add.append("EC dump (256 registers, from the driver's debug iface)")
+            data = dump["bytes"]
+            for row in range(0, 256, 16):
+                cells = []
+                for i in range(16):
+                    val = data.get(f"{row + i:02x}")
+                    cells.append(f"{val:02x}" if isinstance(val, int)
+                                 else (val or "--"))
+                add.append(f"  {row:02x}  " + " ".join(cells))
+        else:
+            add.append("EC dump: not readable (needs msi-ec with debug=1)")
+    return "\n".join(add)
+
+
+def model_id_from_name(name: str) -> str:
+    """`"GS66 Stealth 10SE"` -> `"gs66-stealth-10se"`."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", (name or "").strip().lower())
+    return slug.strip("-") or "my-msi-laptop"
+
+
+def firmware_glob(firmware: str) -> str:
+    """`"16V1EMS1.118"` -> `"16V1EMS1.*"`.
+
+    The trailing revision arrives with every firmware update, so a pattern
+    that pinned it would stop working for every user who updated — which is
+    the opposite of what a registry entry is for.
+    """
+    text = (firmware or "").strip()
+    if not text:
+        return ""
+    head = text.rsplit(".", 1)[0] if "." in text else text
+    return f"{head}.*" if head != text else text
+
+
+def draft_model(facts: dict | None = None) -> dict:
+    """A starting `model.json` for the machine we are running on.
+
+    Deliberately *valid* and deliberately modest: it carries the match rules
+    that are read from the hardware and claims no feature that would need a
+    register nobody has identified yet.  Filling in the `ec` block is the
+    whole job, and doing it is what turns a sysfs-only entry into a full one.
+    """
+    facts = facts or machine_facts()
+    name = facts.get("product_name") or "MSI laptop"
+    match = {}
+    if facts.get("product_name"):
+        match["product_name"] = [facts["product_name"]]
+    if facts.get("board_name"):
+        match["board_name"] = [facts["board_name"]]
+    fw = firmware_glob(facts.get("ec_firmware") or "")
+    if fw:
+        match["ec_firmware"] = [fw]
+    return {
+        "schema": MODEL_SCHEMA,
+        "id": model_id_from_name(name),
+        "name": f"MSI {name}",
+        "vendor": facts.get("sys_vendor") or "Micro-Star International Co., Ltd.",
+        "status": "draft",
+        "match": match,
+        "ec": {},
+        "charge": {"min": CHARGE_MIN_DEFAULT, "max": CHARGE_MAX_DEFAULT,
+                   "step": 10},
+        "features": {
+            "shift": True, "fan": True, "cooler_boost": True,
+            "charge_limit": True,
+            "fan_curve": False, "rpm": False, "mux": False,
+            "webcam": False, "webcam_block": False, "super_battery": False,
+            "fn_key": False, "win_key": False,
+        },
+        "profiles": {
+            "silent": {"shift": "eco", "fan": "silent",
+                       "cooler_boost": False},
+            "balanced": {"shift": "comfort", "fan": "auto",
+                         "cooler_boost": False},
+            "battery": {"shift": "eco", "fan": "auto",
+                        "cooler_boost": False, "charge_end": 60},
+        },
+        "provenance": [
+            "DMI identity and EC firmware read from this machine by "
+            "`msi-control detect --write`",
+        ],
+        "notes": "DRAFT. Fill in the \"ec\" block with this machine's "
+                 "fan-curve and tachometer registers, then set the matching "
+                 "\"features\" flags to true. CONTRIBUTING.md explains how to "
+                 "find them (the driver's debug/ec_dump plus the worked EC "
+                 "map under models/) and how to test the result before "
+                 "opening a pull request.",
+    }
+
+
+def write_draft(directory: str, facts: dict | None = None) -> str:
+    """Write `draft_model()` into `<directory>/model.json`.  Returns the path."""
+    path = os.path.join(directory, "model.json")
+    if os.path.exists(path):
+        raise ModelError(f"{path} already exists — refusing to overwrite it")
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(draft_model(facts), fh, indent=2)
+        fh.write("\n")
+    return path
+
+
+# --------------------------------------------------------------------------
+# The active model
+#
+# `MODEL`, `CURVE_REGS`, `N_TEMPS`, `RPM_REGS`, `RPM_NUMERATOR`,
+# `BUILTIN_PROFILES` and `CHARGE_MIN`/`CHARGE_MAX` are published at the END of
+# this file, once every helper they need has been defined — see "select this
+# machine's model" at the bottom.  Everything here about the embedded
+# controller is *this model's*, never a generic MSI layout.
+# --------------------------------------------------------------------------
+
+# NOTE: the fan registers are per-model and live in the registry; the
+# graphics-mode addresses below are not.  See the MUX block.
 
 # --------------------------------------------------------------------------
 # Graphics mode switch (the "MUX")
 #
-# The G1_3 firmware can run the panel off the discrete GPU alone, or off the
-# Intel iGPU with the dGPU as a render offload (Optimus).  Three places encode
-# the same single fact, and all three agree on this machine:
+# Unlike the fan registers, these addresses are not per-model: the reference
+# tool ElXreno/msi-gpu-switcher drives the identical trio on MSI hardware from
+# other model lines, so the addresses live here and every model file that
+# declares "mux": true uses them.  What *is* per-model is whether anybody has
+# established that the switch works there — see CONTRIBUTING.md.
+#
+# The firmware can run the panel off the discrete GPU alone, or off the Intel
+# iGPU with the dGPU as a render offload (Optimus).  Three places encode the
+# same single fact, and all three agree on this machine:
 #
 #   * EC register 0x2e, bit 6 — MSI's "PXCT" bit.  1 = the panel is wired to
 #     the dGPU (discrete); 0 = the iGPU drives the panel (hybrid).
@@ -264,19 +972,22 @@ def graphics_activity(mode: str, was: str | None, now: str | None) -> str:
         return f"Graphics mode still {label} — reboot to apply"
     return f"Switched graphics to {label} — reboot to apply"
 
-# The driver's charge-control byte at 0xef: end = raw - 0x80, start = end - 10.
-CHARGE_MIN = 20
-CHARGE_MAX = 100
+# The charge-threshold bounds are per model (`charge.min`/`charge.max`) and
+# are published as CHARGE_MIN/CHARGE_MAX at the end of this file.
 
-# Ranges we are willing to write into EC fan-curve bytes.
+# Ranges we are willing to write into EC fan-curve bytes.  These are EC-level
+# limits rather than per-model facts: a fan speed is a percentage and a
+# threshold is a °C reading, so the same bounds police every model's curve.
 TEMP_MIN, TEMP_MAX = 10, 100
 SPEED_MIN, SPEED_MAX = 0, 100
 
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
-# Built-in profiles.  Curves are sane defaults derived from isw's MSI
-# section; "factory" is not here — it is captured from the EC on first run
-# so the original firmware curve can always be restored.
+# Built-in profiles are per-model data — the `gaming` profile's curve is a
+# statement about one machine's thermal envelope — so they live in
+# `model.json` and are published as BUILTIN_PROFILES at the end of this file.
+#
+# The rule that must survive every model file:
 #
 # ⚠️ A profile carries a `charge_end` ONLY when setting a charge limit is the
 # point of that profile.  "silent" / "balanced" / "gaming" deliberately omit
@@ -288,35 +999,10 @@ PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 # The rule is uniform and worth keeping: a profile that does not mention a
 # charge limit does not touch one.  "battery" is the exception because
 # preserving the battery IS that profile's purpose.
-BUILTIN_PROFILES = {
-    "silent": {
-        "shift": "eco",
-        "fan": "silent",
-        "cooler_boost": False,
-    },
-    "balanced": {
-        "shift": "comfort",
-        "fan": "auto",
-        "cooler_boost": False,
-    },
-    "gaming": {
-        "shift": "sport",
-        "fan": "advanced",
-        "cooler_boost": False,
-        "curve": {
-            "cpu": {"temps": [58, 63, 68, 73, 78, 83],
-                    "speeds": [0, 50, 60, 65, 70, 80, 85]},
-            "gpu": {"temps": [53, 58, 63, 68, 73, 83],
-                    "speeds": [0, 55, 65, 70, 80, 85, 90]},
-        },
-    },
-    "battery": {
-        "shift": "eco",
-        "fan": "auto",
-        "cooler_boost": False,
-        "charge_end": 60,
-    },
-}
+#
+# `clean_profile` (below) is what enforces the rest of a profile's shape, and
+# it is applied to *both* a model's built-ins and a saved profile — a stored
+# profile is untrusted input that the next boot replays into the EC.
 
 DEFAULT_CONFIG = {
     # Re-apply the last known state when the daemon starts (boot), so fan
@@ -375,28 +1061,52 @@ def check_int(value, lo: int, hi: int, what: str) -> int:
     return value
 
 
-def check_charge_end(value) -> int:
-    return check_int(value, CHARGE_MIN, CHARGE_MAX, "charge limit")
+def _published(name: str, fallback):
+    """A model-published module global, or `fallback` if not published yet.
+
+    The active model is selected at *import*, at the very bottom of this file,
+    so for the short window while a model file is being parsed the published
+    names (`CHARGE_MIN`, `N_TEMPS`, …) do not exist.  The model loader passes
+    its own values explicitly in that window; this helper is only the belt to
+    that brace, so nothing here can ever raise `NameError`.
+    """
+    return globals().get(name, fallback)
+
+
+def check_charge_end(value, lo: int | None = None, hi: int | None = None) -> int:
+    lo = _published("CHARGE_MIN", CHARGE_MIN_DEFAULT) if lo is None else lo
+    hi = _published("CHARGE_MAX", CHARGE_MAX_DEFAULT) if hi is None else hi
+    return check_int(value, lo, hi, "charge limit")
 
 
 def check_mux_mode(value) -> str:
     return check_choice(value, MUX_MODES, "graphics mode")
 
 
-def check_curve(temps, speeds):
+def check_curve(temps, speeds, n_temps: int | None = None,
+                n_speeds: int | None = None):
     """Validate one fan curve.
 
     Rules the EC requires (and a wrong curve is the one setting that can
     cook the machine, so this is deliberately strict):
-      * exactly 6 temperatures, strictly increasing, inside TEMP_MIN..MAX
-      * exactly 7 speeds, non-decreasing, inside SPEED_MIN..MAX
+      * exactly `n_temps` temperature thresholds, strictly increasing,
+        inside TEMP_MIN..MAX
+      * exactly `n_speeds` fan speeds, non-decreasing, inside SPEED_MIN..MAX
+
+    The shape comes from the model (`ec.curve`), not from this function: 6+7
+    is the GS66's shape, and hard-coding it is how a model with a different
+    fan curve would silently be rejected.  The defaults are the active
+    model's, which is what every caller other than the model loader wants.
     """
+    n_temps = _published("N_TEMPS", N_TEMPS_DEFAULT) if n_temps is None else n_temps
+    n_speeds = _published("N_SPEEDS", N_SPEEDS_DEFAULT) if n_speeds is None else n_speeds
     if not isinstance(temps, list) or not isinstance(speeds, list):
         raise ValidationError("curve must be {temps:[...], speeds:[...]}")
-    if len(temps) != N_TEMPS:
-        raise ValidationError(f"want {N_TEMPS} temperature points, got {len(temps)}")
-    if len(speeds) != N_SPEEDS:
-        raise ValidationError(f"want {N_SPEEDS} fan speeds, got {len(speeds)}")
+    if len(temps) != n_temps:
+        raise ValidationError(
+            f"want {n_temps} temperature points, got {len(temps)}")
+    if len(speeds) != n_speeds:
+        raise ValidationError(f"want {n_speeds} fan speeds, got {len(speeds)}")
 
     temps = [check_int(t, TEMP_MIN, TEMP_MAX, "curve temperature")
              for t in temps]
@@ -411,6 +1121,52 @@ def check_curve(temps, speeds):
             raise ValidationError("curve fan speeds must not decrease")
 
     return temps, speeds
+
+
+def clean_profile(data: dict, n_temps: int | None = None,
+                  n_speeds: int | None = None,
+                  charge_min: int | None = None,
+                  charge_max: int | None = None) -> dict:
+    """Keep only the known keys of a profile, validated.
+
+    Used for a *stored* profile (untrusted input the next boot replays into
+    the EC) and for a model's built-in profiles at load time — one function,
+    so a built-in can never be shaped unlike a saved one.  `charge_end` is
+    optional on purpose; see the note above BUILTIN_PROFILES.
+
+    The bound arguments exist for the model loader, which parses profiles
+    before the model's own bounds have been published; every other caller
+    omits them and gets the active model's.
+    """
+    if not isinstance(data, dict):
+        raise ValidationError("profile must be an object")
+    out = {}
+    if data.get("shift") is not None:
+        out["shift"] = str(data["shift"])
+    if data.get("fan") is not None:
+        out["fan"] = str(data["fan"])
+    if data.get("cooler_boost") is not None:
+        out["cooler_boost"] = bool(data["cooler_boost"])
+    if data.get("charge_end") is not None:
+        out["charge_end"] = check_charge_end(data["charge_end"],
+                                             charge_min, charge_max)
+    if data.get("curve") is not None:
+        curve = data["curve"]
+        if not isinstance(curve, dict):
+            raise ValidationError("curve must be an object")
+        out["curve"] = {}
+        for which in ("cpu", "gpu"):
+            spec = curve.get(which)
+            if spec is None:
+                continue
+            if not isinstance(spec, dict):
+                raise ValidationError(f"curve.{which} must be an object")
+            t, s = check_curve(spec.get("temps"), spec.get("speeds"),
+                               n_temps, n_speeds)
+            out["curve"][which] = {"temps": t, "speeds": s}
+    if not out:
+        raise ValidationError("profile has no settings")
+    return out
 
 
 def curve_speed_at(temps, speeds, temp: float) -> int:
@@ -553,6 +1309,7 @@ def local_status(mux: bool = True) -> dict:
         },
         "battery": _battery_status(bat),
         "graphics": local_graphics() if mux else None,
+        "model": MODEL.summary(),
         "curve": None,          # needs an EC write (tach/ec_get) → daemon only
         "partial": True,        # tells the UI this view is degraded
     }
@@ -706,6 +1463,11 @@ def local_graphics() -> dict:
     requested = var_mode if var_mode is not None else effective
     return {
         "supported": raw is not None or igpu is not None,
+        # Whether *this model* is known to have a working switch at all.
+        # `supported` above is about what this machine exposes; this one is
+        # about whether anybody has established it works here, and a card
+        # that greys a control out has to say which of the two it means.
+        "model_supports": MODEL.feature("mux"),
         "enabled": False,           # only the daemon knows the config
         "effective": effective,
         "requested": requested,
@@ -735,3 +1497,59 @@ def load_config() -> dict:
         # defaults are safe.
         pass
     return cfg
+
+
+# --------------------------------------------------------------------------
+# Select this machine's model, and publish it
+#
+# This runs once, at import, because "which laptop am I on" cannot change
+# while the process lives and deciding it lazily would let two callers
+# disagree.  The module-level names below are the model's, which is why the
+# daemon, the CLI and the GUI never have to ask a second time — and why a
+# per-model register address is typed in exactly one place in the program,
+# `models/<id>/model.json`.
+#
+# A model file that will not parse is *reported*, not raised: the machine it
+# breaks for is almost never the machine of the person who wrote it, and the
+# one who can fix it is the one reading `msi-control detect`.  The active
+# model then falls back to the unsupported one, which is a working state.
+# --------------------------------------------------------------------------
+
+MODEL: Model
+
+try:
+    MODEL = select_model()
+except ModelError as _e:                    # only MSI_MODEL=… can get here
+    raise SystemExit(f"msi-control: {_e}") from None
+
+# Fan-curve and tachometer registers of the active model.
+CURVE_REGS = dict(MODEL.curve_regs)
+N_TEMPS, N_SPEEDS = MODEL.n_temps, MODEL.n_speeds
+RPM_REGS = dict(MODEL.rpm_regs)
+RPM_NUMERATOR = MODEL.rpm_numerator
+
+# Charge-threshold bounds.
+CHARGE_MIN, CHARGE_MAX = MODEL.charge_min, MODEL.charge_max
+
+# Built-in profiles.
+BUILTIN_PROFILES = dict(MODEL.profiles)
+
+
+def active_model() -> Model:
+    return MODEL
+
+
+def feature(name: str) -> bool:
+    """Does the active model declare `name`?  See MODEL_FEATURES."""
+    return MODEL.feature(name)
+
+
+def model_supported() -> bool:
+    return MODEL.supported
+
+
+def model_errors() -> list:
+    """Model files that failed to load, as human sentences."""
+    _models, errors = load_models()
+    return errors
+

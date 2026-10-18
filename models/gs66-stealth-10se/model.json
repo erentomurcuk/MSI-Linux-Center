@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "id": "gs66-stealth-10se",
+  "name": "MSI GS66 Stealth 10SE",
+  "vendor": "Micro-Star International Co., Ltd.",
+  "status": "stable",
+  "added": "2026-10-18",
+
+  "match": {
+    "product_name": ["GS66 Stealth 10SE"],
+    "board_name": ["MS-16V1"],
+    "ec_firmware": ["16V1EMS1.*"]
+  },
+
+  "ec": {
+    "curve": {
+      "cpu": {
+        "temps": ["0x6a", "0x6b", "0x6c", "0x6d", "0x6e", "0x6f"],
+        "speeds": ["0x72", "0x73", "0x74", "0x75", "0x76", "0x77", "0x78"]
+      },
+      "gpu": {
+        "temps": ["0x82", "0x83", "0x84", "0x85", "0x86", "0x87"],
+        "speeds": ["0x8a", "0x8b", "0x8c", "0x8d", "0x8e", "0x8f", "0x90"]
+      }
+    },
+    "rpm": {
+      "numerator": 478000,
+      "cpu": "0xcc",
+      "gpu": "0xca"
+    }
+  },
+
+  "charge": {"min": 20, "max": 100, "step": 10},
+
+  "features": {
+    "shift": true,
+    "fan": true,
+    "cooler_boost": true,
+    "charge_limit": true,
+    "fan_curve": true,
+    "rpm": true,
+    "mux": true,
+    "webcam": false,
+    "webcam_block": false,
+    "super_battery": false,
+    "fn_key": false,
+    "win_key": false
+  },
+
+  "profiles": {
+    "silent": {
+      "shift": "eco",
+      "fan": "silent",
+      "cooler_boost": false
+    },
+    "balanced": {
+      "shift": "comfort",
+      "fan": "auto",
+      "cooler_boost": false
+    },
+    "gaming": {
+      "shift": "sport",
+      "fan": "advanced",
+      "cooler_boost": false,
+      "curve": {
+        "cpu": {"temps": [58, 63, 68, 73, 78, 83],
+                "speeds": [0, 50, 60, 65, 70, 80, 85]},
+        "gpu": {"temps": [53, 58, 63, 68, 73, 83],
+                "speeds": [0, 55, 65, 70, 80, 85, 90]}
+      }
+    },
+    "battery": {
+      "shift": "eco",
+      "fan": "auto",
+      "cooler_boost": false,
+      "charge_end": 60
+    }
+  },
+
+  "provenance": [
+    "isw (YoyPa/isw) [16V1EMS1] section + its MSI_ADDRESS_DEFAULT profile, which carries a real EC dump from a GS66-10SE",
+    "teackot/msi-ec CONF_G1_3, which explicitly lists \"16V1EMS1.118 // GS66 Stealth 10SE\"",
+    "in-tree drivers/platform/x86/msi-ec.c charge-control semantics (the start and end thresholds are one EC byte, always 10% apart)",
+    "Tachometer constant RPM = 478000 / period, reproduced verbatim from isw and confirmed on hardware 2026-10-16 (Cooler Boost drives 0xcc from ~3700 to ~8100, the top of this laptop's range)"
+  ],
+
+  "notes": "Step function: the fan runs at speeds[0] until the temperature passes temps[0], then speeds[1], and so on, so 6 thresholds and 7 speeds. Cooler Boost does NOT update the duty registers (with boost on, 0x71/0x89 stayed at 70 while the tachometers read ~8100 RPM), so fan_pct is what the curve asks for, not what the fan is doing. 0xc8 is not a third fan: it does not follow the fans under Cooler Boost. The graphics-mode (MUX) addresses are deliberately not in this file because they are not GS66-specific -- the whole model family shares one MUX block in src/msi_control.py, and this model only sets \"mux\": true."
+}

@@ -116,6 +116,17 @@ def print_status(st: dict, as_json: bool = False):
         dbg = green("debug=1") if drv.get("debug") else red("debug=0")
         print(f"{bold('EC')}  {fw}  {dim(date)}  {dbg}")
 
+    model = st.get("model")
+    if model:
+        if model.get("supported"):
+            print(f"{bold('Model')} {cyan(model.get('name') or '?')} "
+                  f"{dim('(' + str(model.get('id')) + ')')}")
+        else:
+            print(f"{bold('Model')} {yellow('unsupported')}  "
+                  f"{dim('no model file matches this laptop — fan curve, '
+                        'RPM and graphics switch are off')}")
+            print(dim("      run `msi-control detect` and see CONTRIBUTING.md"))
+
     if st.get("partial"):
         print(yellow("offline view — daemon not running, no RPM/fan-curve"))
         if st.get("_daemon_error"):
@@ -190,6 +201,33 @@ def print_status(st: dict, as_json: bool = False):
 def cmd_status(args):
     st = status(args)
     print_status(st, as_json=args.json)
+
+
+def cmd_detect(args):
+    """What this laptop is, and what a model file for it would need.
+
+    Works with no root and with the daemon down — the moment somebody
+    wondering "is my laptop supported?" is most likely to run it.
+    """
+    if args.write:
+        try:
+            path = core.write_draft(args.write)
+        except core.ModelError as e:
+            die(str(e))
+        print(green("wrote ") + path)
+        print(dim("  fill in the \"ec\" block, then follow CONTRIBUTING.md → "
+                  "\"Adding your model\""))
+        return
+    report = core.detect(include_dump=args.ec_dump)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    print(core.render_detect(report))
+    if not args.ec_dump:
+        print()
+        print(dim("add --ec-dump to include the 256-register EC map "
+                  "(needs msi-ec debug=1)"))
+
 
 
 def cmd_monitor(args):
@@ -555,6 +593,14 @@ def build_parser() -> argparse.ArgumentParser:
         return sub.add_parser(name, **kw)
 
     sp("status", help="show everything").set_defaults(fn=cmd_status)
+
+    m = sp("detect", help="identify this laptop and its model file")
+    m.add_argument("--write", metavar="DIR",
+                   help="write a draft model.json into DIR and stop")
+    m.add_argument("--ec-dump", action="store_true",
+                   help="include the 256-register EC map (needs msi-ec "
+                        "debug=1, costs ~120 ms)")
+    m.set_defaults(fn=cmd_detect)
 
     m = sp("monitor", help="live view")
     m.add_argument("-i", "--interval", type=float, default=2.0)
