@@ -180,10 +180,11 @@ def check_brand_mark() -> None:
     The window/menu icon is the SVG; the header mark and tray are painted at
     runtime.  If they drift, the app looks like two different applications
     depending on where you meet it — so pin the file, its validity, the
-    shield's box, and the fact that the painted mark is *only* that shield:
-    no tile behind it, no lettering on it.  Both were removed because at the
-    16-22 px a taskbar renders they read as a dark square with a smudge in
-    the middle, and "just a red shield" is the whole design.
+    shield's box, the colours the mark is built from, and the fact that the
+    painted mark is *only* the shield and Tux: no tile behind it, no
+    lettering on it.  Both of those were removed because at the 16-22 px a
+    taskbar renders they read as a dark square with a smudge in the middle;
+    "a red shield with a penguin on it" is the whole design.
     """
     from PySide6.QtCore import QRectF
     from PySide6.QtGui import QFontMetrics, QImage, QPainter
@@ -205,12 +206,26 @@ def check_brand_mark() -> None:
         assert img.pixelColor(x, y).alpha() == 0, \
             f"the mark has something behind the shield at {(x, y)}"
 
-    # The centre of the canvas is inside the shield, and it is the MSI red.
-    cx = size // 2
-    centre = img.pixelColor(cx, cx)
-    assert centre.alpha() == 255, "mark has a transparent centre"
-    assert centre.red() > 120 and centre.red() > centre.green() + 60, (
-        f"mark centre is not the red shield: {centre.name()}")
+    # The shield's field around the penguin is the MSI red, and the centre is
+    # the penguin, not empty.  A screenshot cannot tell "red shield with Tux"
+    # from "a red blob", so the colours are asserted by count, not by eye.
+    def has(pred) -> bool:
+        for y in range(size):
+            for x in range(size):
+                c = img.pixelColor(x, y)
+                if c.alpha() > 200 and pred(c):
+                    return True
+        return False
+
+    assert has(lambda c: c.red() > 120 and c.red() > c.green() + 60), \
+        "the mark has no MSI-red field"
+    assert has(lambda c: c.red() > 210 and c.green() > 200 and c.blue() > 190), \
+        "the mark has no Tux (no white belly/face)"
+    assert has(lambda c: c.red() < 60 and c.green() < 60 and c.blue() < 60), \
+        "the mark has no Tux (no black body)"
+    assert has(lambda c: c.red() > 200 and 120 < c.green() < 200
+               and c.blue() < 90), \
+        "the mark has no Tux (no orange beak/feet)"
 
     # …and the shield fills exactly the box MARK_BOX declares, which is the
     # same box the SVG is drawn in.  A mark that floated inside its canvas

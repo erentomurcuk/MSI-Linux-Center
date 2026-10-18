@@ -679,7 +679,7 @@ def _mark_shield(p: QPainter, box: QRectF, stops) -> None:
 
 
 def brand_pixmap(size: int = 32) -> QPixmap:
-    """The app mark: a centred MSI-red shield, and nothing else.
+    """The app mark: an MSI-red shield bearing Tux, and nothing else.
 
     Matching `icons/msi-control.svg` shape for shape.  Painted rather than
     loaded so the GUI keeps its no-icon-theme dependency, and so the window
@@ -688,8 +688,93 @@ def brand_pixmap(size: int = 32) -> QPixmap:
     """
     pm, p, box = _mark_frame(size)
     _mark_shield(p, box, BRAND_RED)
+    _mark_tux(p, box)
     p.end()
     return pm
+
+
+# Tux's own colours, kept here so the painted mark and the SVG use the same
+# three.  Not the theme's: the penguin is the mascot, not a UI element, and a
+# white-bellied black penguin is what makes it recognisable at 16 px.
+TUX_BLACK = "#1c1c1c"
+TUX_WHITE = "#f8f6f0"
+TUX_ORANGE = "#f6a21d"
+
+
+def _mark_tux(p: QPainter, box: QRectF) -> None:
+    """Tux, sitting inside the shield.
+
+    One description, shared with `icons/msi-control.svg`, painted from a unit
+    box so the proportions are the mascot's rather than a generic bird's: a
+    round black body, a white belly, a white face with two eyes, an orange
+    beak and two orange feet.  Placed a little high in the box because the
+    shield tapers to a point, and sized to leave the shield's red as a clear
+    field around the silhouette.
+    """
+    w = box.width() * 0.62
+    h = box.height() * 0.66
+    cx = box.center().x()
+    top = box.top() + box.height() * 0.17
+    left = cx - w / 2
+
+    def P(u: float, v: float) -> QPointF:
+        """Unit-box (0..1, 0..1) -> a point in the mark."""
+        return QPointF(left + u * w, top + v * h)
+
+    def R(u: float, v: float, rw: float, rh: float) -> QRectF:
+        return QRectF(left + u * w, top + v * h, rw * w, rh * h)
+
+    def curve(start, segs):
+        path = QPainterPath(P(*start))
+        for c1, c2, end in segs:
+            path.cubicTo(P(*c1), P(*c2), P(*end))
+        path.closeSubpath()
+        return path
+
+    # Body: narrow head, wide hips, a slight flipper bulge at the shoulders.
+    body = curve(
+        (0.50, 0.00),
+        [((0.62, 0.00), (0.70, 0.09), (0.72, 0.21)),
+         ((0.74, 0.32), (0.83, 0.30), (0.90, 0.45)),
+         ((0.99, 0.62), (0.96, 0.85), (0.78, 0.95)),
+         ((0.66, 1.01), (0.34, 1.01), (0.22, 0.95)),
+         ((0.04, 0.85), (0.01, 0.62), (0.10, 0.45)),
+         ((0.17, 0.30), (0.26, 0.32), (0.28, 0.21)),
+         ((0.30, 0.09), (0.38, 0.00), (0.50, 0.00))])
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(TUX_BLACK))
+    p.drawPath(body)
+
+    # Feet, poking out below the body.
+    p.setBrush(QColor(TUX_ORANGE))
+    p.drawEllipse(R(0.20, 0.88, 0.28, 0.14))
+    p.drawEllipse(R(0.52, 0.88, 0.28, 0.14))
+
+    # Belly.
+    p.setBrush(QColor(TUX_WHITE))
+    p.drawEllipse(R(0.22, 0.46, 0.56, 0.48))
+
+    # Face: the white patch the eyes and beak sit on.
+    face = curve(
+        (0.50, 0.10),
+        [((0.66, 0.10), (0.72, 0.22), (0.70, 0.33)),
+         ((0.67, 0.44), (0.60, 0.48), (0.50, 0.48)),
+         ((0.40, 0.48), (0.33, 0.44), (0.30, 0.33)),
+         ((0.28, 0.22), (0.34, 0.10), (0.50, 0.10))])
+    p.drawPath(face)
+
+    # Eyes.
+    p.setBrush(QColor(TUX_BLACK))
+    p.drawEllipse(R(0.35, 0.20, 0.10, 0.10))
+    p.drawEllipse(R(0.55, 0.20, 0.10, 0.10))
+
+    # Beak.
+    p.setBrush(QColor(TUX_ORANGE))
+    beak = QPainterPath(P(0.42, 0.32))
+    beak.lineTo(P(0.58, 0.32))
+    beak.lineTo(P(0.50, 0.45))
+    beak.closeSubpath()
+    p.drawPath(beak)
 
 
 def tray_digit_font(size: int, label: str) -> QFont:
@@ -1355,7 +1440,7 @@ class DashboardTab(QWidget):
 
         self.syscard = Card("System")
         self.sys_rows = {}
-        for key in ("Driver", "Socket", "Debug interface", "Config"):
+        for key in ("Model", "Driver", "Socket", "Debug interface", "Config"):
             row, v = kv_row(key, self.syscard, selectable=True)
             self.syscard.box.addLayout(row)
             self.sys_rows[key] = v
@@ -1390,7 +1475,9 @@ class DashboardTab(QWidget):
             # `is not None`, not truthiness: a stopped fan reads 0 RPM and
             # that is a real answer, not a missing daemon.
             if rpm is None:
-                card.show("—", None, "RPM needs the daemon", COL_DEAD)
+                sub = ("RPM off — no model definition for this laptop"
+                       if not core.feature("rpm") else "RPM needs the daemon")
+                card.show("—", None, sub, COL_DEAD)
             else:
                 # The bar is fan duty, the number is RPM — say so.  With the
                 # sub-line just reading "RPM" the bar's meaning was anyone's
@@ -1451,6 +1538,15 @@ class DashboardTab(QWidget):
             self.mode_rows[k].setText(str(v) if v else "—")
 
         drv = st.get("driver") or {}
+        model = st.get("model") or core.MODEL.summary()
+        feats = model.get("features") or {}
+        on = [k for k in ("fan_curve", "rpm", "mux") if feats.get(k)]
+        self.sys_rows["Model"].setText(
+            (f"{model.get('name')}  ·  {model.get('id')}"
+             + (f"  ·  curve/rpm/mux: {len(on)}/3" if on else
+                "  ·  no fan-curve, RPM or MUX definition"))
+            if model.get("supported") else
+            "unrecognised — no model file matches this laptop")
         self.sys_rows["Driver"].setText(
             (f"{drv.get('fw') or 'driver'}"
              + (f"  ·  {drv['fw_date']}" if drv.get("fw_date") else ""))
@@ -1613,12 +1709,15 @@ class PerformanceTab(QWidget):
             + ("  ·  reboot required" if pending else ""))
 
         online = self.win.online
-        enabled = bool(g.get("enabled")) and bool(online)
+        model_mux = core.feature("mux")
+        enabled = bool(g.get("enabled")) and bool(online) and model_mux
         for mode, b in self.gfx_buttons.items():
             with QSignalBlockerSafe(b):
                 b.setChecked(mode == g.get("requested"))
             b.setEnabled(enabled)
             b.setToolTip("" if enabled else
+                         "no model definition for this laptop enables the "
+                         "graphics switch" if not model_mux else
                          "the daemon is offline" if not online else
                          "set “AllowMuxSwitch”: true in the config to enable "
                          "this")
@@ -1630,7 +1729,11 @@ class PerformanceTab(QWidget):
 
         # One status line, and it says the *reason* a control is dead rather
         # than leaving a greyed-out button to be interpreted.
-        if not g.get("supported", True):
+        if not model_mux:
+            note = ("no model definition for this laptop enables the graphics "
+                    "switch — run `msi-control detect` and see CONTRIBUTING.md")
+            style = notice_style(muted_color(self))
+        elif not g.get("supported", True):
             note = ("✗ this firmware exposes neither the EC graphics bit nor "
                     f"the {core.MUX_VAR_NAME} variable — the switch is not "
                     "available here")
@@ -1701,7 +1804,27 @@ class FansTab(QWidget):
         super().__init__(parent)
         self.setObjectName("Page")
         self.win = win
+        # Fan curves need this model's EC registers; without a model file they
+        # are simply unknown, so the editor is refused rather than allowed to
+        # write a guessed address.  Read once — the model cannot change while
+        # the process lives.
+        self.curve_ok = core.feature("fan_curve")
         lay = page_layout(self)
+
+        self.curve_notice = QLabel("")
+        self.curve_notice.setWordWrap(True)
+        self.curve_notice.setVisible(False)
+        if not self.curve_ok:
+            self.curve_notice.setText(
+                "This laptop has no model definition yet, so its fan-curve "
+                "registers are unknown — the curve editor is read-only.  Fan "
+                "mode, cooler boost and the charge limit still work, because "
+                "the msi-ec driver provides those directly.  Run "
+                "`msi-control detect` and see CONTRIBUTING.md → “Adding your "
+                "model” to enable curves.")
+            self.curve_notice.setStyleSheet(notice_style(COL_HOT, COL_HOT))
+            self.curve_notice.setVisible(True)
+        lay.addWidget(self.curve_notice)
 
         mode = Card("Fan mode")
         row = QHBoxLayout()
@@ -1726,7 +1849,10 @@ class FansTab(QWidget):
         mode.box.addWidget(hint_label(
             "EC fan modes.  “advanced” lets the fan follow the custom curve "
             "below; “silent” caps the speed; “auto” is the firmware default.  "
-            "The curve editor is live — drag a point and Apply writes it.", mode))
+            + ("The curve editor is live — drag a point and Apply writes it."
+               if self.curve_ok else
+               "The curve below needs a model definition for this laptop."),
+            mode))
         lay.addWidget(mode)
 
         self.canvases = {}
@@ -1818,6 +1944,19 @@ class FansTab(QWidget):
             card.box.addWidget(warn)
             grids.addWidget(card)
         lay.addLayout(grids)
+
+        if not self.curve_ok:
+            # Nothing here can be trusted without the model's registers, so
+            # the whole editor goes read-only.  Fan *mode* above stays live:
+            # that is a sysfs attribute the driver exposes on every machine
+            # it binds to.
+            for which in ("cpu", "gpu"):
+                self.canvases[which].setEnabled(False)
+                for sp in self.spin_temps[which] + self.spin_speeds[which]:
+                    sp.setEnabled(False)
+                self.apply_btns[which].setEnabled(False)
+                self.reset_btns[which].setEnabled(False)
+
         lay.addStretch(1)
 
         self._syncing = False
@@ -1896,8 +2035,11 @@ class FansTab(QWidget):
         dirty = self._unsaved[which]
         online = bool(self.win.online)
         btn = self.apply_btns[which]
-        btn.setEnabled(online and dirty and valid)
-        if not online:
+        btn.setEnabled(online and dirty and valid and self.curve_ok)
+        if not self.curve_ok:
+            btn.setToolTip("this laptop has no model definition for fan "
+                           "curves")
+        elif not online:
             btn.setToolTip("the daemon is offline, so nothing can be written")
         elif not dirty:
             btn.setToolTip("no changes — edit the curve or a spin box first")
@@ -1906,12 +2048,12 @@ class FansTab(QWidget):
         else:
             btn.setToolTip("Write this curve into the embedded controller")
         self.reset_btns[which].setEnabled(
-            self.canvases[which].ghost is not None)
+            self.curve_ok and self.canvases[which].ghost is not None)
         self.pending_labels[which].setVisible(dirty)
 
     def _apply(self, which: str):
         st = self.curve_state[which]
-        if not st or not self._check_valid(which):
+        if not self.curve_ok or not st or not self._check_valid(which):
             return
         self.win.send({"cmd": "curve", "which": which,
                        "temps": st["temps"], "speeds": st["speeds"]})
@@ -2349,7 +2491,8 @@ class SettingsTab(QWidget):
 
         card = Card("Daemon")
         self._daemon_rows = {}
-        for key in ("Socket", "Driver", "State directory"):
+        for key in ("Model", "Model file", "Socket", "Driver",
+                    "State directory"):
             row, v = kv_row(key, card, selectable=True)
             card.box.addLayout(row)
             self._daemon_rows[key] = v
@@ -2443,6 +2586,22 @@ class SettingsTab(QWidget):
 
     def refresh(self, st: dict):
         drv = st.get("driver", {})
+        model = st.get("model") or core.MODEL.summary()
+        if model.get("supported"):
+            self._daemon_rows["Model"].setText(
+                f"{model.get('name')}  ·  {model.get('id')}  "
+                f"·  {model.get('status')}")
+        else:
+            self._daemon_rows["Model"].setText(
+                "unrecognised — no model file matches this laptop")
+        errs = core.model_errors()
+        if errs:
+            self._daemon_rows["Model file"].setText(
+                f"{core.models_dir()}  ·  ⚠ {len(errs)} broken file(s): "
+                + "; ".join(errs))
+        else:
+            self._daemon_rows["Model file"].setText(
+                core.MODEL.source or f"none — registry: {core.models_dir()}")
         self._daemon_rows["Socket"].setText(core.sock_path())
         self._daemon_rows["Driver"].setText(
             (f"loaded · {drv.get('fw')}" if drv.get("present")
@@ -2455,7 +2614,12 @@ class SettingsTab(QWidget):
         # the daemon, same as every other writer in the app.
         online = bool(self.win.online)
         self.reapply_btn.setEnabled(online)
-        self.factory_btn.setEnabled(online)
+        curve_ok = core.feature("fan_curve")
+        self.factory_btn.setEnabled(online and curve_ok)
+        self.factory_btn.setToolTip("" if curve_ok else
+                                    "this laptop has no fan-curve registers "
+                                    "in the registry, so there is nothing to "
+                                    "capture")
         # Fit the box to the text so a read-only dump has no scrollbar, but
         # cap it so a future key cannot push the raw console off the tab.
         # Measured from the line count and the font, NOT from
@@ -2524,7 +2688,12 @@ class Header(QWidget):
         titlebox.setSpacing(1)
         title = QLabel("MSI Linux Control")
         title.setFont(ui_font(TYPE_H2, bold=True))
-        sub = QLabel("MSI GS66 Stealth 10SE · embedded-controller control")
+        self.model = core.MODEL
+        if self.model.supported:
+            sub_text = f"{self.model.name} · embedded-controller control"
+        else:
+            sub_text = "Unrecognised MSI laptop · read-only controls"
+        sub = QLabel(sub_text)
         sub.setFont(ui_font(TYPE_CAPTION))
         sub.setStyleSheet(f"color:{muted_color(self)}")
         titlebox.addWidget(title)
@@ -2605,6 +2774,40 @@ class Banner(QFrame):
         lay.addWidget(text, 1)
         self.setStyleSheet(f"#Banner{{background:{COL_CRIT}}}")
         self.setVisible(False)
+
+
+class ModelBanner(QFrame):
+    """The "no model file for this laptop" strip.
+
+    Shown when the registry matched nothing, which is a *supported* state, not
+    an error: everything the msi-ec driver exposes already works.  Amber, so
+    it reads as a caveat next to the red daemon-offline banner rather than as
+    a second failure — and it names the two things that are off and the one
+    command that fixes it, rather than leaving a greyed-out control to be
+    guessed at.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ModelBanner")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(SPACE * 2, 10, SPACE * 2, 10)
+        lay.setSpacing(SPACE + 2)
+        icon = QLabel()
+        icon.setPixmap(glyph_pixmap("warn", ICON_SM, text_on(COL_HOT)))
+        text = QLabel(
+            "This laptop has no model definition yet, so its fan-curve, "
+            "RPM and graphics-switch registers are unknown and those controls "
+            "are off.  Temperatures, shift and fan modes, cooler boost and the "
+            "charge limit all work.  Run <code>msi-control detect</code> and "
+            "follow CONTRIBUTING.md → “Adding your model” to enable the rest.")
+        text.setWordWrap(True)
+        text.setFont(ui_font(TYPE_BODY))
+        text.setStyleSheet(f"color:{text_on(COL_HOT)}")
+        lay.addWidget(icon)
+        lay.addWidget(text, 1)
+        self.setStyleSheet(f"#ModelBanner{{background:{COL_HOT}}}")
+        self.setVisible(not core.MODEL.supported)
 
 
 class Sidebar(QWidget):
@@ -2692,6 +2895,7 @@ class MainWindow(QMainWindow):
 
         self.header = Header(self)
         self.banner = Banner(self)
+        self.model_banner = ModelBanner(self)
         self.sidebar = Sidebar(self)
         self.tabs.currentChanged.connect(self.sidebar.sync)
         self.sidebar.sync(0)
@@ -2703,6 +2907,7 @@ class MainWindow(QMainWindow):
         rl.setSpacing(0)
         rl.addWidget(self.header)
         rl.addWidget(self.banner)
+        rl.addWidget(self.model_banner)
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)

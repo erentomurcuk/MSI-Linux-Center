@@ -2,25 +2,24 @@
 <!--
   MSI Linux Control — application icon.
 
-  One shape: MSI's heraldic shield, in MSI red, centred on a transparent
-  square.  There is deliberately no tile behind it and no lettering on it —
-  earlier drafts carried a dark rounded tile and the model number, and at
-  the 16-22 px a taskbar and a menu actually render them that turned into a
-  dark square with an unreadable smudge in it.  A single bold silhouette
-  survives the shrink.
+  An MSI-red heraldic shield bearing Tux, centred on a transparent square.
+  The shield is the badge; the penguin is the "Linux" half of the name, so the
+  mark says *MSI* and *Linux* without a word of lettering.  There is still no
+  tile behind it and no text on it: at the 16-22 px a taskbar and a menu
+  actually render them, lettering became an unreadable smudge, while a bold
+  two-colour penguin on a bold field still reads.
 
-  This is the same mark the GUI paints at runtime in `brand_pixmap()` (and
-  its temperature-tinted twin `temp_pixmap()`, used for the tray) — the
-  three are kept in step deliberately, so the window, the menu entry and
-  the tray are recognisably one application.  `check_brand_mark` rasterises
-  both this file and the painted mark and compares the outlines, so they
-  cannot drift apart.
+  This is the same mark the GUI paints at runtime in `brand_pixmap()` (and its
+  temperature-tinted twin `temp_pixmap()`, used for the tray) — kept in step
+  deliberately, so the window, the menu entry and the tray are recognisably one
+  application.  `check_brand_mark` rasterises both this file and the painted
+  mark and compares their ink boxes, so they cannot drift apart.
 
-  The shield's path data is the one in `shield_path()`, whose control
-  points are the fractions below; if you change it here, change it there
-  too (and vice versa).  The three gradient stops are `brand_pixmap()`'s
-  `BRAND_RED`, and the gradient runs from the box's top-left to
-  (x + 0.25·w, y + h) — exactly the `QLinearGradient` the GUI builds.
+  Every coordinate below is generated from the same unit-box description as
+  `_mark_tux()` / `shield_path()` in the GUI (MARK_BOX is x 19, y 12, 90 wide,
+  104 tall; the penguin sits in a 0.62 x 0.66 box inside it).  If you change a
+  shape here, change it there too (and vice versa).  Tux's three colours are
+  `_mark_tux()`'s TUX_BLACK / TUX_WHITE / TUX_ORANGE.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"
      viewBox="0 0 128 128" role="img" aria-label="MSI Linux Control">
@@ -34,9 +33,26 @@
     </linearGradient>
   </defs>
 
-  <!-- The box is x 19, y 12, 90 wide, 104 tall — MARK_BOX in the GUI, which
-       is 19/128, 12/128, 90/128, 104/128.  Even margins, so the shape reads
-       as centred at any size. -->
+  <!-- The shield: x 19, y 12, 90 wide, 104 tall — MARK_BOX in the GUI. -->
   <path d="M19,12 H109 V52.5 C109,84.8 86,103.3 64,116 C42,103.3 19,84.8 19,52.5 Z"
         fill="url(#shield)"/>
+
+  <g id="tux">
+    <!-- body -->
+    <path fill="#1c1c1c"
+          d="M64,29.68 C70.7,29.68 75.16,35.86 76.28,44.09 C77.39,51.64 82.41,50.27 86.32,60.57 C91.34,72.24 89.67,88.02 79.62,94.89 C72.93,99.01 55.07,99.01 48.38,94.89 C38.33,88.02 36.66,72.24 41.68,60.57 C45.59,50.27 50.61,51.64 51.72,44.09 C52.84,35.86 57.3,29.68 64,29.68 Z"/>
+    <!-- feet -->
+    <ellipse cx="55.07" cy="94.89" rx="7.81" ry="4.8" fill="#f6a21d"/>
+    <ellipse cx="72.93" cy="94.89" rx="7.81" ry="4.8" fill="#f6a21d"/>
+    <!-- belly -->
+    <ellipse cx="64" cy="77.73" rx="15.62" ry="16.47" fill="#f8f6f0"/>
+    <!-- face -->
+    <path fill="#f8f6f0"
+          d="M64,36.54 C72.93,36.54 76.28,44.78 75.16,52.33 C73.49,59.88 69.58,62.63 64,62.63 C58.42,62.63 54.51,59.88 52.84,52.33 C51.72,44.78 55.07,36.54 64,36.54 Z"/>
+    <!-- eyes -->
+    <ellipse cx="58.42" cy="46.84" rx="2.79" ry="3.43" fill="#1c1c1c"/>
+    <ellipse cx="69.58" cy="46.84" rx="2.79" ry="3.43" fill="#1c1c1c"/>
+    <!-- beak -->
+    <path fill="#f6a21d" d="M59.54,51.64 L68.46,51.64 L64,60.57 Z"/>
+  </g>
 </svg>
