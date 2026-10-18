@@ -145,6 +145,12 @@ install -m 644 "$HERE/src/msi_controld.py"       "$LIBDIR/"
 install -m 755 "$HERE/src/msi-control"    "$BINDIR/msi-control"
 install -m 755 "$HERE/src/msi-control-gui"       "$BINDIR/msi-control-gui"
 
+# The model registry: one directory per laptop model, beside the module that
+# reads it.  Copied as a tree (a model may ship a README beside its
+# model.json), replacing any previous copy so a removed model really goes.
+install -d "$LIBDIR/models"
+cp -a "$HERE/models/." "$LIBDIR/models/"
+
 # The GUI's shebang uses env python3; make sure PySide6 is present.
 if ! python3 -c 'import PySide6' >/dev/null 2>&1; then
     warn "PySide6 is not installed — the GUI will not start.
@@ -215,3 +221,4 @@ echo
 "$BINDIR/msi-control" status 2>/dev/null || true
 echo
 log "done.  Try:  msi-control status   ·   msi-control-gui"
+log "       not sure your laptop is supported?  run:  msi-control detect"

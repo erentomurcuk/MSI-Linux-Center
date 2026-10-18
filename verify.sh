@@ -39,6 +39,30 @@ systemctl is-active --quiet msi-controld && ok "msi-controld active" \
                                         || bad "msi-controld not active"
 "$BIN" wait --seconds 3 >/dev/null 2>&1 && ok "socket answering" || bad "socket not answering"
 
+section "model"
+# Which laptop this is, and whether a model file describes it.  Everything
+# register-backed below depends on this, so it is checked first and its
+# answer decides whether the curve check can run at all.
+FEATURES=$("$BIN" status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    st = json.load(sys.stdin)
+except Exception:
+    print("curve=False rpm=False mux=False supported=False")
+    raise SystemExit
+m = st.get("model") or {}
+f = m.get("features") or {}
+print("curve=%s rpm=%s mux=%s supported=%s" % (
+    bool(f.get("fan_curve")), bool(f.get("rpm")), bool(f.get("mux")),
+    bool(m.get("supported"))))
+' 2>/dev/null) || FEATURES="curve=False rpm=False mux=False supported=False"
+eval "$FEATURES"
+if [ "$supported" = "True" ]; then
+    ok "a model definition matches this laptop  ($FEATURES)"
+else
+    bad "no model definition matches this laptop — fan curve, RPM and the graphics switch are off.  Run: msi-control detect"
+fi
+
 section "status"
 "$BIN" status || bad "status failed"
 
@@ -108,7 +132,9 @@ fi
 section "fan curve write-back (re-writing what is already there)"
 # Use --json rather than scraping the human formatting: the display layout
 # is allowed to change, the JSON contract is not.
-if curve=$("$BIN" curve --json 2>/dev/null); then
+if [ "$curve" != "True" ]; then
+    ok "skipped — no model definition for this laptop (curve registers unknown)"
+elif curve=$("$BIN" curve --json 2>/dev/null); then
     read -r temps speeds < <(printf '%s' "$curve" | python3 -c '
 import json,sys
 c=json.load(sys.stdin)["cpu"]
@@ -131,7 +157,7 @@ import json, sys
 st = json.load(sys.stdin)
 for w in ("cpu", "gpu"):
     d = st[w]
-    t, f, r = d["temp"], d["fan_pct"], d["rpm"]
+    t, f, r = d.get("temp"), d.get("fan_pct"), d.get("rpm")
     print("  %s: %s°C  fan %s%%  %s RPM" % (w, t, f, r))
     # 0 RPM is a stopped fan, which is a real answer (the EC parks them at
     # idle), not a failure — only reject values that cannot be a tach count.
