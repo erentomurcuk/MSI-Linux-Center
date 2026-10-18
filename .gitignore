@@ -1,0 +1,49 @@
+# GS66 Center — ignore rules
+#
+# The repo ships the *source* of the driver, daemon, CLI and GUI.  Anything a
+# build or a test run produces is disposable and must never be committed.
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- kernel / DKMS build output (third_party/msi-ec is vendored source) -----
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+*.order
+*.symvers
+
+# --- test artefacts ---------------------------------------------------------
+# gui_smoke.py parks a scratch XDG_CONFIG_HOME under the shots dir so a test
+# run can never touch ~/.config.  That is throwaway state, not a fixture.
+tests/shots/**/_xdg_config/
+tests/shots/_xdg_config/
+
+# --- editor / OS ------------------------------------------------------------
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+*.kate-swp
+.directory
+
+# --- runtime / local state --------------------------------------------------
+*.log
+*.bak
+*.orig
+*.rej
+*.patch
+*.tmp

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GS66 Center
+GenericName=Laptop Control Center
+Comment=Fan curves, performance modes and battery charge limit for the MSI GS66
+Exec=gs66-gui
+Icon=gs66-center
+Terminal=false
+Categories=Settings;System;HardwareSettings;
+Keywords=MSI;GS66;fan;battery;EC;performance;curve;
+StartupNotify=true

@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""gs66-center — command line control for the MSI GS66 on Linux.
+
+Reads work without the daemon (plain sysfs); anything that changes a setting
+needs gs66d running as root.
+
+Examples:
+    gs66-center status                 # full state (daemon) or degraded view
+    gs66-center mode                   # show performance mode
+    gs66-center mode sport             # eco | comfort | sport | turbo
+    gs66-center fan advanced           # auto | silent | advanced
+    gs66-center boost on               # Cooler Boost
+    gs66-center battery 80             # stop charging at 80 %
+    gs66-center curve show
+    gs66-center curve cpu --temps 55,60,65,70,78,85 --speeds 0,40,55,65,75,85,100
+    gs66-center profile list
+    gs66-center profile apply gaming
+    gs66-center profile save quiet-office
+    gs66-center graphics               # graphics mode (MUX): hybrid | discrete
+    gs66-center monitor                # live temperature / fan view
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+
+
+def _add_lib_path() -> str:
+    """Find gs66_common.py, whether run from the source tree or installed.
+
+    Installed layout puts the shared module in /usr/local/lib/gs66-center
+    while the wrappers live in /usr/local/bin — so dirname(__file__) alone
+    is not enough, and the CLI would die with ModuleNotFoundError.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [here,
+                  os.path.join(here, "..", "lib", "gs66-center"),
+                  "/usr/local/lib/gs66-center",
+                  "/usr/lib/gs66-center"]
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "gs66_common.py")):
+            c = os.path.realpath(c)
+            if c not in sys.path:
+                sys.path.insert(0, c)
+            return c
+    sys.path.insert(0, here)
+    return here
+
+
+_add_lib_path()
+
+import gs66_common as core                                     # noqa: E402
+from gs66_common import ProtocolError, ValidationError        # noqa: E402
+from gs66_common import (BAND_COOL, BAND_CRIT, BAND_HOT,      # noqa: E402
+                         BAND_WARM)
+
+
+# --------------------------------------------------------------------------
+# output helpers
+# --------------------------------------------------------------------------
+
+TTY = sys.stdout.isatty()
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if TTY else str(text)
+
+def bold(t):   return _c("1", t)
+def dim(t):    return _c("2", t)
+def green(t):  return _c("32", t)
+def yellow(t): return _c("33", t)
+def red(t):    return _c("31", t)
+def cyan(t):   return _c("36", t)
+
+
+def die(msg: str, code: int = 1):
+    print(red(f"error: {msg}"), file=sys.stderr)
+    sys.exit(code)
+
+
+def need_daemon_hint() -> str:
+    return ("gs66d is not running — start it with\n"
+            "    sudo systemctl start gs66-centerd\n"
+            "(settings can only be changed by the privileged daemon)")
+
+
+def status(args) -> dict:
+    """Full status via daemon; fall back to a degraded local view."""
+    if args.direct:
+        return core.local_status()
+    try:
+        st = core.call({"cmd": "status"}, timeout=args.timeout)
+        st["partial"] = False
+        return st
+    except (OSError, ProtocolError) as e:
+        st = core.local_status()
+        st["_daemon_error"] = str(e)
+        return st
+
+
+def print_status(st: dict, as_json: bool = False):
+    if as_json:
+        print(json.dumps(st, indent=2, sort_keys=True))
+        return
+
+    drv = st.get("driver", {})
+    if not drv.get("present"):
+        print(red("msi-ec driver is not loaded — fan/mode control unavailable"))
+        print(dim("  sudo modprobe msi-ec        (or check install.sh)"))
+    else:
+        fw = drv.get("fw") or "?"
+        date = drv.get("fw_date") or ""
+        dbg = green("debug=1") if drv.get("debug") else red("debug=0")
+        print(f"{bold('EC')}  {fw}  {dim(date)}  {dbg}")
+
+    if st.get("partial"):
+        print(yellow("offline view — daemon not running, no RPM/fan-curve"))
+        if st.get("_daemon_error"):
+            print(dim(f"  ({st['_daemon_error']})"))
+
+    shift = st.get("shift", {})
+    fan = st.get("fan", {})
+    print(f"{bold('Mode')}   {cyan(shift.get('current') or '?'):<9} "
+          f"{dim('available: ' + ', '.join(shift.get('available') or []))}")
+    print(f"{bold('Fan')}    {cyan(fan.get('current') or '?'):<9} "
+          f"{dim('available: ' + ', '.join(fan.get('available') or []))}")
+    cb = st.get("cooler_boost")
+    cb_txt = {"on": red("ON"), "off": dim("off")}.get(cb, dim("n/a"))
+    print(f"{bold('Boost')}  {cb_txt}")
+
+    for which in ("cpu", "gpu"):
+        s = st.get(which, {})
+        temp = s.get("temp")
+        pct = s.get("fan_pct")
+        rpm = s.get("rpm")
+        # Same bands as the GUI (core.temp_band) — one definition, so a
+        # colour means the same thing in both front-ends.
+        temp_s = "??" if temp is None else f"{temp}°C"
+        band = core.temp_band(temp)
+        temp_s = {BAND_COOL: green, BAND_WARM: yellow,
+                  BAND_HOT: red, BAND_CRIT: red}.get(band, dim)(temp_s)
+        line = f"{bold(which.upper()):<6}{temp_s:<8}"
+        line += f"fan {('??' if pct is None else str(pct) + '%'):>4}"
+        line += f"  {dim(str(rpm) + ' RPM') if rpm is not None else dim('RPM n/a')}"
+        print(line)
+
+    bat = st.get("battery")
+    if not bat:
+        print(f"{bold('Batt')}   {dim('no battery found')}")
+    else:
+        pct = bat.get("pct")
+        ac = bat.get("ac_online")
+        ac_s = "AC" if ac else ("battery" if ac is False else "?")
+        bar_len = 20
+        filled = 0 if pct is None else round(pct * bar_len / 100)
+        bar = green("█" * filled) + dim("░" * (bar_len - filled))
+        print(f"{bold('Batt')}   {bar} {pct if pct is not None else '?'}%  {dim(ac_s)}  "
+              f"{dim(bat.get('status') or '')}")
+        cs, ce = bat.get("charge_start"), bat.get("charge_end")
+        if ce is not None:
+            print(f"{bold('Limit')}  stop at {cyan(str(ce) + '%')}"
+                  + (f", start at {cyan(str(cs) + '%')}" if cs is not None else "")
+                  + dim("  (battery health / charge threshold)"))
+
+    curve = st.get("curve")
+    if curve:
+        for which in ("cpu", "gpu"):
+            c = curve.get(which)
+            if not c:
+                continue
+            pts = ",".join(f"{t}:{s}" for t, s in zip(c["temps"], c["speeds"][1:]))
+            print(f"{bold('Curve ' + which.upper())} base {c['speeds'][0]}%  "
+                  f"{dim(pts + '  (%)')}")
+
+    g = st.get("graphics")
+    if g:
+        eff = core.MUX_LABELS.get(g.get("effective"), "unknown")
+        req = g.get("requested")
+        line = f"{bold('Gfx')}    {cyan(eff)}"
+        if g.get("reboot_required"):
+            line += yellow(f"  -> {core.MUX_LABELS.get(req, req)} after reboot")
+        elif req and req != g.get("effective"):
+            line += dim(f"  (requested {req})")
+        print(line)
+
+
+def cmd_status(args):
+    st = status(args)
+    print_status(st, as_json=args.json)
+
+
+def cmd_monitor(args):
+    try:
+        while True:
+            st = status(args)
+            if args.json:
+                print(json.dumps(st))
+            else:
+                cpu, gpu = st.get("cpu", {}), st.get("gpu", {})
+                bat = st.get("battery") or {}
+                shift = (st.get("shift") or {}).get("current") or "?"
+                fan = (st.get("fan") or {}).get("current") or "?"
+                line = (f"CPU {cpu.get('temp')}°C {cpu.get('fan_pct')}% "
+                        f"{cpu.get('rpm') or '?'}rpm | "
+                        f"GPU {gpu.get('temp')}°C {gpu.get('fan_pct')}% "
+                        f"{gpu.get('rpm') or '?'}rpm | "
+                        f"{shift}/{fan} | bat {bat.get('pct')}%")
+                print(line, flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+
+
+def _set(args, key, value):
+    try:
+        res = core.call({"cmd": "set", "key": key, "value": value},
+                        timeout=args.timeout)
+    except (OSError, ProtocolError) as e:
+        msg = str(e)
+        if "No such file" in msg or "Connection refused" in msg \
+                or "refused" in msg or "errno" in msg.lower():
+            die(f"{msg}\n{need_daemon_hint()}")
+        die(msg)
+    if args.json:
+        print(json.dumps(res, indent=2, sort_keys=True))
+        return
+    # The daemon read the setting back before and after, so this sentence
+    # describes the hardware, not our intention.  A no-op says so rather
+    # than pretending something happened.  The activity form is what a
+    # person reads after pressing a button ("Set charge limit to 80%");
+    # the raw `a -> b` diff stays in --json for scripts.
+    activity = res.get("activity") or core.describe_activity(
+        key, res.get("was"), res.get("now"))
+    print(green("✓ ") + (activity if res.get("changed") else dim(activity)))
+
+
+def cmd_mode(args):
+    if args.value is None:
+        st = status(args)
+        cur = (st.get("shift") or {}).get("current")
+        avail = (st.get("shift") or {}).get("available") or []
+        # Honour --json here too: a read-only query is exactly what a script
+        # wants, and silently returning human text for a machine flag is the
+        # same bug as the one that dropped --json before the subcommand.
+        if args.json:
+            print(json.dumps({"current": cur, "available": avail},
+                             indent=2))
+            return
+        print(cur or "?")
+        print(dim("available: " + ", ".join(avail)))
+        return
+    _set(args, "shift", args.value)
+
+
+def cmd_fan(args):
+    if args.value is None:
+        st = status(args)
+        cur = (st.get("fan") or {}).get("current")
+        avail = (st.get("fan") or {}).get("available") or []
+        if args.json:
+            print(json.dumps({"current": cur, "available": avail},
+                             indent=2))
+            return
+        print(cur or "?")
+        print(dim("available: " + ", ".join(avail)))
+        return
+    _set(args, "fan", args.value)
+
+
+def cmd_boost(args):
+    if args.value is None:
+        st = status(args)
+        if args.json:
+            print(json.dumps({"cooler_boost": st.get("cooler_boost")},
+                             indent=2))
+            return
+        print((st.get("cooler_boost") or "?"))
+        return
+    _set(args, "cooler_boost", args.value)
+
+
+def cmd_battery(args):
+    if args.value is None:
+        st = status(args)
+        bat = st.get("battery")
+        if not bat:
+            die("no battery found")
+        if args.json:
+            print(json.dumps(bat, indent=2))
+        else:
+            print_status(st)
+        return
+    _set(args, "charge_end", args.value)
+
+
+def _parse_int_list(text: str, what: str) -> list:
+    try:
+        return [int(p) for p in text.split(",") if p.strip() != ""]
+    except ValueError:
+        raise ValidationError(f"{what} must be a comma separated list of integers")
+
+
+def cmd_curve(args):
+    if args.which is None:
+        st = status(args)
+        curve = st.get("curve")
+        if not curve:
+            die("fan curve unavailable — is gs66d running with debug=1?")
+        if args.json:
+            print(json.dumps(curve, indent=2))
+            return
+        for which in ("cpu", "gpu"):
+            c = curve.get(which)
+            if not c:
+                continue
+            print(bold(f"{which.upper()} curve"))
+            print(f"  temps  (°C): {c['temps']}")
+            print(f"  speeds (%):  {c['speeds']}   "
+                  + dim("(speeds[0] = below first threshold)"))
+            print("  step map:  " + dim(" ".join(
+                f"<{t}°C→{s}%" for t, s in zip(c["temps"], c["speeds"][1:]))))
+        return
+
+    if not args.temps or not args.speeds:
+        raise ValidationError("--temps and --speeds are both required "
+                              "(curve with no arguments shows the current one)")
+    temps = _parse_int_list(args.temps, "--temps")
+    speeds = _parse_int_list(args.speeds, "--speeds")
+    try:
+        data = core.call({"cmd": "curve", "which": args.which,
+                          "temps": temps, "speeds": speeds},
+                         timeout=args.timeout)
+    except OSError as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    except ProtocolError as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return
+    print(green("✓ ") + (data.get("activity")
+                         or f"{args.which} curve written"))
+    print(f"  temps:  {data['temps']}")
+    print(f"  speeds: {data['speeds']}")
+
+
+def cmd_profile(args):
+    if args.action == "list":
+        try:
+            profs = core.call({"cmd": "profile", "action": "list"},
+                              timeout=args.timeout)
+        except (OSError, ProtocolError) as e:
+            # listing built-ins still works offline
+            profs = {"builtin": sorted(core.BUILTIN_PROFILES), "saved": []}
+            print(dim(f"(daemon offline: {e})"))
+        print(bold("built-in: ") + ", ".join(profs["builtin"]))
+        print(bold("saved:    ") + (", ".join(profs["saved"]) or dim("none")))
+        return
+
+    if not args.name:
+        raise ValidationError(f"profile {args.action} needs a name")
+    if args.action == "save" and args.file:
+        with open(args.file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        payload = {"cmd": "profile", "action": "save",
+                   "name": os.path.splitext(os.path.basename(args.file))[0]
+                   if args.name == "-" else args.name, "data": data}
+    elif args.action == "save":
+        payload = {"cmd": "profile", "action": "save-current", "name": args.name}
+    else:                                   # apply / delete
+        payload = {"cmd": "profile", "action": args.action, "name": args.name}
+    try:
+        out = core.call(payload, timeout=args.timeout)
+    except OSError as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    except ProtocolError as e:
+        die(str(e))
+    if args.action == "apply":
+        for w in out.get("warnings") or []:
+            print(yellow(f"warning: {w}"))
+        acts = out.get("activities") or []
+        if acts:
+            for c in acts:
+                print(green("✓ ") + c)
+        else:
+            print(dim(f"profile {out.get('applied')} — nothing to change"))
+    else:
+        print(json.dumps(out, indent=2, sort_keys=True))
+
+
+def _print_graphics(g: dict) -> None:
+    """The graphics-mode block, shared by `graphics` and `status`.
+
+    Labels are padded *before* being coloured: padding a string that already
+    contains ANSI escapes counts the escapes as visible width and the columns
+    stop lining up in a terminal.
+    """
+    print(bold("Graphics (MUX)"))
+    if not g:
+        print(f"  {dim('unavailable — is gs66d running?')}")
+        return
+    if g.get("supported") is False:
+        print(f"  {dim('this firmware exposes no graphics switch')}")
+        return
+
+    eff = g.get("effective")
+    eff_s = core.MUX_LABELS.get(eff, "unknown")
+    print(f"  {bold('running'.ljust(11))}"
+          f"{cyan(eff_s) if eff else dim('unknown')}"
+          f"  {dim('Intel display controller ' + {True: 'present',
+                                                False: 'absent',
+                                                None: 'unknown'}[g.get('igpu_present')])}")
+
+    req = g.get("requested")
+    src = []
+    if g.get("var_present"):
+        src.append(f"{core.MUX_VAR_NAME} byte 1 = "
+                   f"{1 if g.get('var_mode') == core.MUX_DISCRETE else 0}")
+    if g.get("ec_bit") is not None:
+        src.append("EC 0x2e bit 6 = "
+                   f"{1 if g.get('ec_mode') == core.MUX_DISCRETE else 0}")
+    print(f"  {bold('next boot'.ljust(11))}{cyan(core.MUX_LABELS.get(req, 'unknown'))}"
+          f"  {dim('; '.join(src) or 'unreadable')}")
+    if g.get("reboot_required"):
+        print("  " + yellow("⚠ a reboot is required for this to take effect"))
+    if g.get("enabled"):
+        print(f"  {bold('switch'.ljust(11))}{green('enabled')}  "
+              + dim("gs66-center graphics hybrid|discrete"))
+    else:
+        print(f"  {bold('switch'.ljust(11))}{dim('disabled')}  "
+              + dim(f'set "AllowMuxSwitch": true in {core.config_path()}'))
+
+
+def cmd_graphics(args):
+    if args.revert:
+        try:
+            out = core.call({"cmd": "graphics", "action": "revert"},
+                            timeout=args.timeout)
+        except OSError as e:
+            die(f"{e}\n{need_daemon_hint()}")
+        except ProtocolError as e:
+            die(str(e))
+        if args.json:
+            print(json.dumps(out, indent=2, sort_keys=True))
+            return
+        print(green("✓ ") + out.get("activity", "graphics mode restored"))
+        _print_graphics(out.get("graphics") or {})
+        return
+
+    if args.value is None:
+        st = status(args)
+        g = st.get("graphics") or {}
+        if args.json:
+            print(json.dumps(g, indent=2, sort_keys=True))
+            return
+        _print_graphics(g)
+        if st.get("partial"):
+            print(dim("  (offline view: the EC register needs the daemon)"))
+        return
+
+    if not args.yes:
+        die("refusing to switch the graphics mode without --yes.\n"
+            "  A switch writes EC 0x2e and the UEFI variable MsiDCVarData and\n"
+            "  only takes effect at the next reboot.  On a model whose MUX was\n"
+            "  never reverse engineered it can leave the machine with no\n"
+            "  display.  Re-run as `gs66-center graphics " + args.value
+            + " --yes`\n  once you have read the Graphics (MUX) section of "
+            "README.md.")
+    try:
+        out = core.call({"cmd": "graphics", "action": "set",
+                         "mode": args.value}, timeout=args.timeout)
+    except OSError as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    except ProtocolError as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    print(green("✓ ") + out.get("activity", "graphics mode set"))
+    _print_graphics(out.get("graphics") or {})
+
+
+def cmd_raw(args):
+    try:
+        out = core.call({"cmd": "raw", "addr": args.addr, "val": args.val},
+                        timeout=args.timeout)
+    except (OSError, ProtocolError) as e:
+        die(str(e))
+    if args.val is None:
+        print(f"0x{out['addr']:02x} = 0x{out['val']:02x} ({out['val']})")
+    else:
+        print(f"wrote 0x{out['addr']:02x} = 0x{out['val']:02x}")
+
+
+def cmd_reapply(args):
+    try:
+        out = core.call({"cmd": "reapply"}, timeout=args.timeout)
+    except (OSError, ProtocolError) as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    for w in out.get("warnings") or []:
+        print(yellow(f"warning: {w}"))
+    acts = out.get("activities") or []
+    if acts:
+        for c in acts:
+            print(green("✓ ") + c)
+    else:
+        print(dim("state re-applied — nothing to change"))
+
+
+def cmd_wait(args):
+    """Block until the daemon answers — handy in scripts/units."""
+    deadline = time.time() + args.seconds
+    while time.time() < deadline:
+        if core.daemon_available():
+            print("ready")
+            return 0
+        time.sleep(0.3)
+    print("timed out", file=sys.stderr)
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # Global flags are accepted BOTH before and after the subcommand
+    # (`gs66-center --json status` and `gs66-center status --json`).
+    # SUPPRESS keeps a subparser from resetting a flag given on the outer
+    # parser — argparse would otherwise clobber it with the default.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true",
+                        default=argparse.SUPPRESS, help="machine output")
+    common.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
+    common.add_argument("--direct", action="store_true", default=argparse.SUPPRESS,
+                        help="read sysfs locally, never talk to the daemon")
+
+    ap = argparse.ArgumentParser(
+        prog="gs66-center", description="MSI GS66 control center (CLI)",
+        parents=[common])
+    # Do NOT set_defaults() the three shared flags here.  set_defaults()
+    # mutates the *action object's* .default, and these actions are shared
+    # with every subparser through parents=[common] — so `json=False` was
+    # written onto the same --json action each subparser reuses, and the
+    # subparser then planted json=False into the namespace, clobbering a
+    # `--json` given before the subcommand.  The flag was silently dropped
+    # (`gs66-center --json mode sport` printed human text).  SUPPRESS leaves
+    # the attribute absent unless the user passed it; main() fills in the
+    # fallbacks.  Found by trying to read JSON out of the deployed CLI.
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def sp(name, **kw):
+        kw.setdefault("parents", [common])
+        return sub.add_parser(name, **kw)
+
+    sp("status", help="show everything").set_defaults(fn=cmd_status)
+
+    m = sp("monitor", help="live view")
+    m.add_argument("-i", "--interval", type=float, default=2.0)
+    m.set_defaults(fn=cmd_monitor)
+
+    m = sp("mode", help="performance (shift) mode")
+    m.add_argument("value", nargs="?",
+                   help="eco|comfort|sport|turbo (omit to show)")
+    m.set_defaults(fn=cmd_mode)
+
+    m = sp("fan", help="fan mode")
+    m.add_argument("value", nargs="?", help="auto|silent|advanced (omit to show)")
+    m.set_defaults(fn=cmd_fan)
+
+    m = sp("boost", help="cooler boost")
+    m.add_argument("value", nargs="?", help="on|off (omit to show)")
+    m.set_defaults(fn=cmd_boost)
+
+    m = sp("battery", help="battery charge limit")
+    m.add_argument("value", nargs="?", type=int, metavar="PERCENT",
+                   help="stop charging at N%% (omit to show)")
+    m.set_defaults(fn=cmd_battery)
+
+    m = sp("curve", help="fan curve (no args = show)")
+    m.add_argument("which", nargs="?", choices=["cpu", "gpu"],
+                   help="which fan's curve to set")
+    m.add_argument("--temps", help="6 comma separated °C thresholds")
+    m.add_argument("--speeds", help="7 comma separated fan %% values")
+    m.set_defaults(fn=cmd_curve)
+
+    m = sp("profile", help="named settings bundles")
+    m.add_argument("action",
+                   choices=["list", "show", "apply", "save", "delete"],
+                   help="show = print one profile without applying it")
+    m.add_argument("name", nargs="?")
+    m.add_argument("--file", help="(save) read profile JSON from file")
+    m.set_defaults(fn=cmd_profile)
+
+    m = sp("graphics", help="graphics mode (MUX): hybrid | discrete")
+    m.add_argument("value", nargs="?", choices=list(core.MUX_MODES),
+                   help="switch to this mode (omit to show; needs --yes)")
+    m.add_argument("--yes", action="store_true",
+                   help="confirm the switch (it needs a reboot to take effect)")
+    m.add_argument("--revert", action="store_true",
+                   help="undo the last switch from the saved backup")
+    m.set_defaults(fn=cmd_graphics)
+
+    m = sp("raw", help="peek/poke one EC byte (AllowRaw)")
+    m.add_argument("addr", help="address, e.g. 0xf4")
+    m.add_argument("val", nargs="?", help="value to write, e.g. 0x0d")
+    m.set_defaults(fn=cmd_raw)
+
+    sp("reapply",
+       help="re-apply persisted state (used after resume)"
+       ).set_defaults(fn=cmd_reapply)
+
+    m = sp("wait", help="wait for the daemon to come up")
+    m.add_argument("--seconds", type=float, default=30.0)
+    m.set_defaults(fn=cmd_wait)
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+
+    # Fallbacks for the three global flags, applied AFTER parsing so the
+    # shared --json/--timeout/--direct actions keep default=SUPPRESS (see
+    # the note in build_parser).  SUPPRESS means "absent unless the user
+    # passed it", which is exactly what lets a flag be given either before
+    # or after the subcommand without one position clobbering the other.
+    if not hasattr(args, "json"):
+        args.json = False
+    if not hasattr(args, "timeout"):
+        args.timeout = 5.0
+    if not hasattr(args, "direct"):
+        args.direct = False
+
+    # raw address/value parsing (hex or decimal)
+    if getattr(args, "cmd", None) == "raw":
+        for field in ("addr", "val"):
+            v = getattr(args, field, None)
+            if v is None:
+                continue
+            try:
+                setattr(args, field, int(v, 0))
+            except ValueError:
+                die(f"{field}: {v!r} is not a number (use 0x.. for hex)")
+
+    try:
+        args.fn(args)
+    except ValidationError as e:
+        die(str(e))
+    except ProtocolError as e:
+        die(str(e))
+    except BrokenPipeError:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

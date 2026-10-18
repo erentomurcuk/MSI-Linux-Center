@@ -1,0 +1,34 @@
+[Unit]
+Description=GS66 Center daemon (EC control: fans, performance modes, charge limit)
+Documentation=file:///usr/local/share/doc/gs66-center/README.md
+# The EC sysfs attributes only exist once the msi-ec driver has bound.
+Wants=systemd-modules-load.service
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/gs66-center/gs66d.py
+Restart=on-failure
+RestartSec=3
+
+# The daemon needs no network and runs no subprocesses.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictSUIDSGID=yes
+NoNewPrivileges=yes
+
+# /usr, /boot and /etc become read-only; /run stays writable for the socket
+# and /var/lib/gs66-center is created and granted by StateDirectory.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NOT protected: /sys must stay writable — that is the entire point
+# (msi-ec attributes + the battery charge thresholds live there).
+ProtectKernelTunables=no
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ReadWritePaths=/sys
+StateDirectory=gs66-center
+
+[Install]
+WantedBy=multi-user.target

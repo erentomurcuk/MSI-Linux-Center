@@ -1,0 +1,8 @@
+{
+  "RestoreLast": true,
+  "DefaultProfile": null,
+  "AllowRaw": false,
+  "AllowMuxSwitch": false,
+  "SocketGroup": "wheel",
+  "ReapplyOnResume": true
+}

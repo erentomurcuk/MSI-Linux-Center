@@ -1,0 +1,25 @@
+#!/bin/sh
+# systemd-system-sleep hook: re-apply persisted GS66 state after resume.
+# The EC sometimes resets shift/fan mode across S3, so the daemon's state
+# stops matching reality; this pushes it back.
+#
+# $1 = pre|post, $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+[ "$1" = post ] || exit 0
+
+CONF=/etc/gs66-center/config.json
+# Respect ReapplyOnResume (default true when the key is absent).
+if [ -f "$CONF" ] && grep -q '"ReapplyOnResume"[[:space:]]*:[[:space:]]*false' "$CONF"; then
+    exit 0
+fi
+
+# Right after resume the daemon may still be coming up, so give the socket
+# a moment before asking it to re-apply.
+i=0
+while [ "$i" -lt 10 ]; do
+    if [ -S /run/gs66-centerd.sock ]; then
+        /usr/local/bin/gs66-center reapply >/dev/null 2>&1 && exit 0
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+exit 0

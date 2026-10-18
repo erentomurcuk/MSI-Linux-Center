@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  GS66 Center — application icon.
+
+  One shape: MSI's heraldic shield, in MSI red, centred on a transparent
+  square.  There is deliberately no tile behind it and no lettering on it —
+  earlier drafts carried a dark rounded tile and the model number, and at
+  the 16-22 px a taskbar and a menu actually render them that turned into a
+  dark square with an unreadable smudge in it.  A single bold silhouette
+  survives the shrink.
+
+  This is the same mark the GUI paints at runtime in `brand_pixmap()` (and
+  its temperature-tinted twin `temp_pixmap()`, used for the tray) — the
+  three are kept in step deliberately, so the window, the menu entry and
+  the tray are recognisably one application.  `check_brand_mark` rasterises
+  both this file and the painted mark and compares the outlines, so they
+  cannot drift apart.
+
+  The shield's path data is the one in `shield_path()`, whose control
+  points are the fractions below; if you change it here, change it there
+  too (and vice versa).  The three gradient stops are `brand_pixmap()`'s
+  `BRAND_RED`, and the gradient runs from the box's top-left to
+  (x + 0.25·w, y + h) — exactly the `QLinearGradient` the GUI builds.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"
+     viewBox="0 0 128 128" role="img" aria-label="GS66 Center">
+  <title>GS66 Center</title>
+  <defs>
+    <linearGradient id="shield" x1="19" y1="12" x2="41.5" y2="116"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff4a3d"/>
+      <stop offset="0.5" stop-color="#e2231a"/>
+      <stop offset="1" stop-color="#9c0a19"/>
+    </linearGradient>
+  </defs>
+
+  <!-- The box is x 19, y 12, 90 wide, 104 tall — MARK_BOX in the GUI, which
+       is 19/128, 12/128, 90/128, 104/128.  Even margins, so the shape reads
+       as centred at any size. -->
+  <path d="M19,12 H109 V52.5 C109,84.8 86,103.3 64,116 C42,103.3 19,84.8 19,52.5 Z"
+        fill="url(#shield)"/>
+</svg>

@@ -1,0 +1,2993 @@
+#!/usr/bin/env python3
+"""gs66-gui — Qt control centre for the MSI GS66 10SE.
+
+Front-end to gs66d (which owns every EC write); this process is never
+privileged and never touches sysfs directly.  All daemon traffic runs on one
+worker thread so a slow EC transfer can never freeze the UI.
+
+Sections (sidebar):
+  Dashboard    live temps / fan speeds / RPM / battery
+  Performance  shift mode (eco/comfort/sport/turbo) + cooler boost + MUX
+  Fans         fan mode + draggable CPU/GPU fan curves (with factory ghost)
+  Battery      charge limit (the "stop charging at N%" setting)
+  Profiles     built-in + saved setting bundles
+  Settings     daemon state, re-apply, factory capture, raw EC console
+
+Design rules (same ones the daemon enforces — the GUI is just a client):
+  * every value is validated by gs66_common before it is sent;
+  * nothing is written optimistically — the UI re-reads state after each
+    command, so what you see is what the EC actually holds;
+  * with the daemon down the GUI degrades to read-only instead of lying.
+
+Theme: one token set per theme (light/dark), applied as a QPalette plus a
+single application stylesheet, so every colour, radius and border comes from
+one place and the two themes cannot drift apart.  `GS66_THEME=light|dark`
+forces one; otherwise the desktop's own colour scheme decides, defaulting to
+dark when the platform does not report one (as offscreen does not).
+
+The look is MSI's: the accent is MSI red, and the app mark is a red shield
+carrying the model name — the badge language a gaming laptop is expected to
+have.  The temperature bands stay green→amber→orange→red, because those are
+*status* rather than chrome, so the red accent never has to double as
+"critical": an interactive control is red because it is the brand, a hot
+reading is red because it is hot, and the two never mean the same thing.
+
+Shape, spacing and type each come from one scale (`SPACE`, `R_CARD`/`R_CTRL`/
+`R_INNER`, `TYPE_*`).  They used to be chosen per widget — six different corner
+radii, and a mix of point- and pixel-sized fonts — which is the kind of drift
+that makes an interface read as assembled rather than designed.
+
+Font sizes are deliberately set in code, never in the stylesheet: a Qt
+stylesheet `font-size` overrides QWidget.setFont(), which would silently
+flatten the big readouts back to body size.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import signal
+import sys
+import threading
+
+
+def _add_lib_path() -> str:
+    """Find gs66_common.py, whether run from the source tree or installed.
+
+    Installed layout puts the shared module in /usr/local/lib/gs66-center
+    while the wrappers live in /usr/local/bin — so dirname(__file__) alone
+    is not enough.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [here,
+                  os.path.join(here, "..", "lib", "gs66-center"),
+                  "/usr/local/lib/gs66-center",
+                  "/usr/lib/gs66-center"]
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "gs66_common.py")):
+            c = os.path.realpath(c)
+            if c not in sys.path:
+                sys.path.insert(0, c)
+            return c
+    sys.path.insert(0, here)
+    return here
+
+
+_add_lib_path()
+
+from PySide6.QtCore import (QObject, QPointF, QRectF, QSettings, QSize, Qt,
+                            QTimer, Signal)
+from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QKeySequence,
+                           QLinearGradient, QPainter, QPainterPath, QPalette,
+                           QPen, QPixmap, QShortcut)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QGridLayout,
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMainWindow, QMenu,
+                               QMessageBox, QPlainTextEdit, QProgressBar,
+                               QPushButton, QScrollArea, QSlider,
+                               QSpinBox, QStackedWidget, QStatusBar,
+                               QSystemTrayIcon, QVBoxLayout, QWidget)
+
+import gs66_common as core                                     # noqa: E402
+
+POLL_MS = 1500
+
+# --------------------------------------------------------------------------
+# Temperature palette — the SEMANTIC colours.  They are status, not chrome,
+# so they are fixed across themes and shared with the CLI via gs66_common's
+# bands: 62 °C is "warm" in every front-end, which they used to disagree on.
+# --------------------------------------------------------------------------
+COL_OK = "#2e9e5b"        # cool
+COL_WARM = "#c9a227"      # warm
+COL_HOT = "#e07b39"       # hot
+COL_CRIT = "#d64545"      # critical
+COL_DEAD = "#8a8f98"      # no reading
+
+BAND_COLOURS = {
+    core.BAND_COOL: COL_OK,
+    core.BAND_WARM: COL_WARM,
+    core.BAND_HOT: COL_HOT,
+    core.BAND_CRIT: COL_CRIT,
+}
+
+
+def temp_color(temp):
+    return BAND_COLOURS.get(core.temp_band(temp), COL_DEAD)
+
+
+# --------------------------------------------------------------------------
+# Design tokens — shape, spacing and type, in one scale so they cannot drift.
+# --------------------------------------------------------------------------
+
+SPACE = 8             # one spacing unit; margins and gaps are multiples of it
+R_CARD = 16           # cards and dialogs
+R_CTRL = 10           # buttons, inputs, list rows
+R_INNER = 12          # an inset panel inside a card (the curve plot)
+PAGE_PAD = 20         # a page's outer margin, left and right
+PAGE_PAD_V = 18       # ... and top / bottom
+PAGE_GAP = 14         # the gap between a page's cards
+R_PILL = 8            # chips, badges, menu rows, tooltips
+R_BAR = 5             # progress bars and the slider groove
+
+# Control geometry.  One rung for every button, single-line field, spin box
+# and sidebar row, so they are the same height by construction rather than by
+# a minimum height each widget sets for itself — which is how “Apply” on the
+# battery page ended up 10 px taller than the “60%” preset beside it.  H_* are
+# *content* heights (see the stylesheet's control block); the hero is the only
+# deliberate exception, and it says so where it is used.
+PAD_CTRL_V = 6        # buttons, inputs and nav rows
+PAD_HERO_V = 12       # the one oversized control (cooler boost)
+H_CTRL = 22           # → a 36 px rendered control
+H_SPIN = 19           # → also 36 px: a spin box adds 3 px of its own
+H_SLIDER = 28         # the charge slider's touch target (a slider, not a
+                      # button — the handle needs room the text does not)
+H_BAR = 8             # the stat tiles' progress bar
+ICON_SM = 16          # every icon drawn in a row of text, so none of them
+                      # can make its own row taller than the text beside it
+
+# Type scale, in device-independent pixels (see ui_font).  Anything that is
+# deliberately sized picks one rung; the rest inherits the platform font.
+TYPE_DISPLAY = 30     # a stat tile's big number
+TYPE_H1 = 21          # a page headline
+TYPE_H2 = 16          # the window title in the header
+TYPE_BODY = 13        # sub-lines and explanatory hints
+TYPE_CAPTION = 11     # card captions, chips, the connection pill
+TYPE_MICRO = 10       # axis labels, the sidebar shortcut hint
+
+
+def ui_font(px: int, *, bold: bool = False, italic: bool = False) -> QFont:
+    """One helper for every explicitly-sized label.
+
+    Sizes are pixels, never points.  The GUI used to mix `setPointSize` and
+    `setPixelSize`, so the same nominal "big" number rendered at two different
+    heights depending on which widget happened to draw it.
+    """
+    f = QFont()
+    f.setPixelSize(px)
+    f.setBold(bold)
+    f.setItalic(italic)
+    return f
+
+
+def mono_font(px: int = TYPE_CAPTION) -> QFont:
+    """A fixed-width font for the data views (config JSON, raw EC console).
+
+    Machine output in a proportional face is harder to scan and misaligns
+    columns; every other code surface on the desktop is monospaced.
+    """
+    f = ui_font(px)
+    f.setStyleHint(QFont.StyleHint.Monospace)
+    f.setFamily("monospace")
+    return f
+
+
+def _srgb(v: float) -> float:
+    return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+
+def text_on(background: str) -> str:
+    """Black or white text, whichever is readable on `background`.
+
+    White on the amber "hot" colour measures ~2.9:1 — it looks fine in a
+    mockup and fails WCAG AA in use.  Luminance decides, not habit.
+    """
+    c = QColor(background)
+    lum = (0.2126 * _srgb(c.redF()) + 0.7152 * _srgb(c.greenF())
+           + 0.0722 * _srgb(c.blueF()))
+    return "#000000" if lum > 0.18 else "#ffffff"
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    c = QColor(hex_color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha:.3f})"
+
+
+def muted_color(widget) -> str:
+    """Readable secondary text, derived from the live palette.
+
+    A hardcoded grey is a lie in whichever theme you did not test it in —
+    rgba(160,160,160) is nearly invisible on a light background.  Blend the
+    real foreground 60% towards the real background instead: that measures
+    ~4.0:1 on light and ~5.5:1 on dark.
+    """
+    pal = widget.palette()
+    fg = pal.color(pal.ColorRole.WindowText)
+    bg = pal.color(pal.ColorRole.Window)
+    return QColor(*[round(f * 0.6 + b * 0.4)
+                    for f, b in ((fg.red(), bg.red()),
+                                 (fg.green(), bg.green()),
+                                 (fg.blue(), bg.blue()))]).name()
+
+
+# --------------------------------------------------------------------------
+# Theme — one token set per theme, one stylesheet, so nothing drifts.
+# --------------------------------------------------------------------------
+
+_DARK = {
+    "name": "dark",
+    "bg": "#0b0c0f", "surface": "#131519", "surface2": "#1a1d23",
+    "surface3": "#23272f", "border": "#282d36", "border_strong": "#3b414d",
+    "text": "#eceef3", "text_dim": "#b4bbc7", "muted": "#7f8794",
+    "accent": "#e2231a", "accent_hover": "#ff4a3d",
+}
+
+_LIGHT = {
+    "name": "light",
+    "bg": "#eef0f4", "surface": "#ffffff", "surface2": "#f5f6fa",
+    "surface3": "#eaedf3", "border": "#e2e5ec", "border_strong": "#cad0dc",
+    "text": "#15171c", "text_dim": "#4a5160", "muted": "#6b7383",
+    "accent": "#c8102e", "accent_hover": "#a30d25",
+}
+
+
+def _theme(base: dict) -> dict:
+    """Add the derived tokens a theme needs on top of its base colours."""
+    t = dict(base)
+    dark = t["name"] == "dark"
+    t["on_accent"] = text_on(t["accent"])
+    t["accent_soft"] = _rgba(t["accent"], 0.18 if dark else 0.12)
+    t["accent_ink"] = ("#ffb0aa" if dark else "#a30d25")
+    t["accent_line"] = t["accent"]
+    t["bar_bg"] = ("rgba(255,255,255,0.10)" if dark else "rgba(0,0,0,0.09)")
+    t["scroll"] = ("rgba(255,255,255,0.16)" if dark else "rgba(0,0,0,0.16)")
+    t["scroll_hover"] = ("rgba(255,255,255,0.30)" if dark else "rgba(0,0,0,0.30)")
+    t["crit"] = COL_CRIT
+    t["crit_soft"] = _rgba(COL_CRIT, 0.14)
+    # Shape tokens, as QSS length strings so the stylesheet can interpolate
+    # them the same way it interpolates colour.
+    t["r_card"], t["r_ctrl"], t["r_inner"] = (f"{R_CARD}px", f"{R_CTRL}px",
+                                              f"{R_INNER}px")
+    t["r_pill"], t["r_bar"] = f"{R_PILL}px", f"{R_BAR}px"
+    t["pad_ctrl_v"] = f"{PAD_CTRL_V}px"
+    t["pad_hero_v"] = f"{PAD_HERO_V}px"
+    t["h_ctrl"], t["h_spin"] = f"{H_CTRL}px", f"{H_SPIN}px"
+    return t
+
+
+THEMES = {"dark": _theme(_DARK), "light": _theme(_LIGHT)}
+THEME = THEMES["dark"]                  # replaced by apply_theme()
+
+# The stylesheet is `%`-templated, not an f-string: QSS is full of braces and
+# `%(token)s` leaves every one of them alone.
+QSS = """
+QWidget { color: %(text)s; }
+
+QMainWindow, #Root { background: %(bg)s; }
+QStackedWidget { background: transparent; }
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+#Page { background: transparent; }
+
+#Header { background: %(surface)s; border-bottom: 1px solid %(border)s; }
+#Sidebar { background: %(surface)s; border-right: 1px solid %(border)s; }
+
+#Card { background: %(surface)s; border: 1px solid %(border)s;
+        border-radius: %(r_card)s; }
+#CardTitle { color: %(muted)s; }
+
+QLabel { background: transparent; }
+
+/* The control rung.  Every button, single-line field, spin box and sidebar
+   row is the same height, so a row that mixes them — the battery presets
+   beside Apply, the raw console's two fields beside Read and Write — lines
+   up instead of stepping.  Qt's stylesheet min-height is the *content* box,
+   so the rendered height is this plus twice the padding plus the border;
+   both numbers come from the tokens above, and check_control_sizes measures
+   the result.  Do not give a widget its own setMinimumHeight(): a button
+   that sets one is a button that no longer lines up with its neighbours. */
+QPushButton, QLineEdit { min-height: %(h_ctrl)s; }
+/* A spin box spends 3 px on its arrow buttons on top of everything else
+   (measured, and unaffected by their height or their padding) — so it gets
+   3 px less content to come out on the same rung.  Leave it out and the one
+   spin box in the fans editor is the only control that does not match. */
+QSpinBox { min-height: %(h_spin)s; }
+
+QPushButton {
+    background: %(surface2)s; border: 1px solid %(border_strong)s;
+    border-radius: %(r_ctrl)s; padding: %(pad_ctrl_v)s 14px; color: %(text)s;
+}
+QPushButton:hover { background: %(surface3)s; border-color: %(muted)s; }
+QPushButton:pressed { background: %(border)s; }
+QPushButton:focus { border-color: %(accent)s; }
+QPushButton:disabled { color: %(muted)s; background: %(surface2)s;
+                       border-color: %(border)s; }
+
+/* The one deliberately oversized control: cooler boost is the tab's single
+   big switch, and the only thing here that is not a row control. */
+QPushButton[hero="true"] {
+    padding: %(pad_hero_v)s 16px;
+    background: %(surface2)s; border: 1px solid %(border_strong)s;
+}
+
+/* A mode button (shift / fan / graphics): the checked one is *filled* with
+   the accent, so the current mode is unmistakable from across the room. */
+QPushButton[choice="true"]:checked {
+    background: %(accent)s; border-color: %(accent)s; color: %(on_accent)s;
+    font-weight: bold;
+}
+QPushButton[choice="true"]:checked:hover { background: %(accent_hover)s;
+    border-color: %(accent_hover)s; }
+QPushButton[primary="true"] { background: %(accent)s; border-color: %(accent)s;
+                              color: %(on_accent)s; font-weight: bold; }
+QPushButton[primary="true"]:hover { background: %(accent_hover)s;
+                                    border-color: %(accent_hover)s; }
+QPushButton[primary="true"]:disabled { background: %(surface2)s;
+    color: %(muted)s; border-color: %(border)s; font-weight: normal; }
+QPushButton[danger="true"] { background: transparent; color: %(crit)s;
+                             border-color: %(crit)s; }
+QPushButton[danger="true"]:hover { background: %(crit_soft)s;
+                                   border-color: %(crit)s; }
+QPushButton[danger="true"]:disabled { color: %(muted)s;
+                                      border-color: %(border)s; }
+QPushButton[ghost="true"] { background: transparent; border-color: transparent;
+                            color: %(text_dim)s; }
+QPushButton[ghost="true"]:hover { background: %(surface3)s; color: %(text)s; }
+QPushButton[ghost="true"]:pressed { background: %(border)s; }
+
+/* Nav rows: a squared-off left rule marks the current section while the rest
+   of the row keeps the control radius.  Same vertical padding as a button, so
+   a nav row and a page control are the same height. */
+#Sidebar QPushButton[nav="true"] {
+    background: transparent; border: 1px solid transparent;
+    border-left: 3px solid transparent;
+    border-top-right-radius: %(r_ctrl)s; border-bottom-right-radius: %(r_ctrl)s;
+    border-top-left-radius: 0; border-bottom-left-radius: 0;
+    padding: %(pad_ctrl_v)s 12px; text-align: left; color: %(text_dim)s;
+}
+#Sidebar QPushButton[nav="true"]:hover { background: %(surface3)s;
+                                         color: %(text)s; }
+#Sidebar QPushButton[nav="true"]:checked {
+    background: %(accent_soft)s; color: %(accent_ink)s; font-weight: bold;
+    border-left: 3px solid %(accent_line)s;
+}
+
+/* --------------------------------------------------------------- readouts */
+QProgressBar { background: %(bar_bg)s; border: none;
+               border-radius: %(r_bar)s; }
+QProgressBar::chunk { background: %(accent)s; border-radius: %(r_bar)s; }
+
+QSlider::groove:horizontal { height: 6px; background: %(bar_bg)s;
+                             border-radius: 3px; }
+QSlider::sub-page:horizontal { background: %(accent)s; border-radius: 3px; }
+QSlider::handle:horizontal { width: 18px; height: 18px; margin: -7px 0;
+    border-radius: 9px; background: %(surface)s; border: 2px solid %(accent)s; }
+QSlider::handle:horizontal:hover { background: %(accent)s; }
+QSlider:focus { border: none; }
+QSlider::handle:horizontal:focus { border-color: %(accent_hover)s; }
+
+/* ----------------------------------------------------------------- fields */
+/* Same vertical padding as a button, so a field and the button that acts on
+   it are one row height. */
+QSpinBox, QLineEdit {
+    background: %(surface2)s; border: 1px solid %(border_strong)s;
+    border-radius: %(r_ctrl)s; padding: %(pad_ctrl_v)s 8px; color: %(text)s;
+    selection-background-color: %(accent)s; selection-color: %(on_accent)s;
+}
+QSpinBox:hover, QLineEdit:hover { border-color: %(muted)s; }
+QSpinBox:focus, QLineEdit:focus { border-color: %(accent)s; }
+QSpinBox:disabled, QLineEdit:disabled { color: %(muted)s;
+                                        border-color: %(border)s; }
+
+QPlainTextEdit, QListWidget {
+    background: %(surface2)s; border: 1px solid %(border)s;
+    border-radius: %(r_ctrl)s; padding: 6px; color: %(text)s;
+    selection-background-color: %(accent)s; selection-color: %(on_accent)s;
+}
+QPlainTextEdit:hover, QListWidget:hover { border-color: %(muted)s; }
+QPlainTextEdit:focus, QListWidget:focus { border-color: %(accent)s; }
+QListWidget::item { padding: 7px 9px; border-radius: %(r_ctrl)s; }
+QListWidget::item:selected { background: %(accent_soft)s;
+                             color: %(accent_ink)s; font-weight: bold; }
+QListWidget::item:hover { background: %(surface3)s; }
+
+/* ------------------------------------------------------------------ chrome */
+QStatusBar { background: %(surface)s; border-top: 1px solid %(border)s;
+             color: %(text_dim)s; }
+QStatusBar::item { border: none; }
+
+QMenu { background: %(surface)s; border: 1px solid %(border)s;
+        border-radius: %(r_ctrl)s; padding: 5px; }
+QMenu::item { padding: 6px 18px; border-radius: %(r_pill)s; }
+QMenu::item:selected { background: %(accent_soft)s; color: %(accent_ink)s; }
+QMenu::separator { height: 1px; background: %(border)s; margin: 5px 8px; }
+
+QToolTip { background: %(surface3)s; color: %(text)s;
+           border: 1px solid %(border_strong)s; padding: 4px 7px;
+           border-radius: %(r_pill)s; }
+
+QMessageBox { background: %(surface)s; }
+QMessageBox QLabel { color: %(text)s; }
+
+QScrollBar:vertical { background: transparent; width: 11px; margin: 3px; }
+QScrollBar::handle:vertical { background: %(scroll)s; border-radius: 4px;
+                              min-height: 32px; }
+QScrollBar::handle:vertical:hover { background: %(scroll_hover)s; }
+QScrollBar:horizontal { background: transparent; height: 11px; margin: 3px; }
+QScrollBar::handle:horizontal { background: %(scroll)s; border-radius: 4px;
+                                min-width: 32px; }
+QScrollBar::handle:horizontal:hover { background: %(scroll_hover)s; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+"""
+
+
+def _palette(t: dict) -> QPalette:
+    pal = QPalette()
+    C, G = QPalette.ColorRole, QPalette.ColorGroup
+    pal.setColor(C.Window, QColor(t["bg"]))
+    pal.setColor(C.WindowText, QColor(t["text"]))
+    pal.setColor(C.Base, QColor(t["surface"]))
+    pal.setColor(C.AlternateBase, QColor(t["surface2"]))
+    pal.setColor(C.Text, QColor(t["text"]))
+    pal.setColor(C.Button, QColor(t["surface2"]))
+    pal.setColor(C.ButtonText, QColor(t["text"]))
+    pal.setColor(C.Highlight, QColor(t["accent"]))
+    pal.setColor(C.HighlightedText, QColor(t["on_accent"]))
+    pal.setColor(C.ToolTipBase, QColor(t["surface3"]))
+    pal.setColor(C.ToolTipText, QColor(t["text"]))
+    pal.setColor(C.PlaceholderText, QColor(t["muted"]))
+    pal.setColor(G.Disabled, C.WindowText, QColor(t["muted"]))
+    pal.setColor(G.Disabled, C.Text, QColor(t["muted"]))
+    pal.setColor(G.Disabled, C.ButtonText, QColor(t["muted"]))
+    return pal
+
+
+def resolve_theme(app) -> str:
+    """`GS66_THEME` wins; else the desktop's scheme; else dark."""
+    env = os.environ.get("GS66_THEME", "").strip().lower()
+    if env in ("light", "dark"):
+        return env
+    try:
+        scheme = app.styleHints().colorScheme()
+        if scheme == Qt.ColorScheme.Light:
+            return "light"
+        if scheme == Qt.ColorScheme.Dark:
+            return "dark"
+    except Exception:                                       # noqa: BLE001
+        pass
+    # Unknown (offscreen platforms, exotic desktops): dark is the default
+    # this app is designed around, and it never looks broken.
+    return "dark"
+
+
+def apply_theme(app=None, force: str | None = None) -> str:
+    """Install the palette + stylesheet.  Safe to call more than once."""
+    global THEME
+    app = app or QApplication.instance()
+    if app is None:
+        return "dark"
+    name = force or resolve_theme(app)
+    THEME = THEMES.get(name, THEMES["dark"])
+    app.setPalette(_palette(THEME))
+    app.setStyleSheet(QSS % THEME)
+    app.setProperty("gs66_theme", THEME["name"])
+    return THEME["name"]
+
+
+def tcol(key: str) -> QColor:
+    return QColor(THEME.get(key, "#888888"))
+
+
+def accent_icon_color() -> str:
+    return THEME["accent"]
+
+
+# --------------------------------------------------------------------------
+# painted glyphs — a handful of vector icons, so the UI has a visual language
+# without shipping (and licensing) an icon theme.
+# --------------------------------------------------------------------------
+
+def glyph_pixmap(name: str, size: int = 20, color: str = "#ffffff") -> QPixmap:
+    """Draw one small monochrome icon.  Normalised 0..1 coordinates, so every
+    glyph scales from the 16 px sidebar to the 32 px header mark."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    s = float(size)
+    pad = s * 0.16
+    w = s - 2 * pad
+    c = QColor(color)
+    pen = QPen(c)
+    pen.setWidthF(max(1.4, s * 0.085))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+
+    def R(x, y, ww, hh) -> QRectF:
+        return QRectF(pad + x * w, pad + y * w, ww * w, hh * w)
+
+    if name == "dashboard":
+        for x, y in ((0, 0), (0.56, 0), (0, 0.56), (0.56, 0.56)):
+            p.drawRoundedRect(R(x, y, 0.44, 0.44), 0.1 * w, 0.1 * w)
+    elif name == "fans":                              # hub + three blades
+        cx, cy = pad + 0.5 * w, pad + 0.5 * w
+        p.translate(cx, cy)
+        for k in range(3):
+            p.save()
+            p.rotate(k * 120)
+            p.drawEllipse(QRectF(-0.13 * w, -0.5 * w, 0.26 * w, 0.46 * w))
+            p.restore()
+        p.drawEllipse(QPointF(0, 0), 0.13 * w, 0.13 * w)
+    elif name == "battery":
+        p.drawRoundedRect(R(0, 0.24, 0.78, 0.52), 0.12 * w, 0.12 * w)
+        p.setBrush(c)
+        p.drawRoundedRect(R(0.83, 0.4, 0.13, 0.2), 0.05 * w, 0.05 * w)
+        p.drawRoundedRect(R(0.1, 0.34, 0.42, 0.32), 0.06 * w, 0.06 * w)
+    elif name == "profiles":                          # bookmark
+        path = QPainterPath()
+        path.moveTo(pad + 0.22 * w, pad)
+        path.lineTo(pad + 0.78 * w, pad)
+        path.lineTo(pad + 0.78 * w, pad + w)
+        path.lineTo(pad + 0.5 * w, pad + 0.72 * w)
+        path.lineTo(pad + 0.22 * w, pad + w)
+        path.closeSubpath()
+        p.drawPath(path)
+    elif name == "settings":                          # three sliders
+        for y, k in ((0.22, 0.66), (0.5, 0.32), (0.78, 0.58)):
+            p.drawLine(QPointF(pad, pad + y * w), QPointF(pad + w, pad + y * w))
+            p.setBrush(c)
+            p.drawEllipse(QPointF(pad + k * w, pad + y * w), 0.11 * w, 0.11 * w)
+            p.setBrush(Qt.NoBrush)
+    elif name == "refresh":
+        p.drawArc(R(0.06, 0.06, 0.88, 0.88), 60 * 16, 250 * 16)
+        p.setBrush(c)
+        tip = QPainterPath()
+        tip.moveTo(pad + 0.94 * w, pad + 0.36 * w)
+        tip.lineTo(pad + 0.60 * w, pad + 0.42 * w)
+        tip.lineTo(pad + 0.92 * w, pad + 0.70 * w)
+        tip.closeSubpath()
+        p.drawPath(tip)
+    elif name == "power":
+        p.drawArc(R(0.08, 0.12, 0.84, 0.84), 55 * 16, 250 * 16)
+        p.drawLine(QPointF(pad + 0.5 * w, pad), QPointF(pad + 0.5 * w,
+                                                       pad + 0.52 * w))
+    elif name == "bolt":                              # Performance
+        path = QPainterPath()
+        pts = [(0.58, 0.0), (0.16, 0.56), (0.44, 0.56), (0.36, 1.0),
+               (0.84, 0.42), (0.54, 0.42)]
+        path.moveTo(pad + pts[0][0] * w, pad + pts[0][1] * w)
+        for x, y in pts[1:]:
+            path.lineTo(pad + x * w, pad + y * w)
+        path.closeSubpath()
+        p.setBrush(c)
+        p.drawPath(path)
+    elif name == "warn":
+        path = QPainterPath()
+        path.moveTo(pad + 0.5 * w, pad)
+        path.lineTo(pad + w, pad + w)
+        path.lineTo(pad, pad + w)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawLine(QPointF(pad + 0.5 * w, pad + 0.34 * w),
+                   QPointF(pad + 0.5 * w, pad + 0.62 * w))
+        p.setBrush(c)
+        p.drawEllipse(QPointF(pad + 0.5 * w, pad + 0.82 * w), 0.06 * w,
+                      0.06 * w)
+    p.end()
+    return pm
+
+
+def nav_icon(name: str, size: int = ICON_SM) -> QIcon:
+    """A nav glyph that lights up in the accent colour when selected.
+
+    QPushButton draws its icon in the QIcon.On state when checked, so the
+    two pixmaps give the selected row both a tinted background *and* a
+    brightened icon — a colour change on its own is easy to miss."""
+    ic = QIcon()
+    ic.addPixmap(glyph_pixmap(name, size, THEME["text_dim"]),
+                 QIcon.Mode.Normal, QIcon.State.Off)
+    ic.addPixmap(glyph_pixmap(name, size, THEME["accent"]),
+                 QIcon.Mode.Normal, QIcon.State.On)
+    ic.addPixmap(glyph_pixmap(name, size, THEME["text"]),
+                 QIcon.Mode.Active, QIcon.State.Off)
+    ic.addPixmap(glyph_pixmap(name, size, THEME["accent_hover"]),
+                 QIcon.Mode.Active, QIcon.State.On)
+    return ic
+
+
+def shield_path(rect: QRectF) -> QPainterPath:
+    """The MSI-style heraldic shield: square shoulders, curving to a point.
+
+    One description shared by the painted app mark, the tray fallback and
+    (as hand-written path data) `icons/gs66-center.svg`, so the mark in the
+    window and the icon in the menu cannot look like two different apps.
+    Control points are the SVG's, normalised to the box.
+    """
+    x, y, w, h = rect.left(), rect.top(), rect.width(), rect.height()
+    path = QPainterPath()
+    path.moveTo(x, y)
+    path.lineTo(x + w, y)
+    path.lineTo(x + w, y + h * 0.389)
+    path.cubicTo(x + w, y + h * 0.70,
+                 x + w * 0.744, y + h * 0.878,
+                 x + w * 0.5, y + h)
+    path.cubicTo(x + w * 0.256, y + h * 0.878,
+                 x, y + h * 0.70,
+                 x, y + h * 0.389)
+    path.closeSubpath()
+    return path
+
+
+# Where the shield sits on the mark's square, as x, y, width, height
+# fractions.  Sized so the shape fills the canvas with an even margin — the
+# mark *is* the shield, so whatever is left over is wasted — and centred, so
+# it sits level with its neighbours in a taskbar.  The same four numbers are
+# baked into `icons/gs66-center.svg`; `check_brand_mark` rasterises both and
+# compares the outlines, so the two cannot drift apart.
+MARK_BOX = (19.0 / 128, 12.0 / 128, 90.0 / 128, 104.0 / 128)
+
+# The shield's three gradient stops — the same three the SVG carries, in the
+# same order and at the same positions.
+BRAND_RED = ("#ff4a3d", "#e2231a", "#9c0a19")
+
+
+def _mark_frame(size: int):
+    """A transparent canvas with the shield's bounding box on it.
+
+    An earlier version of this mark was a dark rounded tile carrying the
+    shield *and* the model number.  At the 16-22 px a taskbar and a menu
+    actually render it, that was a dark square with an unreadable smudge in
+    it, so both the tile and the lettering are gone: one shape, drawn as
+    large as it will go.  Returning the box keeps `brand_pixmap` and
+    `temp_pixmap` geometrically identical by construction rather than by
+    copy-paste.
+    """
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    s = float(size)
+    x, y, w, h = MARK_BOX
+    return pm, p, QRectF(s * x, s * y, s * w, s * h)
+
+
+def _mark_shield(p: QPainter, box: QRectF, stops) -> None:
+    """The shield itself.  `stops` are the three gradient colours, in order —
+    `brand_pixmap` passes the same three the SVG carries, so the painted mark
+    and the installed icon cannot drift into different reds."""
+    shield = shield_path(box)
+    grad = QLinearGradient(box.left(), box.top(),
+                           box.left() + box.width() * 0.25, box.bottom())
+    for pos, col in zip((0.0, 0.5, 1.0), stops):
+        grad.setColorAt(pos, col)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(grad))
+    p.drawPath(shield)
+
+
+def brand_pixmap(size: int = 32) -> QPixmap:
+    """The app mark: a centred MSI-red shield, and nothing else.
+
+    Matching `icons/gs66-center.svg` shape for shape.  Painted rather than
+    loaded so the GUI keeps its no-icon-theme dependency, and so the window
+    icon, the header mark and the tray all agree without shipping a second
+    file.
+    """
+    pm, p, box = _mark_frame(size)
+    _mark_shield(p, box, BRAND_RED)
+    p.end()
+    return pm
+
+
+def tray_digit_font(size: int, label: str) -> QFont:
+    """The font for the tray's temperature reading.
+
+    Sized off the *label*, not just the icon: “100” at the two-digit size
+    runs over the shield's edges, and a tray icon has no room to be clipped.
+    Its own function so the smoke test can measure the fit at the sizes the
+    tray really paints, instead of hunting for the digits in a raster.
+    """
+    f = QFont()
+    f.setPixelSize(max(7, int(size * (0.42 if len(label) <= 2 else 0.33))))
+    f.setBold(True)
+    return f
+
+
+def temp_pixmap(size: int, temp, label: str = "") -> QPixmap:
+    """The app mark tinted by the hottest reading — the tray icon.
+
+    Same shield as `brand_pixmap` so the tray, the window and the menu entry
+    are recognisably one app; the *fill* is the temperature band, so the tray
+    also answers “how hot is it” without opening the window.  A grey shield
+    means no reading has arrived yet.
+
+    The reading is the one thing painted on the shield, and the only place
+    the mark carries text at all: a tray icon has no label beside it.
+    """
+    pm, p, box = _mark_frame(size)
+    col = QColor(temp_color(temp))
+    _mark_shield(p, box, (col.lighter(118), col, col.darker(135)))
+    if label:
+        p.setPen(QPen(QColor(text_on(col.name()))))
+        p.setFont(tray_digit_font(size, label))
+        p.drawText(box, Qt.AlignCenter, label)
+    p.end()
+    return pm
+
+
+def hint_label(text: str, parent=None) -> QLabel:
+    """The one helper for explanatory small print — themed, wrapping, muted."""
+    h = QLabel(text, parent)
+    h.setWordWrap(True)
+    h.setFont(ui_font(TYPE_BODY))
+    h.setStyleSheet(f"color:{muted_color(h)}")
+    return h
+
+
+def notice_style(colour: str, background: str | None = None) -> str:
+    """Inline QSS for a warning / status strip inside a page.
+
+    One helper so the fan-curve and MUX warnings — which are both "here is
+    why this control is not going to work" — cannot end up with different
+    padding, radius or text colour, as they did.
+    """
+    if background:
+        return (f"color:{text_on(background)};background:{background};"
+                f"padding:8px 11px;border-radius:{R_CTRL}px;"
+                "font-weight:bold;")
+    return f"color:{colour};"
+
+
+def mark_checked(btn: "QPushButton") -> None:
+    """Flag a checkable button as a choice, so the theme can make its
+    selected state unmistakable (filled accent + bold label).  Breeze's
+    default checked button is only a few percent off the unchecked one —
+    genuinely easy to miss at a laptop-screen angle, which is the only angle
+    these buttons are ever seen from."""
+    btn.setProperty("choice", True)
+
+
+# Short names for the graphics mode.  core.MUX_LABELS spells out the full
+# "Hybrid (Intel + NVIDIA)" for a button or a sentence; a dashboard row and a
+# window title want the one word.
+MUX_SHORT = {core.MUX_HYBRID: "Hybrid", core.MUX_DISCRETE: "Discrete"}
+
+
+def graphics_mode(g: dict):
+    """The mode to *display* — the running one, or the pending one loudly."""
+    if not g:
+        return None
+    if g.get("reboot_required"):
+        return g.get("requested")
+    return g.get("effective") or g.get("requested")
+
+
+def graphics_summary(g: dict) -> str | None:
+    """One short phrase for the dashboard's "Right now" list."""
+    mode = graphics_mode(g)
+    if mode is None:
+        return None
+    name = MUX_SHORT.get(mode, mode)
+    return f"{name} after reboot" if g.get("reboot_required") else name
+
+
+# --------------------------------------------------------------------------
+# daemon client — every request answered on the worker thread, delivered
+# to the GUI as a queued Qt signal
+# --------------------------------------------------------------------------
+
+class Client(QObject):
+    reply = Signal(dict)        # {tag, cmd, data?} or {tag, cmd, error}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._loop, daemon=True,
+                         name="gs66-client").start()
+
+    def submit(self, cmd: dict, tag: str | None = None):
+        cmd = dict(cmd)
+        cmd["_tag"] = tag or str(cmd.get("cmd", "?"))
+        self._q.put(cmd)
+
+    def _loop(self):
+        while True:
+            cmd = self._q.get()
+            tag = cmd.pop("_tag")
+            try:
+                data = core.call(cmd, timeout=5.0)
+                self.reply.emit({"tag": tag, "cmd": cmd, "data": data})
+            except Exception as e:                          # noqa: BLE001
+                self.reply.emit({"tag": tag, "cmd": cmd, "error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# small building blocks
+# --------------------------------------------------------------------------
+
+class QSignalBlockerSafe:
+    """With-statement signal blocker that survives Qt object deletion."""
+
+    def __init__(self, obj):
+        self.obj = obj
+
+    def __enter__(self):
+        self.obj.blockSignals(True)
+
+    def __exit__(self, *a):
+        self.obj.blockSignals(False)
+
+
+class Card(QFrame):
+    """A titled surface with a tidy vertical layout — the GUI's layout atom.
+
+    A plain QFrame + an uppercase caption rather than a QGroupBox: the
+    groupbox title is drawn by the style at a size and colour we cannot
+    control, which is what made the old tabs read as unstyled."""
+    def __init__(self, title: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self.box = QVBoxLayout(self)
+        self.box.setContentsMargins(SPACE * 2, 14, SPACE * 2, 14)
+        self.box.setSpacing(SPACE + 2)
+        self.header = QHBoxLayout()
+        self.header.setSpacing(SPACE)
+        self.title = QLabel(title.upper())
+        self.title.setObjectName("CardTitle")
+        f = ui_font(TYPE_CAPTION, bold=True)
+        # A little tracking on the uppercase captions, so a row of card titles
+        # reads as a set of labels rather than as small shouting body text.
+        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108.0)
+        self.title.setFont(f)
+        self.header.addWidget(self.title)
+        self.header.addStretch(1)
+        if title:
+            self.box.addLayout(self.header)
+
+
+def kv_row(label: str, parent=None, value: str = "—",
+           selectable: bool = False) -> tuple:
+    """One label / right-aligned value row, styled in exactly one place.
+
+    Every card that lists facts ("Right now", "System", the MUX state, the
+    daemon) used to build this by hand, which is how their values drifted to
+    different weights and alignments.  Returns ``(row_layout, value_label)``
+    so the caller keeps a handle to update the value.
+    """
+    row = QHBoxLayout()
+    row.setSpacing(SPACE + 2)
+    k = QLabel(label)
+    k.setFont(ui_font(TYPE_BODY))
+    k.setStyleSheet(f"color:{muted_color(k)}")
+    v = QLabel(value)
+    v.setFont(ui_font(TYPE_BODY, bold=True))
+    v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    v.setWordWrap(True)
+    if selectable:
+        v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    row.addWidget(k, 0)
+    # The value takes the rest of the row and right-aligns inside it: giving
+    # the *stretch* the slack instead hands the label its minimum width, and a
+    # wrapping label then breaks a short string across two lines.
+    row.addWidget(v, 1)
+    return row, v
+
+
+def stat_row(label: str, value: str, parent=None) -> tuple:
+    """A label / big-number / unit row for a page headline (e.g. Battery)."""
+    row = QHBoxLayout()
+    row.setSpacing(SPACE)
+    k = QLabel(label)
+    k.setFont(ui_font(TYPE_BODY))
+    k.setStyleSheet(f"color:{muted_color(k)}")
+    v = QLabel(value)
+    v.setFont(ui_font(TYPE_H1, bold=True))
+    row.addWidget(k, 0, Qt.AlignBottom)
+    row.addWidget(v, 0, Qt.AlignBottom)
+    row.addStretch(1)
+    return row, v
+
+
+def field_label(text: str) -> QLabel:
+    """The caption above a form field — defined in exactly one place, so the
+    profile form and the raw console cannot label their fields differently."""
+    lab = QLabel(text)
+    lab.setFont(ui_font(TYPE_CAPTION, bold=True))
+    lab.setStyleSheet(f"color:{muted_color(lab)}")
+    return lab
+
+
+class StatCard(Card):
+    """Big number + progress bar + sub-line.  Every reading looks the same,
+    so a glance down the row compares them instead of re-reading them."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(title, parent)
+        self.chip = QLabel("")
+        self.chip.setObjectName("Chip")
+        self.chip.setFont(ui_font(TYPE_MICRO, bold=True))
+        self.chip.setVisible(False)
+        self.header.addWidget(self.chip)
+
+        self.value = QLabel("—")
+        self.value.setFont(ui_font(TYPE_DISPLAY, bold=True))
+        self.value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(H_BAR)
+        self.sub = QLabel("")
+        self.sub.setWordWrap(True)
+        self.sub.setFont(ui_font(TYPE_BODY))
+        self.sub.setStyleSheet(f"color:{muted_color(self)}")
+        # Centred vertically so the card still looks composed when the
+        # dashboard stretches it to fill the window.
+        self.box.addStretch(1)
+        self.box.addWidget(self.value)
+        self.box.addWidget(self.bar)
+        self.box.addWidget(self.sub)
+        self.box.addStretch(1)
+
+    def set_chip(self, text: str, colour: str | None = None) -> None:
+        if not text:
+            # Clear the style as well as the text: a hidden chip that keeps
+            # the last colour is a surprise waiting for the first caller who
+            # shows it without going through here.
+            self.chip.setVisible(False)
+            self.chip.setText("")
+            self.chip.setStyleSheet("")
+            return
+        c = colour or THEME["accent"]
+        self.chip.setText(text)
+        self.chip.setStyleSheet(
+            f"color:{text_on(c)};background:{c};border-radius:{R_PILL}px;"
+            "padding:3px 9px;")
+        self.chip.setVisible(True)
+
+    def show(self, text: str, frac: float | None, sub: str,
+             colour: str | None = None, chip: str | None = None,
+             chip_colour: str | None = None):
+        accent = colour or THEME["accent"]
+        self.value.setText(text)
+        self.value.setStyleSheet(f"color:{accent}")
+        if frac is None:
+            self.bar.setValue(0)
+            self.bar.setEnabled(False)
+        else:
+            self.bar.setEnabled(True)
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(int(max(0.0, min(1.0, frac)) * 1000))
+        self.bar.setStyleSheet(
+            f"QProgressBar{{background:{THEME['bar_bg']};border:none;"
+            f"border-radius:{R_BAR}px}}"
+            f"QProgressBar::chunk{{background:{accent};"
+            f"border-radius:{R_BAR}px}}")
+        self.sub.setText(sub)
+        self.set_chip(chip or "", chip_colour)
+
+
+def scrolled(page: QWidget) -> QScrollArea:
+    """Put a page in a frameless, resizable scroll area.
+
+    Every section scrolls, so the window can be made small on a laptop screen
+    without a control sliding off the bottom."""
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.NoFrame)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    sa.setWidget(page)
+    return sa
+
+
+def page_layout(widget: QWidget) -> QVBoxLayout:
+    """The standard page frame — one margin and one gap for all six sections.
+
+    Every tab used to repeat the same three lines; centralising them is what
+    keeps a card on the Dashboard aligned with a card on Settings."""
+    lay = QVBoxLayout(widget)
+    lay.setContentsMargins(PAGE_PAD, 18, PAGE_PAD, 18)
+    lay.setSpacing(PAGE_GAP)
+    return lay
+
+
+# --------------------------------------------------------------------------
+# fan-curve canvas — drag the six threshold points; the factory curve is
+# drawn behind as a ghost so you can see how far you have strayed
+# --------------------------------------------------------------------------
+
+class CurveCanvas(QWidget):
+    """Draggable fan-curve editor.
+
+    Fully keyboard-operable, which the mouse-only first version was not:
+    Tab reaches it, arrows select and move a point, Shift+arrows take bigger
+    steps.  The same clamping as the mouse path is applied, so a keyboard
+    drag can no more produce an invalid curve than a mouse one can.
+    """
+
+    changed = Signal()                       # user moved a point
+
+    # The axes span the *whole* valid range, so a legal point can never be
+    # drawn outside the plot.  TMIN used to be a hardcoded 20 while the EC
+    # accepts down to core.TEMP_MIN (10): a keyboard nudge could then move
+    # point 0 to 10 °C, which sits left of the plot — the handle vanished off
+    # the edge and the mouse could no longer reach the value its own spin box
+    # was showing.  Keep these tied to core, not to a taste call.
+    TMIN, TMAX = core.TEMP_MIN, core.TEMP_MAX   # x axis, °C
+    SMIN, SMAX = core.SPEED_MIN, core.SPEED_MAX  # y axis, %
+    ML, MR, MT, MB = 40, 16, 16, 28          # margins
+    STEP_FINE = 1
+    STEP_COARSE = 5
+
+    def __init__(self, which: str, parent=None):
+        super().__init__(parent)
+        self.which = which
+        self.temps: list = []
+        self.speeds: list = []
+        self.ghost = None                    # factory {temps, speeds}
+        self.live = None                     # (temp, fan%) from the EC
+        self._drag: int | None = None
+        self._hover: int | None = None
+        self._kb: int | None = None          # keyboard-selected point
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAccessibleName(f"{which.upper()} fan curve")
+        self.setAccessibleDescription(
+            "Editable fan curve.  Use the Tab key to reach it, the left and "
+            "right arrow keys to choose a point, and the up and down arrow "
+            "keys to change its fan speed.  Hold Shift for larger steps.")
+        self.setMinimumHeight(230)
+
+    # -- coordinate mapping -------------------------------------------------
+
+    def _plot(self) -> QRectF:
+        return QRectF(self.ML, self.MT,
+                      self.width() - self.ML - self.MR,
+                      self.height() - self.MT - self.MB)
+
+    def _x(self, t: float) -> float:
+        p = self._plot()
+        return p.left() + (t - self.TMIN) / (self.TMAX - self.TMIN) * p.width()
+
+    def _t(self, x: float) -> float:
+        p = self._plot()
+        return self.TMIN + (x - p.left()) / p.width() * (self.TMAX - self.TMIN)
+
+    def _y(self, s: float) -> float:
+        p = self._plot()
+        return p.bottom() - (s - self.SMIN) / (self.SMAX - self.SMIN) * p.height()
+
+    def _s(self, y: float) -> float:
+        p = self._plot()
+        return self.SMIN + (p.bottom() - y) / p.height() * (self.SMAX - self.SMIN)
+
+    # -- data ---------------------------------------------------------------
+
+    def set_curve(self, temps, speeds, ghost=None):
+        self.temps = list(temps or [])
+        self.speeds = list(speeds or [])
+        if ghost is not None:
+            self.ghost = ghost
+        self.update()
+
+    def set_live(self, live):
+        self.live = live
+        self.update()
+
+    # -- painting -----------------------------------------------------------
+
+    def _step_path(self, temps, speeds) -> QPainterPath:
+        """Step function: speeds[0] until temps[0] is passed, then speeds[1] …"""
+        path = QPainterPath()
+        path.moveTo(self._x(self.TMIN), self._y(speeds[0]))
+        for t, s in zip(temps, speeds[1:]):
+            x = self._x(t)
+            path.lineTo(x, path.currentPosition().y())
+            path.lineTo(x, self._y(s))
+        path.lineTo(self._x(self.TMAX), path.currentPosition().y())
+        return path
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        plot = self._plot()
+
+        # inset panel, so the plot reads as its own surface inside the card
+        p.setPen(Qt.NoPen)
+        p.setBrush(tcol("surface2"))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+                          R_INNER, R_INNER)
+
+        grid = tcol("border_strong")
+        grid.setAlpha(150)
+        p.setPen(QPen(grid, 1, Qt.DotLine))
+        for t in range(self.TMIN, self.TMAX + 1, 10):
+            p.drawLine(QPointF(self._x(t), plot.top()),
+                       QPointF(self._x(t), plot.bottom()))
+        for s in range(self.SMIN, self.SMAX + 1, 25):
+            p.drawLine(QPointF(plot.left(), self._y(s)),
+                       QPointF(plot.right(), self._y(s)))
+
+        lab = tcol("muted")
+        p.setPen(QPen(lab))
+        p.setFont(ui_font(TYPE_MICRO))
+        # Gridlines every 10 °C, but round-number labels only — the axis now
+        # starts at core.TEMP_MIN (10), so 20…100 stay the natural labels.
+        for t in (20, 40, 60, 80, 100):
+            p.drawText(QRectF(self._x(t) - 14, plot.bottom() + 3, 28, 14),
+                       Qt.AlignCenter, str(t))
+        for s in (0, 50, 100):
+            p.drawText(QRectF(0, self._y(s) - 7, self.ML - 8, 14),
+                       Qt.AlignRight | Qt.AlignVCenter, str(s))
+        p.drawText(QRectF(plot.left(), plot.bottom() + 15, plot.width(), 12),
+                   Qt.AlignCenter, "°C")
+
+        if self.temps and len(self.speeds) == core.N_SPEEDS:
+            # The curve is *your setting*, so it wears the brand accent.  The
+            # live position of the machine wears its temperature-band colour
+            # instead, so "what I configured" and "how hot it is right now"
+            # can never be mistaken for one another.  (The curve itself used
+            # to be tinted by the live temperature — an identical curve then
+            # changed colour from minute to minute, and the accent ended up
+            # meaning nothing at all.)
+            col = tcol("accent")
+
+            if self.ghost:
+                p.setPen(QPen(tcol("muted"), 1.4, Qt.DashLine))
+                p.drawPath(self._step_path(self.ghost["temps"],
+                                           self.ghost["speeds"]))
+
+            path = self._step_path(self.temps, self.speeds)
+            fill = QColor(col)
+            fill.setAlpha(38)
+            area = QPainterPath(path)
+            area.lineTo(self._x(self.TMAX), self._y(self.SMIN))
+            area.lineTo(self._x(self.TMIN), self._y(self.SMIN))
+            area.closeSubpath()
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(fill))
+            p.drawPath(area)
+
+            p.setPen(QPen(col, 2.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+
+            # Live marker: where the machine actually is right now — drawn in
+            # the temperature band colour and labelled, so the one coloured
+            # thing on the plot is the reading it stands for.
+            if self.live and self.live[0] is not None:
+                mark = QColor(temp_color(self.live[0]))
+                p.setPen(QPen(mark, 1.5, Qt.DotLine))
+                x = self._x(self.live[0])
+                p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+                txt = f"{self.live[0]}°C"
+                if self.live[1] is not None:
+                    txt += f" · {self.live[1]}%"
+                fm = p.fontMetrics()
+                w = fm.horizontalAdvance(txt) + 12
+                bx = min(max(x + 5, plot.left()), plot.right() - w)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(mark))
+                p.drawRoundedRect(QRectF(bx, plot.top() + 4, w, 17), 6, 6)
+                p.setPen(QPen(QColor(text_on(mark.name()))))
+                p.drawText(QRectF(bx, plot.top() + 4, w, 17),
+                           Qt.AlignCenter, txt)
+
+            # draggable handles.  The keyboard-selected one gets a ring, so
+            # focus is visible without relying on the style's focus rect —
+            # which custom-painted widgets do not get for free.
+            focused = self.hasFocus()
+            ring = tcol("text")
+            for i, (t, s) in enumerate(zip(self.temps, self.speeds[1:])):
+                hot = i in (self._drag, self._hover)
+                selected = focused and i == self._kb
+                r = 6.5 if hot else 5.0
+                cx, cy = self._x(t), self._y(s)
+                if selected:
+                    p.setPen(QPen(ring, 2))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawEllipse(QPointF(cx, cy), r + 3.5, r + 3.5)
+                p.setPen(QPen(col.darker(140) if hot else col, 2))
+                p.setBrush(QBrush(col.lighter(130) if hot else col))
+                p.drawEllipse(QPointF(cx, cy), r, r)
+        else:
+            p.setPen(QPen(lab))
+            p.drawText(plot, Qt.AlignCenter, "no curve data")
+        p.end()
+
+    # -- interaction --------------------------------------------------------
+
+    def _nearest(self, pos) -> int | None:
+        best, bestd = None, 12.0
+        for i, (t, s) in enumerate(zip(self.temps, self.speeds[1:])):
+            d = ((self._x(t) - pos.x()) ** 2 + (self._y(s) - pos.y()) ** 2) ** .5
+            if d < bestd:
+                best, bestd = i, d
+        return best
+
+    def _set_point(self, i: int, t: int, s: int) -> bool:
+        """Move point i, clamped to the monotonic envelope.
+
+        Shared by the mouse and the keyboard so the two can never disagree
+        about what a legal move is: a curve that fails validation on the way
+        in is a curve the user cannot Apply, and clamping here means that
+        can never happen from either input device.
+        """
+        lo_t = self.temps[i - 1] + 1 if i > 0 else core.TEMP_MIN
+        hi_t = self.temps[i + 1] - 1 if i + 1 < len(self.temps) else core.TEMP_MAX
+        lo_s = self.speeds[i]
+        hi_s = self.speeds[i + 2] if i + 2 < len(self.speeds) else core.SPEED_MAX
+        nt = max(lo_t, min(hi_t, t))
+        ns = max(lo_s, min(hi_s, s))
+        if nt == self.temps[i] and ns == self.speeds[i + 1]:
+            return False                      # nothing actually moved
+        self.temps[i] = nt
+        self.speeds[i + 1] = ns
+        return True
+
+    def mousePressEvent(self, ev):
+        self._drag = self._nearest(ev.position())
+        if self._drag is not None:
+            self._kb = self._drag
+            self.setFocus()
+            self.update()
+
+    def mouseMoveEvent(self, ev):
+        if self._drag is None:
+            h = self._nearest(ev.position())
+            if h != self._hover:
+                self._hover = h
+                self.setCursor(Qt.SizeAllCursor if h is not None
+                               else Qt.ArrowCursor)
+                self.update()
+            return
+        if self._set_point(self._drag,
+                           round(self._t(ev.position().x())),
+                           round(self._s(ev.position().y()))):
+            self.update()
+            self.changed.emit()
+
+    def mouseReleaseEvent(self, ev):
+        if self._drag is not None:
+            self._drag = None
+            self.update()
+            self.changed.emit()
+
+    def focusInEvent(self, ev):
+        if self._kb is None and self.temps:
+            self._kb = 0
+        self.update()
+        super().focusInEvent(ev)
+
+    def focusOutEvent(self, ev):
+        self._kb = None
+        self.update()
+        super().focusOutEvent(ev)
+
+    def keyPressEvent(self, ev):
+        if not self.temps or len(self.speeds) != core.N_SPEEDS:
+            super().keyPressEvent(ev)
+            return
+        key = ev.key()
+        step = (self.STEP_COARSE if ev.modifiers() & Qt.ShiftModifier
+                else self.STEP_FINE)
+        i = 0 if self._kb is None else self._kb
+
+        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down) \
+                and ev.modifiers() & Qt.AltModifier:
+            # Alt+arrows walk between points, matching the spin-box layout
+            # where the points run left to right.
+            self._kb = max(0, min(len(self.temps) - 1,
+                                  i + (1 if key in (Qt.Key_Right, Qt.Key_Down)
+                                       else -1)))
+            self.update()
+            ev.accept()
+            return
+
+        moved = False
+        if key == Qt.Key_Left:
+            moved = self._set_point(i, self.temps[i] - step,
+                                    self.speeds[i + 1])
+        elif key == Qt.Key_Right:
+            moved = self._set_point(i, self.temps[i] + step,
+                                    self.speeds[i + 1])
+        elif key == Qt.Key_Up:
+            moved = self._set_point(i, self.temps[i],
+                                    self.speeds[i + 1] + step)
+        elif key == Qt.Key_Down:
+            moved = self._set_point(i, self.temps[i],
+                                    self.speeds[i + 1] - step)
+        else:
+            super().keyPressEvent(ev)
+            return
+
+        if moved:
+            self.update()
+            self.changed.emit()
+        ev.accept()
+
+    def leaveEvent(self, ev):
+        if self._hover is not None:
+            self._hover = None
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+
+
+# --------------------------------------------------------------------------
+# sections
+# --------------------------------------------------------------------------
+
+class DashboardTab(QWidget):
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        lay = page_layout(self)
+
+        self.cpu = StatCard("CPU")
+        self.gpu = StatCard("GPU")
+        self.cpu_rpm = StatCard("CPU fan")
+        self.gpu_rpm = StatCard("GPU fan")
+        self.battery = StatCard("Battery")
+
+        grid = QGridLayout()
+        grid.setSpacing(PAGE_GAP)
+        grid.addWidget(self.cpu, 0, 0)
+        grid.addWidget(self.gpu, 0, 1)
+        grid.addWidget(self.cpu_rpm, 0, 2)
+        grid.addWidget(self.gpu_rpm, 0, 3)
+        grid.addWidget(self.battery, 1, 0, 1, 2)
+        self.modes = Card("Right now")
+        grid.addWidget(self.modes, 1, 2, 1, 2)
+        for c in range(4):
+            grid.setColumnStretch(c, 1)
+        lay.addLayout(grid)
+
+        self.syscard = Card("System")
+        self.sys_rows = {}
+        for key in ("Driver", "Socket", "Debug interface", "Config"):
+            row, v = kv_row(key, self.syscard, selectable=True)
+            self.syscard.box.addLayout(row)
+            self.sys_rows[key] = v
+        self.syscard.box.addWidget(hint_label(
+            "Read from the daemon's own status, not from sysfs: this window "
+            "never opens the hardware directly.", self.syscard))
+        lay.addWidget(self.syscard)
+        lay.addStretch(1)
+
+        self.mode_rows = {}
+        for label in ("Performance", "Fan mode", "Cooler boost",
+                      "Charge limit", "Graphics"):
+            row, v = kv_row(label, self.modes)
+            self.modes.box.addLayout(row)
+            self.mode_rows[label] = v
+
+    def refresh(self, st: dict):
+        cpu, gpu = st.get("cpu", {}), st.get("gpu", {})
+        for card, d in ((self.cpu, cpu), (self.gpu, gpu)):
+            t = d.get("temp")
+            pct = d.get("fan_pct")
+            band = core.temp_band(t)
+            card.show(f"{t}°C" if t is not None else "—",
+                      (t / 100.0) if t is not None else None,
+                      f"fan {pct}%" if pct is not None else "fan —",
+                      temp_color(t),
+                      chip=(band or "").upper(),
+                      chip_colour=temp_color(t))
+        for card, d in ((self.cpu_rpm, cpu), (self.gpu_rpm, gpu)):
+            rpm = d.get("rpm")
+            pct = d.get("fan_pct")
+            # `is not None`, not truthiness: a stopped fan reads 0 RPM and
+            # that is a real answer, not a missing daemon.
+            if rpm is None:
+                card.show("—", None, "RPM needs the daemon", COL_DEAD)
+            else:
+                # The bar is fan duty, the number is RPM — say so.  With the
+                # sub-line just reading "RPM" the bar's meaning was anyone's
+                # guess, and it does not track the number beside it.
+                card.show(f"{rpm:,}", (pct / 100.0) if pct is not None else None,
+                          f"RPM · fan {pct}%" if pct is not None else "RPM",
+                          temp_color(d.get("temp")))
+
+        bat = st.get("battery") or {}
+        pct = bat.get("pct")
+        # Wear is *capacity now* against *capacity when new*.  This used to be
+        # energy_now / energy_full, which is the state of charge — so the
+        # dashboard announced "67% of new" beside a big 67% and told you
+        # nothing about the battery's health at all.
+        wear = None
+        if bat.get("energy_full") and bat.get("energy_full_design"):
+            wear = bat["energy_full"] / bat["energy_full_design"]
+        limit = bat.get("charge_end")
+        status = (bat.get("status") or "").strip()
+        word = status.lower()
+        # The chip names the state and colours it by whether it wants your
+        # attention.  Charging and full are simply fine (green); "not
+        # charging" while on AC is the one state people actually ask about —
+        # usually the charge limit doing its job — so it takes the amber that
+        # means "look, but nothing is wrong"; everything else, including
+        # running on battery, is neutral.
+        if word in ("charging", "full"):
+            chip_col = COL_OK
+        elif word in ("not charging", "unknown"):
+            chip_col = COL_WARM
+        else:
+            chip_col = THEME["accent"]
+        # The battery is not a temperature, so it does not wear the heat-map
+        # colours; it wears the brand accent, which is what the app uses for
+        # "a value we are reporting" everywhere else.  (It used to be green
+        # whatever the charge was, so 8% on battery looked as "fine" as 100%.)
+        self.battery.show(
+            f"{pct}%" if pct is not None else "—",
+            (pct / 100.0) if pct is not None else None,
+            " · ".join(x for x in [
+                "AC" if bat.get("ac_online") else ("battery" if bat.get(
+                    "ac_online") is not None else ""),
+                f"health {wear:.0%}" if wear else "",
+                f"limit {limit}%" if limit is not None else "",
+            ] if x),
+            THEME["accent"],
+            chip=(status.upper() if status else ""),
+            chip_colour=chip_col)
+
+        rows = {
+            "Performance": st.get("shift", {}).get("current"),
+            "Fan mode": st.get("fan", {}).get("current"),
+            "Cooler boost": st.get("cooler_boost"),
+            "Charge limit": (f"{limit}%" if limit is not None else None),
+            "Graphics": graphics_summary(st.get("graphics") or {}),
+        }
+        for k, v in rows.items():
+            self.mode_rows[k].setText(str(v) if v else "—")
+
+        drv = st.get("driver") or {}
+        self.sys_rows["Driver"].setText(
+            (f"{drv.get('fw') or 'driver'}"
+             + (f"  ·  {drv['fw_date']}" if drv.get("fw_date") else ""))
+            if drv.get("present") else "NOT LOADED  (see Settings)")
+        self.sys_rows["Socket"].setText(core.sock_path())
+        self.sys_rows["Debug interface"].setText(
+            "on" if drv.get("debug") else "off")
+        cfg = st.get("config") or {}
+        bits = []
+        if cfg:
+            bits.append("raw access " + ("ON" if cfg.get("AllowRaw") else "off"))
+            bits.append("MUX switch "
+                        + ("ON" if cfg.get("AllowMuxSwitch") else "off"))
+        self.sys_rows["Config"].setText("  ·  ".join(bits) or "—")
+
+
+class PerformanceTab(QWidget):
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        lay = page_layout(self)
+
+        card = Card("Performance mode (shift)")
+        self.note = hint_label(
+            "MSI's shift modes trade sustained performance against heat and "
+            "fan noise.  Changes reach the EC immediately.", card)
+        card.box.addWidget(self.note)
+        self.btns = QButtonGroup(self)
+        self.btns.setExclusive(True)
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        self.buttons = {}
+        for name in ("eco", "comfort", "sport", "turbo"):
+            b = QPushButton(name.capitalize())
+            b.setCheckable(True)
+            mark_checked(b)
+            b.clicked.connect(lambda _=False, n=name: self.win.set_key("shift", n))
+            self.btns.addButton(b)
+            self.buttons[name] = b
+            row.addWidget(b)
+        card.box.addLayout(row)
+        card.box.addWidget(hint_label(
+            "eco · quiet and cool — comfort · everyday — sport · sustained "
+            "load — turbo · maximum (loud)", card))
+        lay.addWidget(card)
+
+        boost = Card("Cooling")
+        self.boost_btn = QPushButton("COOLER BOOST — hold both fans at 100%")
+        self.boost_btn.setCheckable(True)
+        # The one oversized control in the app: its height comes from the
+        # [hero="true"] rule in the stylesheet, so it is a token like every
+        # other size rather than a number set here.
+        self.boost_btn.setProperty("hero", True)
+        self.boost_btn.setFont(ui_font(TYPE_H2, bold=True))
+        self.boost_btn.setCursor(Qt.PointingHandCursor)
+        self.boost_btn.clicked.connect(self._boost)
+        boost.box.addWidget(self.boost_btn)
+        boost.box.addWidget(hint_label(
+            "Forced maximum cooling, e.g. right after a gaming session.  "
+            "It stays on until you turn it off (or the daemon re-applies "
+            "your saved state at boot).  The duty registers do not move under "
+            "Cooler Boost — watch the RPM beside them.", boost))
+        lay.addWidget(boost)
+
+        # ---- graphics mode (MUX) -----------------------------------------
+        # Same place MSI Center puts "Graphics Switch", and the same trade:
+        # discrete is faster and hybrid is cooler and longer-running.
+        gfx = Card("Graphics mode (MUX)")
+        gfx.box.addWidget(hint_label(
+            "Which GPU drives the built-in display.  A switch is written to "
+            "the embedded controller and to a UEFI variable, and takes effect "
+            "at the next reboot — this session is unaffected.", gfx))
+
+        self.gfx_rows = {}
+        for label in ("running now", "at next boot"):
+            row, v = kv_row(label, gfx)
+            gfx.box.addLayout(row)
+            self.gfx_rows[label] = v
+
+        grow = QHBoxLayout()
+        grow.setSpacing(SPACE)
+        self.gfx_btns = QButtonGroup(self)
+        self.gfx_btns.setExclusive(True)
+        self.gfx_buttons = {}
+        for mode in core.MUX_MODES:
+            b = QPushButton(core.MUX_LABELS[mode])
+            b.setCheckable(True)
+            mark_checked(b)
+            b.clicked.connect(lambda _=False, m=mode: self._graphics(m))
+            self.gfx_btns.addButton(b)
+            self.gfx_buttons[mode] = b
+            grow.addWidget(b, 1)
+        self.gfx_revert = QPushButton("Undo last switch")
+        self.gfx_revert.clicked.connect(self._graphics_revert)
+        grow.addWidget(self.gfx_revert, 0)
+        gfx.box.addLayout(grow)
+
+        self.gfx_warn = QLabel("")
+        self.gfx_warn.setWordWrap(True)
+        self.gfx_warn.setVisible(False)
+        gfx.box.addWidget(self.gfx_warn)
+        gfx.box.addWidget(hint_label(
+            "⚠ A switch rewrites EC 0x2e and the UEFI variable "
+            f"{core.MUX_VAR_NAME}.  It is off unless “AllowMuxSwitch” is set "
+            "in the config, it always needs a reboot, and on a laptop whose "
+            "MUX was never reverse engineered it can leave the machine with "
+            "no display — recovery would then mean resetting the firmware.  "
+            "The previous value is backed up first.", gfx))
+        lay.addWidget(gfx)
+        lay.addStretch(1)
+
+        self._avail = []
+        self._gfx: dict = {}
+
+    def _boost(self):
+        self.win.set_key("cooler_boost", self.boost_btn.isChecked())
+
+    def _graphics(self, mode: str):
+        g = self._gfx or {}
+        if g.get("requested") == mode and not g.get("reboot_required"):
+            self.win.flash(f"already in {MUX_SHORT.get(mode, mode)} mode")
+            return
+        answer = QMessageBox.warning(
+            self, "Switch graphics mode",
+            f"Switch the graphics mode to {core.MUX_LABELS[mode]}?\n\n"
+            "This writes EC register 0x2e, the EC switch trigger and the "
+            f"UEFI variable {core.MUX_VAR_NAME}.  It takes effect at the "
+            "NEXT REBOOT — nothing changes in this session.\n\n"
+            "On a laptop whose MUX was never reverse engineered this can "
+            "leave the machine without a display, and recovery would then "
+            "mean resetting the firmware.  The current value is saved to a "
+            "backup first, and “Undo last switch” restores it.\n\n"
+            "Switch now and reboot later?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.win.send({"cmd": "graphics", "action": "set", "mode": mode},
+                          tag="graphics")
+
+    def _graphics_revert(self):
+        backup = (self._gfx or {}).get("backup") or {}
+        answer = QMessageBox.warning(
+            self, "Undo graphics switch",
+            "Restore the graphics mode saved before the last switch "
+            f"({core.MUX_LABELS.get(backup.get('requested'), '?')})?\n\n"
+            "As with the switch itself, this needs a reboot to take effect.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.win.send({"cmd": "graphics", "action": "revert"},
+                          tag="graphics")
+
+    def refresh_graphics(self, st: dict):
+        g = st.get("graphics") or {}
+        self._gfx = g
+        self.gfx_rows["running now"].setText(
+            core.MUX_LABELS.get(g.get("effective")) or "unknown")
+        pending = bool(g.get("reboot_required"))
+        self.gfx_rows["at next boot"].setText(
+            (core.MUX_LABELS.get(g.get("requested")) or "unknown")
+            + ("  ·  reboot required" if pending else ""))
+
+        online = self.win.online
+        enabled = bool(g.get("enabled")) and bool(online)
+        for mode, b in self.gfx_buttons.items():
+            with QSignalBlockerSafe(b):
+                b.setChecked(mode == g.get("requested"))
+            b.setEnabled(enabled)
+            b.setToolTip("" if enabled else
+                         "the daemon is offline" if not online else
+                         "set “AllowMuxSwitch”: true in the config to enable "
+                         "this")
+        has_backup = bool(g.get("backup"))
+        self.gfx_revert.setEnabled(enabled and has_backup)
+        self.gfx_revert.setToolTip(
+            "Restore the value saved before the last switch" if has_backup
+            else "nothing has been switched yet")
+
+        # One status line, and it says the *reason* a control is dead rather
+        # than leaving a greyed-out button to be interpreted.
+        if not g.get("supported", True):
+            note = ("✗ this firmware exposes neither the EC graphics bit nor "
+                    f"the {core.MUX_VAR_NAME} variable — the switch is not "
+                    "available here")
+            style = notice_style(COL_CRIT, COL_CRIT)
+        elif not g.get("enabled"):
+            note = ("switching is disabled — set “AllowMuxSwitch”: true in "
+                    f"{core.config_path()} and restart gs66-centerd")
+            style = notice_style(muted_color(self))
+        elif not online:
+            note = "the daemon is offline, so nothing can be written"
+            style = notice_style(muted_color(self))
+        elif pending:
+            note = "⚠ a reboot is required for the requested mode to apply"
+            style = notice_style(COL_HOT, COL_HOT)
+        else:
+            note = ""
+            style = ""
+        self.gfx_warn.setText(note)
+        self.gfx_warn.setStyleSheet(style)
+        self.gfx_warn.setVisible(bool(note))
+
+    def refresh(self, st: dict):
+        cur = st.get("shift", {}).get("current")
+        self._avail = st.get("shift", {}).get("available") or []
+        for name, b in self.buttons.items():
+            blocked = bool(self._avail) and name not in self._avail
+            b.setEnabled(not blocked and bool(self.win.online))
+            b.setToolTip("not supported by this EC firmware" if blocked else "")
+            with QSignalBlockerSafe(b):
+                b.setChecked(name == cur)
+        on = st.get("cooler_boost") == "on"
+        with QSignalBlockerSafe(self.boost_btn):
+            self.boost_btn.setChecked(on)
+        self.boost_btn.setEnabled(bool(self.win.online))
+        self.boost_btn.setText("COOLER BOOST ON — tap to release"
+                               if on else
+                               "COOLER BOOST — hold both fans at 100%")
+        # Only restyle when it is actually on.  "On" is the same filled accent
+        # as every other selected control, so the tab has one meaning for one
+        # look; the amber this used to wear read as "hot", which Cooler Boost
+        # — the thing that *cools* — is the opposite of.
+        if on:
+            self.boost_btn.setStyleSheet(
+                f"QPushButton{{background:{THEME['accent']};"
+                f"color:{THEME['on_accent']};border:1px solid "
+                f"{THEME['accent']}}}"
+                f"QPushButton:hover{{background:{THEME['accent_hover']};"
+                f"border-color:{THEME['accent_hover']}}}")
+        else:
+            self.boost_btn.setStyleSheet("")
+        self.refresh_graphics(st)
+
+
+class FansTab(QWidget):
+    """Fan mode + the two editable curves.
+
+    The curves carry **unsaved-change tracking**.  Without it the 1.5 s poll
+    re-adopted the EC's curve on every refresh and silently reverted whatever
+    the user had just dragged — the edit vanished mid-thought, and the Apply
+    button then applied the EC's own value back to the EC.  A refresh may now
+    only replace the editor when the editor holds no unsaved change, and the
+    pending state clears by itself the moment the EC agrees (i.e. the write
+    landed).  Nothing is written optimistically: the EC read-back is still the
+    only thing that clears the flag.
+    """
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        lay = page_layout(self)
+
+        mode = Card("Fan mode")
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        self.mode_btns = QButtonGroup(self)
+        self.mode_btns.setExclusive(True)
+        self.modes = {}
+        for name in ("auto", "silent", "advanced"):
+            b = QPushButton(name.capitalize())
+            b.setCheckable(True)
+            mark_checked(b)
+            b.clicked.connect(lambda _=False, n=name: self.win.set_key("fan", n))
+            self.mode_btns.addButton(b)
+            self.modes[name] = b
+            row.addWidget(b, 1)
+        self.mode_now = QLabel("")
+        self.mode_now.setFont(ui_font(TYPE_BODY))
+        self.mode_now.setStyleSheet(f"color:{muted_color(self)}")
+        row.addSpacing(SPACE)
+        row.addWidget(self.mode_now, 0)
+        mode.box.addLayout(row)
+        mode.box.addWidget(hint_label(
+            "EC fan modes.  “advanced” lets the fan follow the custom curve "
+            "below; “silent” caps the speed; “auto” is the firmware default.  "
+            "The curve editor is live — drag a point and Apply writes it.", mode))
+        lay.addWidget(mode)
+
+        self.canvases = {}
+        self.spin_temps = {}
+        self.spin_speeds = {}
+        self.apply_btns = {}
+        self.reset_btns = {}
+        self.pending_labels = {}
+        self.curve_state = {"cpu": None, "gpu": None}
+        self._unsaved = {"cpu": False, "gpu": False}
+
+        grids = QHBoxLayout()
+        grids.setSpacing(PAGE_GAP)
+        for which in ("cpu", "gpu"):
+            card = Card(f"{which.upper()} fan curve")
+            canvas = CurveCanvas(which)
+            canvas.changed.connect(lambda w=which: self._canvas_changed(w))
+            self.canvases[which] = canvas
+            card.box.addWidget(canvas)
+
+            trow = QGridLayout()
+            trow.setHorizontalSpacing(4)
+            trow.setVerticalSpacing(3)
+            self.spin_temps[which] = []
+            self.spin_speeds[which] = []
+            for i in range(core.N_TEMPS):
+                lab = QLabel(f"T{i + 1}")
+                lab.setAlignment(Qt.AlignCenter)
+                lab.setFont(ui_font(TYPE_MICRO))
+                lab.setStyleSheet(f"color:{muted_color(self)}")
+                sp = QSpinBox()
+                sp.setRange(core.TEMP_MIN, core.TEMP_MAX)
+                sp.setSuffix("°")
+                sp.setFixedWidth(52)
+                sp.setAccessibleName(f"{which.upper()} threshold {i + 1}")
+                sp.valueChanged.connect(
+                    lambda _v, w=which, kind="t": self._spin_changed(w, kind))
+                self.spin_temps[which].append(sp)
+                trow.addWidget(lab, 0, i)
+                trow.addWidget(sp, 1, i)
+            for i in range(core.N_SPEEDS):
+                lab = QLabel(f"S{i}")
+                lab.setAlignment(Qt.AlignCenter)
+                lab.setFont(ui_font(TYPE_MICRO))
+                lab.setStyleSheet(f"color:{muted_color(self)}")
+                sp = QSpinBox()
+                sp.setRange(core.SPEED_MIN, core.SPEED_MAX)
+                sp.setSuffix("%")
+                sp.setFixedWidth(48)
+                sp.setAccessibleName(f"{which.upper()} speed {i}")
+                sp.valueChanged.connect(
+                    lambda _v, w=which, kind="s": self._spin_changed(w, kind))
+                self.spin_speeds[which].append(sp)
+                trow.addWidget(lab, 2, i)
+                trow.addWidget(sp, 3, i)
+            card.box.addLayout(trow)
+
+            brow = QHBoxLayout()
+            brow.setSpacing(SPACE)
+            apply_btn = QPushButton(f"Apply {which.upper()} curve")
+            apply_btn.setProperty("primary", True)
+            apply_btn.setToolTip(
+                "Write this curve into the embedded controller")
+            apply_btn.clicked.connect(lambda _=False, w=which: self._apply(w))
+            reset_btn = QPushButton("Load factory")
+            reset_btn.setToolTip("Load the original firmware curve into the "
+                                 "editor (nothing is written until you Apply)")
+            reset_btn.clicked.connect(lambda _=False, w=which: self._load_ghost(w))
+            pending = QLabel("● unsaved changes")
+            pending.setVisible(False)
+            pending.setFont(ui_font(TYPE_CAPTION, bold=True))
+            pending.setStyleSheet(f"color:{COL_HOT}")
+            self.apply_btns[which] = apply_btn
+            self.reset_btns[which] = reset_btn
+            self.pending_labels[which] = pending
+            # One warning label per canvas, stored directly — the old code
+            # kept a shared self.warn that ended up pointing at whichever
+            # fan was built last.
+            warn = QLabel("")
+            warn.setWordWrap(True)
+            warn.setVisible(False)
+            setattr(self, f"warn_{which}", warn)
+            brow.addWidget(apply_btn)
+            brow.addWidget(reset_btn)
+            brow.addSpacing(SPACE // 2)
+            brow.addWidget(pending)
+            brow.addStretch(1)
+            card.box.addLayout(brow)
+            card.box.addWidget(warn)
+            grids.addWidget(card)
+        lay.addLayout(grids)
+        lay.addStretch(1)
+
+        self._syncing = False
+
+    # -- editing ------------------------------------------------------------
+
+    def _canvas_changed(self, which: str):
+        if self._syncing:
+            return
+        st = self.curve_state[which]
+        if not st:
+            return
+        st["temps"] = list(self.canvases[which].temps)
+        st["speeds"] = list(self.canvases[which].speeds)
+        self._unsaved[which] = True
+        self._sync_spins(which)
+        self._update_actions(which)
+
+    def _spin_changed(self, which: str, kind: str):
+        if self._syncing:
+            return
+        st = self.curve_state[which]
+        if not st:
+            return
+        if kind == "t":
+            st["temps"] = [sp.value() for sp in self.spin_temps[which]]
+        else:
+            st["speeds"] = [sp.value() for sp in self.spin_speeds[which]]
+        self._unsaved[which] = True
+        self.canvases[which].set_curve(st["temps"], st["speeds"])
+        self._update_actions(which)
+
+    def _sync_spins(self, which: str):
+        st = self.curve_state[which]
+        if not st:
+            return
+        self._syncing = True
+        try:
+            for sp, v in zip(self.spin_temps[which], st["temps"]):
+                sp.blockSignals(True)
+                sp.setValue(v)
+                sp.blockSignals(False)
+            for sp, v in zip(self.spin_speeds[which], st["speeds"]):
+                sp.blockSignals(True)
+                sp.setValue(v)
+                sp.blockSignals(False)
+        finally:
+            self._syncing = False
+
+    @staticmethod
+    def _same_curve(a, b) -> bool:
+        return bool(a) and bool(b) and a.get("temps") == b.get("temps") \
+            and a.get("speeds") == b.get("speeds")
+
+    def _check_valid(self, which: str) -> bool:
+        st = self.curve_state[which] or {}
+        warn = getattr(self, f"warn_{which}")
+        try:
+            core.check_curve(st.get("temps"), st.get("speeds"))
+        except core.ValidationError as e:
+            # Visible as well as coloured: colour alone fails for a
+            # meaningful share of users, and an invisible warning is no
+            # warning at all.  Text colour is derived from the badge
+            # background rather than assumed white.
+            warn.setText(f"✗ {e} — Apply is disabled until this is fixed")
+            warn.setStyleSheet(notice_style(COL_CRIT, COL_CRIT))
+            warn.setVisible(True)
+            return False
+        warn.setText("")
+        warn.setVisible(False)
+        return True
+
+    def _update_actions(self, which: str):
+        """Apply is live only for a valid, changed, online curve."""
+        valid = self._check_valid(which)
+        dirty = self._unsaved[which]
+        online = bool(self.win.online)
+        btn = self.apply_btns[which]
+        btn.setEnabled(online and dirty and valid)
+        if not online:
+            btn.setToolTip("the daemon is offline, so nothing can be written")
+        elif not dirty:
+            btn.setToolTip("no changes — edit the curve or a spin box first")
+        elif not valid:
+            btn.setToolTip("the curve is not valid yet")
+        else:
+            btn.setToolTip("Write this curve into the embedded controller")
+        self.reset_btns[which].setEnabled(
+            self.canvases[which].ghost is not None)
+        self.pending_labels[which].setVisible(dirty)
+
+    def _apply(self, which: str):
+        st = self.curve_state[which]
+        if not st or not self._check_valid(which):
+            return
+        self.win.send({"cmd": "curve", "which": which,
+                       "temps": st["temps"], "speeds": st["speeds"]})
+
+    def _load_ghost(self, which: str):
+        g = self.canvases[which].ghost
+        if not g:
+            return
+        st = self.curve_state.setdefault(which, {})
+        st["temps"] = list(g["temps"])
+        st["speeds"] = list(g["speeds"])
+        self._unsaved[which] = True
+        self.canvases[which].set_curve(st["temps"], st["speeds"])
+        self._sync_spins(which)
+        self._update_actions(which)
+
+    # -- from the daemon ----------------------------------------------------
+
+    def refresh_factory(self):
+        """The daemon answered with the factory profile body: use its curves
+        as the ghost drawn under the editable ones."""
+        body = self.win.profile_cache.get("factory") or {}
+        ghost = body.get("curve") or {}
+        for which in ("cpu", "gpu"):
+            g = ghost.get(which)
+            if g:
+                self.canvases[which].ghost = g
+                self.canvases[which].update()
+
+    def refresh(self, st: dict):
+        cur = st.get("fan", {}).get("current")
+        for name, b in self.modes.items():
+            b.setEnabled(bool(self.win.online))
+            with QSignalBlockerSafe(b):
+                b.setChecked(name == cur)
+        self.mode_now.setText(f"current: {cur}" if cur else "")
+
+        factory = None
+        saved = (st.get("profiles") or {}).get("saved") or []
+        if "factory" in saved:
+            factory = self.win.profile_cache.get("factory")
+
+        curves = st.get("curve") or {}
+        for which in ("cpu", "gpu"):
+            live = st.get(which, {})
+            self.canvases[which].set_live(
+                (live.get("temp"), live.get("fan_pct")))
+            if self.canvases[which].ghost is None and factory:
+                g = (factory.get("curve") or {}).get(which)
+                if g:
+                    self.canvases[which].ghost = g
+                    self.canvases[which].update()
+            got = curves.get(which)
+            if got:
+                if self._unsaved[which]:
+                    # The editor holds a change the EC has not got yet.  We
+                    # may only clear the flag when the EC now *agrees* — that
+                    # is the read-back confirming the write.
+                    if self._same_curve(self.curve_state[which], got):
+                        self._unsaved[which] = False
+                elif not self._same_curve(self.curve_state[which], got):
+                    # No unsaved change: follow the EC (first load, a profile
+                    # apply, a re-apply, or another client moving it).
+                    self.curve_state[which] = {"temps": list(got["temps"]),
+                                               "speeds": list(got["speeds"])}
+                    self._sync_spins(which)
+                    self.canvases[which].set_curve(got["temps"], got["speeds"])
+            self._update_actions(which)
+
+
+class BatteryTab(QWidget):
+    """Charge limit.
+
+    The slider edits a *pending* value; nothing reaches the EC until
+    Apply is pressed.  That distinction is spelled out on screen rather
+    than implied, because the previous version wrote on slider release —
+    so a slow drag across the track silently reprogrammed the charger
+    several times on the way to wherever you were aiming.
+    """
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        self._applied: int | None = None      # what the EC actually holds
+        self._loaded = False                  # have we seen a status yet
+        lay = page_layout(self)
+
+        card = Card("Charge limit")
+        self.label = QLabel("—")
+        self.label.setFont(ui_font(TYPE_H1, bold=True))
+        self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(core.CHARGE_MIN, core.CHARGE_MAX)
+        self.slider.setSingleStep(1)
+        self.slider.setPageStep(10)
+        self.slider.setMinimumHeight(H_SLIDER)
+        self.slider.setAccessibleName("Charge limit percentage")
+        self.slider.setToolTip(
+            "Choose where charging stops.  Nothing is written until you "
+            "press Apply.")
+        self.slider.valueChanged.connect(self._pending_changed)
+
+        scale = QHBoxLayout()
+        for text, align in (("20%", Qt.AlignLeft), ("60%", Qt.AlignHCenter),
+                            ("100%", Qt.AlignRight)):
+            s = QLabel(text)
+            s.setFont(ui_font(TYPE_MICRO))
+            s.setStyleSheet(f"color:{muted_color(self)}")
+            s.setAlignment(align | Qt.AlignVCenter)
+            scale.addWidget(s, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        for pct in (60, 80, 100):
+            b = QPushButton(f"{pct}%")
+            b.setToolTip(f"Select {pct}% (still needs Apply)")
+            b.clicked.connect(lambda _=False, p=pct: self._preset(p))
+            row.addWidget(b)
+        row.addStretch(1)
+
+        # Apply is the whole point of this tab, so it is a real button with
+        # a real state: disabled when there is nothing to apply.
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.setProperty("primary", True)
+        self.apply_btn.setToolTip("Write the selected limit to the battery")
+        self.apply_btn.clicked.connect(self._apply)
+        self.revert_btn = QPushButton("Revert")
+        self.revert_btn.setToolTip("Discard the pending change")
+        self.revert_btn.clicked.connect(self._revert)
+        row.addWidget(self.revert_btn)
+        row.addWidget(self.apply_btn)
+
+        # "60% applied · 80% pending" — the difference between the slider
+        # and the hardware, stated rather than guessed.
+        self.pending_label = QLabel("")
+        self.pending_label.setWordWrap(True)
+        self.pending_label.setFont(ui_font(TYPE_BODY, bold=True))
+        self.pending_label.setVisible(False)
+
+        self.detail = QLabel("")
+        self.detail.setWordWrap(True)
+        self.detail.setFont(ui_font(TYPE_BODY))
+        self.detail.setStyleSheet(f"color:{muted_color(self)}")
+
+        card.box.addWidget(self.label)
+        card.box.addWidget(self.slider)
+        card.box.addLayout(scale)
+        card.box.addLayout(row)
+        card.box.addWidget(self.pending_label)
+        card.box.addWidget(self.detail)
+        card.box.addWidget(hint_label(
+            "Charging stops at the limit and resumes when the battery dips "
+            "about 10% below it — keeping a laptop at 60–80% is the single "
+            "biggest thing you can do for long-term battery health.  "
+            "Choose a value, then press Apply.", card))
+        lay.addWidget(card)
+
+        info = Card("Battery")
+        self.info = QLabel("—")
+        self.info.setWordWrap(True)
+        self.info.setFont(ui_font(TYPE_BODY))
+        info.box.addWidget(self.info)
+        lay.addWidget(info)
+        lay.addStretch(1)
+        self._sync_pending()
+
+    # -- pending vs applied -------------------------------------------------
+
+    def _dirty(self) -> bool:
+        """Is the slider showing something the EC is not holding?
+
+        An unreadable threshold (`_applied is None`) counts as *dirty*, not
+        as "nothing to do".  The driver returns -ENODATA when the charge byte
+        reads 0, which is this machine's genuine unset boot state — so the
+        old `is not None` guard left Apply permanently disabled on a fresh
+        boot, in precisely the situation where the limit most needs setting.
+        """
+        if not self._loaded:
+            return False
+        if self._applied is None:
+            return True
+        return self.slider.value() != self._applied
+
+    def _pending_changed(self, _value: int):
+        self._sync_pending()
+
+    def _sync_pending(self):
+        """Keep the Apply/Revert buttons and the status line honest."""
+        val = self.slider.value()
+        dirty = self._dirty()
+        online = bool(self.win.online)
+
+        self.apply_btn.setEnabled(online and dirty)
+        self.revert_btn.setEnabled(online and dirty)
+        self.slider.setEnabled(online)
+        # Name the concrete value in the button: "Apply 80%" tells you what
+        # will happen, "Apply" leaves you checking the slider first.  With
+        # nothing pending it reads as the disabled state it is.
+        self.apply_btn.setText(f"Apply {val}%" if dirty else "Apply")
+        # The buttons must not be the only thing telling you it is unsafe to
+        # press Apply — say why when they are off.
+        self.apply_btn.setToolTip(
+            f"Write {val}% to the battery charge threshold" if (online and dirty)
+            else "Nothing pending — move the slider first" if online else
+            "The daemon is not running, so nothing can be written")
+
+        if not self._loaded:
+            self.pending_label.setVisible(False)
+        elif self._applied is None:
+            self.pending_label.setText("The battery threshold is not readable")
+            self.pending_label.setStyleSheet(f"color:{COL_WARM}")
+            self.pending_label.setVisible(True)
+        elif dirty:
+            self.pending_label.setText(
+                f"{self._applied}% applied  ·  {val}% pending")
+            self.pending_label.setStyleSheet(f"color:{THEME['accent']}")
+            self.pending_label.setVisible(True)
+        else:
+            self.pending_label.setText(f"{val}% applied — no pending change")
+            self.pending_label.setStyleSheet(f"color:{muted_color(self)}")
+            self.pending_label.setVisible(True)
+
+    # -- actions -------------------------------------------------------------
+
+    def _apply(self):
+        value = self.slider.value()
+        # Send the tag so the reply handler can name the setting in the
+        # confirmation instead of printing a bare "applied".
+        self.win.send({"cmd": "set", "key": "charge_end", "value": value},
+                      tag="set:charge_end")
+
+    def _revert(self):
+        # Reset to whatever the EC is holding; if the threshold is not
+        # readable there is nothing to go back to, so fall back to the same
+        # value refresh() adopts rather than leaving a dead button.
+        target = self._applied if self._applied is not None else core.CHARGE_MAX
+        with QSignalBlockerSafe(self.slider):
+            self.slider.setValue(target)
+        self._sync_pending()
+
+    def _preset(self, pct: int):
+        """Select a preset — deliberately does NOT apply it."""
+        self.slider.setValue(pct)
+        self._sync_pending()
+
+    # -- from the daemon ----------------------------------------------------
+
+    def refresh(self, st: dict):
+        bat = st.get("battery") or {}
+        end = bat.get("charge_end")
+
+        # Decide whether to adopt BEFORE updating _applied: once we do,
+        # "the slider is behind the EC" is no longer observable.
+        had_pending = self._dirty()
+        slider_held = self.slider.isSliderDown()
+
+        self._applied = end
+        self._loaded = True
+
+        # Adopt the EC's value, unless the user is mid-drag or still has an
+        # unapplied choice on screen — yanking the slider out from under
+        # them is how a user ends up applying a value they did not pick.
+        if not slider_held and not had_pending:
+            with QSignalBlockerSafe(self.slider):
+                self.slider.setValue(end if end is not None
+                                     else core.CHARGE_MAX)
+
+        self.label.setText(f"stop charging at {end}%" if end is not None
+                           else "charge limit not readable")
+        start = bat.get("charge_start")
+        self.detail.setText(f"recharges from {start}%"
+                            if start is not None else "")
+        self.info.setText(self._battery_line(bat))
+        self._sync_pending()
+
+    @staticmethod
+    def _battery_line(bat: dict) -> str:
+        bits = []
+        if bat.get("pct") is not None:
+            bits.append(f"charge {bat['pct']}%")
+        if bat.get("status"):
+            bits.append(bat["status"])
+        if bat.get("energy_full") and bat.get("energy_full_design"):
+            wear = bat["energy_full"] / bat["energy_full_design"]
+            bits.append(f"health ≈ {wear:.0%} of design")
+        return " · ".join(bits) or "no battery data"
+
+
+class ProfilesTab(QWidget):
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(PAGE_PAD, PAGE_PAD_V, PAGE_PAD, PAGE_PAD_V)
+        lay.setSpacing(PAGE_GAP)
+
+        left = Card("Profiles")
+        self.listw = QListWidget()
+        self.listw.setMinimumHeight(240)
+        self.listw.itemDoubleClicked.connect(lambda _i: self._apply())
+        left.box.addWidget(self.listw, 1)
+        self.apply_btn = QPushButton("Apply selected")
+        self.apply_btn.setProperty("primary", True)
+        self.apply_btn.clicked.connect(self._apply)
+        left.box.addWidget(self.apply_btn)
+        left.box.addWidget(hint_label(
+            "Double-click a profile to apply it.  “factory” restores exactly "
+            "what this laptop shipped with.", left))
+        lay.addWidget(left, 1)
+
+        right = Card("Save / delete")
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("e.g. quiet-office")
+        self.name.returnPressed.connect(self._save)
+        right.box.addWidget(field_label("Name"))
+        right.box.addWidget(self.name)
+        b1 = QPushButton("Save current settings as…")
+        b1.setProperty("primary", True)
+        b1.clicked.connect(self._save)
+        b2 = QPushButton("Delete selected")
+        b2.setProperty("danger", True)
+        b2.clicked.connect(self._delete)
+        self.save_btn = b1
+        self.delete_btn = b2
+        # The buttons belong directly under the field they act on.  Without
+        # the stretch, the form row absorbs the card's extra height and the
+        # two buttons drift down into the middle of the card, leaving a void
+        # above them that reads as a layout bug.
+        right.box.addWidget(b1)
+        right.box.addWidget(b2)
+        right.box.addStretch(1)
+        right.box.addWidget(hint_label(
+            "A profile stores performance mode, fan mode, cooler boost and "
+            "both fan curves.  “factory” is captured from "
+            "the EC on first start — apply it to return to exactly what the "
+            "laptop shipped with.\n\n"
+            "Applying one does not touch your charge limit — that is a "
+            "battery choice, not a performance one.  Only the “battery” "
+            "profile sets it (to 60%).", right))
+        # Top-aligned so the card is only as tall as its contents: letting it
+        # stretch to match the (tall) profile list left a large void under the
+        # two buttons that reads as a broken layout.
+        lay.addWidget(right, 1, Qt.AlignTop)
+        self._names: list = []
+
+    def _selected(self) -> str | None:
+        item = self.listw.currentItem()
+        if item is None:
+            return None
+        name = item.data(Qt.ItemDataRole.UserRole)
+        return name if name in self._names else None
+
+    def _apply(self):
+        name = self._selected()
+        if not name:
+            self.win.flash("select a profile first", ok=False)
+            return
+        self.win.send({"cmd": "profile", "action": "apply", "name": name},
+                      tag="profile:apply")
+
+    def _save(self):
+        name = self.name.text().strip()
+        try:
+            core.check_profile_name(name)
+        except core.ValidationError as e:
+            self.win.flash(str(e), ok=False)
+            return
+        self.win.send({"cmd": "profile", "action": "save-current",
+                       "name": name}, tag="profile:save")
+
+    def _delete(self):
+        name = self._selected()
+        if not name:
+            self.win.flash("select a profile first", ok=False)
+            return
+        # Deleting is the one irreversible action in this tab, so it asks.
+        # Everything else here is a setting the EC can simply be told again.
+        if name == "factory":
+            self.win.flash("the factory profile cannot be deleted", ok=False)
+            return
+        answer = QMessageBox.question(
+            self, "Delete profile",
+            f"Delete the profile “{name}”?  This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.win.send({"cmd": "profile", "action": "delete", "name": name},
+                          tag="profile:delete")
+
+    def refresh(self, st: dict):
+        profs = st.get("profiles") or {}
+        builtin = profs.get("builtin") or []
+        saved = profs.get("saved") or []
+        self._names = builtin + saved
+
+        # Rebuild only when the set actually changed, so a 1.5 s poll does
+        # not reset the user's selection out from under them.
+        seen = [self.listw.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.listw.count())]
+        if seen != self._names:
+            keep = self._selected()
+            self.listw.clear()
+            for n in builtin:
+                it = QListWidgetItem(f"{n}  ·  built-in")
+                it.setData(Qt.ItemDataRole.UserRole, n)
+                it.setToolTip("shipped with the daemon — delete is refused")
+                self.listw.addItem(it)
+            for n in saved:
+                it = QListWidgetItem(f"{n}  ·  saved")
+                it.setData(Qt.ItemDataRole.UserRole, n)
+                it.setToolTip("saved on this machine")
+                self.listw.addItem(it)
+            if keep in self._names:
+                for i in range(self.listw.count()):
+                    if self.listw.item(i).data(Qt.ItemDataRole.UserRole) == keep:
+                        self.listw.setCurrentRow(i)
+                        break
+        self.apply_btn.setEnabled(bool(self.win.online))
+        # Save and delete are daemon writes too, so they follow the same rule
+        # the rest of the app uses: with the daemon down nothing is writable.
+        # Leaving them live only produced a "✗" on click, which reads as a
+        # bug rather than the offline state the banner already explains.
+        self.save_btn.setEnabled(bool(self.win.online))
+        self.delete_btn.setEnabled(bool(self.win.online))
+
+
+class SettingsTab(QWidget):
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        lay = page_layout(self)
+
+        card = Card("Daemon")
+        self._daemon_rows = {}
+        for key in ("Socket", "Driver", "State directory"):
+            row, v = kv_row(key, card, selectable=True)
+            card.box.addLayout(row)
+            self._daemon_rows[key] = v
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        self.reapply_btn = QPushButton("Re-apply state now")
+        self.reapply_btn.clicked.connect(self._reapply)
+        self.factory_btn = QPushButton("Capture factory profile")
+        self.factory_btn.clicked.connect(self._factory)
+        row.addWidget(self.reapply_btn)
+        row.addWidget(self.factory_btn)
+        row.addStretch(1)
+        card.box.addLayout(row)
+        card.box.addWidget(hint_label(
+            "“Re-apply” pushes your persisted settings back into the EC — "
+            "useful after a suspend, when firmware sometimes resets it.  "
+            "“Capture factory” snapshots the current EC state as the "
+            "“factory” profile, once.", card))
+        lay.addWidget(card)
+
+        cfg = Card("Config")
+        self.cfg_text = QPlainTextEdit()
+        self.cfg_text.setReadOnly(True)
+        self.cfg_text.setFont(mono_font(TYPE_BODY))
+        cfg.box.addWidget(self.cfg_text)
+        cfg.box.addWidget(hint_label(
+            f"{core.config_path()} — edit by hand, the daemon re-reads it at "
+            "start-up.", cfg))
+        lay.addWidget(cfg)
+
+        raw = Card("Raw EC console")
+        self.allow_raw = QLabel("")
+        self.allow_raw.setWordWrap(True)
+        self.allow_raw.setFont(ui_font(TYPE_BODY, bold=True))
+        raw.box.addWidget(self.allow_raw)
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        self.raw_addr = QLineEdit()
+        self.raw_addr.setPlaceholderText("0xf4")
+        self.raw_addr.setFixedWidth(92)
+        self.raw_addr.setAccessibleName("EC address")
+        self.raw_addr.setToolTip("EC address in hex, e.g. 0xf4")
+        self.raw_val = QLineEdit()
+        self.raw_val.setPlaceholderText("value (write)")
+        self.raw_val.setFixedWidth(120)
+        self.raw_val.setAccessibleName("EC value")
+        self.raw_val.setToolTip("Value to write, in hex (leave empty to read)")
+        self.raw_read = QPushButton("Read")
+        self.raw_read.setToolTip("Read the byte at the address above")
+        self.raw_read.clicked.connect(lambda: self._raw(None))
+        self.raw_write = QPushButton("Write")
+        self.raw_write.setToolTip("Write the value into the address above")
+        self.raw_write.clicked.connect(lambda: self._raw(True))
+        row.addWidget(self.raw_addr)
+        row.addWidget(self.raw_val)
+        row.addWidget(self.raw_read)
+        row.addWidget(self.raw_write)
+        row.addStretch(1)
+        raw.box.addLayout(row)
+        self.raw_out = QLabel("—")
+        self.raw_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.raw_out.setFont(mono_font(TYPE_BODY))
+        raw.box.addWidget(self.raw_out)
+        raw.box.addWidget(hint_label(
+            "Unvalidated EC access.  One wrong byte here can crash the "
+            "embedded controller and the machine with it — which is why it "
+            "is off unless AllowRaw is set in the config.", raw))
+        lay.addWidget(raw)
+        lay.addStretch(1)
+
+    def _reapply(self):
+        self.win.send({"cmd": "reapply"})
+
+    def _factory(self):
+        self.win.send({"cmd": "capture-factory"})
+
+    def _raw(self, write):
+        try:
+            addr = int(self.raw_addr.text(), 0)
+        except ValueError:
+            self.win.flash("address must be a number, e.g. 0xf4")
+            return
+        cmd = {"cmd": "raw", "addr": addr}
+        if write is not None:
+            try:
+                cmd["val"] = int(self.raw_val.text(), 0)
+            except ValueError:
+                self.win.flash("value must be a number, e.g. 0x0d")
+                return
+        self.win.send(cmd, tag="raw")
+
+    def refresh(self, st: dict):
+        drv = st.get("driver", {})
+        self._daemon_rows["Socket"].setText(core.sock_path())
+        self._daemon_rows["Driver"].setText(
+            (f"loaded · {drv.get('fw')}" if drv.get("present")
+             else "NOT LOADED")
+            + (" · debug interface on" if drv.get("debug") else ""))
+        self._daemon_rows["State directory"].setText(core.state_dir())
+        cfg = st.get("config") or {}
+        self.cfg_text.setPlainText(json.dumps(cfg, indent=2, sort_keys=True))
+        # Re-apply and capture-factory are daemon writes; disable them with
+        # the daemon, same as every other writer in the app.
+        online = bool(self.win.online)
+        self.reapply_btn.setEnabled(online)
+        self.factory_btn.setEnabled(online)
+        # Fit the box to the text so a read-only dump has no scrollbar, but
+        # cap it so a future key cannot push the raw console off the tab.
+        # Measured from the line count and the font, NOT from
+        # QTextDocument.size(): an unshown document reports its (lazy, wrong)
+        # layout size — 8 px for an eight-line dump — which is how the box
+        # ended up one line tall with a scrollbar behind it.
+        fm = self.cfg_text.fontMetrics()
+        lines = max(1, self.cfg_text.document().blockCount())
+        self.cfg_text.setFixedHeight(min(lines * fm.lineSpacing() + 26, 260))
+        if not cfg.get("AllowRaw"):
+            note, enabled = "raw access is disabled (AllowRaw: false)", False
+        elif not self.win.online:
+            note, enabled = "raw access allowed, but the daemon is offline", False
+        else:
+            note, enabled = "raw access is ENABLED — be careful", True
+        self.allow_raw.setText(note)
+        self.allow_raw.setStyleSheet(
+            f"color:{COL_WARM}" if enabled else f"color:{muted_color(self)}")
+        # The two raw fields directly — no findChildren walk over widgets
+        # we already hold by name.
+        for w in (self.raw_addr, self.raw_val,
+                  self.raw_read, self.raw_write):
+            w.setEnabled(enabled)
+
+
+# --------------------------------------------------------------------------
+# chrome — header, connection pill, offline banner, sidebar, nav stack
+# --------------------------------------------------------------------------
+
+class NavStack(QStackedWidget):
+    """A QStackedWidget that remembers tab labels.
+
+    The sections are driven from the sidebar now, but keeping the small
+    QTabWidget-shaped surface (addTab / count / currentIndex / tabText) means
+    the smoke test and the settings-persistence code did not have to care
+    which widget is actually doing the switching.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._labels: list = []
+
+    def addTab(self, widget: QWidget, label: str):
+        self._labels.append(label)
+        self.addWidget(widget)
+
+    def tabText(self, index: int) -> str:
+        return self._labels[index]
+
+
+class Header(QWidget):
+    """Brand, connection state, and the two global actions."""
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Header")
+        self.win = win
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(SPACE * 2, 14, SPACE * 2, 14)
+        lay.setSpacing(SPACE + 4)
+
+        mark = QLabel()
+        mark.setPixmap(brand_pixmap(36))
+        mark.setToolTip("GS66 Center")
+        titlebox = QVBoxLayout()
+        titlebox.setSpacing(1)
+        title = QLabel("GS66 Center")
+        title.setFont(ui_font(TYPE_H2, bold=True))
+        sub = QLabel("MSI GS66 Stealth 10SE · embedded-controller control")
+        sub.setFont(ui_font(TYPE_CAPTION))
+        sub.setStyleSheet(f"color:{muted_color(self)}")
+        titlebox.addWidget(title)
+        titlebox.addWidget(sub)
+        lay.addWidget(mark)
+        lay.addLayout(titlebox)
+        lay.addStretch(1)
+
+        # A compact status chip rather than a full-width banner: it is the
+        # loudest saturated colour on the screen, so it gets a small box and
+        # the truth ("daemon online/offline") in words.
+        self.pill = QLabel("")
+        self.pill.setFont(ui_font(TYPE_CAPTION, bold=True))
+        lay.addWidget(self.pill)
+
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setProperty("ghost", True)
+        self.refresh_btn.setIcon(QIcon(glyph_pixmap("refresh", ICON_SM,
+                                                    THEME["text_dim"])))
+        self.refresh_btn.setIconSize(QSize(ICON_SM, ICON_SM))
+        self.refresh_btn.setToolTip("Re-read every value from the daemon "
+                                    "(Ctrl+R)")
+        self.refresh_btn.clicked.connect(self.win.poll_status)
+        lay.addWidget(self.refresh_btn)
+
+        self.quit_btn = QPushButton("Quit")
+        self.quit_btn.setProperty("ghost", True)
+        self.quit_btn.setIcon(QIcon(glyph_pixmap("power", ICON_SM,
+                                                 THEME["text_dim"])))
+        self.quit_btn.setIconSize(QSize(ICON_SM, ICON_SM))
+        self.quit_btn.setToolTip("Quit GS66 Center (Ctrl+Q)")
+        self.quit_btn.clicked.connect(QApplication.quit)
+        lay.addWidget(self.quit_btn)
+
+        self.set_online(None)
+
+    def set_online(self, online):
+        if online is None:
+            label, colour = "connecting…", THEME["muted"]
+        elif online:
+            label, colour = "daemon online", COL_OK
+        else:
+            label, colour = "daemon offline", COL_CRIT
+        self.pill.setText(f"●  {label}")
+        self.pill.setStyleSheet(
+            f"color:{text_on(colour)};background:{colour};"
+            f"border-radius:{R_PILL}px;padding:4px 11px;")
+        self.pill.setToolTip(
+            "The gs66-centerd daemon is answering" if online else
+            "Waiting for the daemon's first reply" if online is None else
+            "The daemon is not reachable — the app is read-only")
+
+
+class Banner(QFrame):
+    """The read-only warning strip shown when the daemon is unreachable.
+
+    Uses the same critical red as the offline status chip: one condition,
+    one colour.  (It used to run amber here and red in the chip, so the two
+    disagreed about the same fact.)
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Banner")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(SPACE * 2, 10, SPACE * 2, 10)
+        lay.setSpacing(SPACE + 2)
+        icon = QLabel()
+        icon.setPixmap(glyph_pixmap("warn", ICON_SM, text_on(COL_CRIT)))
+        text = QLabel(
+            "The gs66-centerd daemon is not reachable — every reading below is "
+            "read-only and no setting can be written.  Start it with "
+            "<code>sudo systemctl start gs66-centerd</code>.")
+        text.setWordWrap(True)
+        text.setFont(ui_font(TYPE_BODY))
+        text.setStyleSheet(f"color:{text_on(COL_CRIT)}")
+        lay.addWidget(icon)
+        lay.addWidget(text, 1)
+        self.setStyleSheet(f"#Banner{{background:{COL_CRIT}}}")
+        self.setVisible(False)
+
+
+class Sidebar(QWidget):
+    """Icon + label navigation.  One entry per section."""
+
+    ITEMS = (("Dashboard", "dashboard"), ("Performance", "bolt"),
+             ("Fans", "fans"), ("Battery", "battery"),
+             ("Profiles", "profiles"), ("Settings", "settings"))
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Sidebar")
+        self.setFixedWidth(216)
+        self.win = win
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(SPACE + 4, SPACE * 2, SPACE + 4, SPACE * 2)
+        lay.setSpacing(3)
+        self.buttons = []
+        for i, (label, glyph) in enumerate(self.ITEMS):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setProperty("nav", True)
+            # 16 px, the same as every other icon in the app, and no taller
+            # than a line of text — an 18 px icon made a nav row taller than
+            # the buttons it sits level with.
+            b.setIconSize(QSize(ICON_SM, ICON_SM))
+            b.setIcon(nav_icon(glyph, ICON_SM))
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(f"{label}  (Ctrl+{i + 1})")
+            b.clicked.connect(lambda _=False, n=i: win.tabs.setCurrentIndex(n))
+            lay.addWidget(b)
+            self.buttons.append(b)
+        lay.addStretch(1)
+        hint = QLabel("Ctrl+1…6  sections\nCtrl+R  refresh\nCtrl+Q  quit")
+        hint.setFont(ui_font(TYPE_MICRO))
+        hint.setStyleSheet(f"color:{muted_color(self)}")
+        lay.addWidget(hint)
+
+    def sync(self, index: int):
+        for i, b in enumerate(self.buttons):
+            with QSignalBlockerSafe(b):
+                b.setChecked(i == index)
+
+
+# --------------------------------------------------------------------------
+# main window
+# --------------------------------------------------------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        apply_theme(QApplication.instance())
+
+        self.setWindowTitle("GS66 Center")
+        self.online = None                  # None = not yet heard from it
+        self.profile_cache: dict = {}
+        self._pending_status = False
+        self._conn_note = "connecting…"      # the status bar's permanent text
+
+        # Window size and the section you last looked at, remembered across
+        # launches.  For an app opened repeatedly to check one number, a
+        # window that forgets both every time is the most-returned-to
+        # annoyance there is.  Scoped to this app and written only on a
+        # real close, so a hide-to-tray never saves a hidden state.
+        self._qs = QSettings("gs66-center", "gs66-center")
+
+        self.client = Client(self)
+        self.client.reply.connect(self._on_reply)
+
+        self.dash = DashboardTab(self)
+        self.perf = PerformanceTab(self)
+        self.fans = FansTab(self)
+        self.batt = BatteryTab(self)
+        self.profs = ProfilesTab(self)
+        self.settings = SettingsTab(self)
+
+        self.tabs = NavStack()
+        for page, label in ((self.dash, "Dashboard"),
+                            (self.perf, "Performance"),
+                            (self.fans, "Fans"),
+                            (self.batt, "Battery"),
+                            (self.profs, "Profiles"),
+                            (self.settings, "Settings")):
+            self.tabs.addTab(scrolled(page), label)
+
+        self.header = Header(self)
+        self.banner = Banner(self)
+        self.sidebar = Sidebar(self)
+        self.tabs.currentChanged.connect(self.sidebar.sync)
+        self.sidebar.sync(0)
+
+        root = QWidget()
+        root.setObjectName("Root")
+        rl = QVBoxLayout(root)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
+        rl.addWidget(self.header)
+        rl.addWidget(self.banner)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self.sidebar)
+        body.addWidget(self.tabs, 1)
+        rl.addLayout(body, 1)
+        self.setCentralWidget(root)
+
+        # Restore after the tabs exist, so the saved index has somewhere to
+        # land.  A saved index that is out of range is ignored rather than
+        # clamped: a stale 6 in a 6-section stack is a guess, not a
+        # preference.
+        saved_tab = self._qs.value("tab", type=int)
+        if isinstance(saved_tab, int) and 0 <= saved_tab < self.tabs.count():
+            self.tabs.setCurrentIndex(saved_tab)
+        geo = self._qs.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(1180, 780)
+        self.setMinimumSize(940, 640)
+
+        sb = QStatusBar()
+        sb.setSizeGripEnabled(False)
+        # What we are talking to lives here permanently.  This used to be
+        # pushed as a *transient* message on every poll — and the poll is
+        # 1.5 s — so an action's confirmation ("shift → turbo") was wiped off
+        # the bar within a second and a half of appearing, and a slow reply
+        # never showed at all.
+        self.status_info = QLabel("connecting…")
+        self.status_info.setFont(ui_font(TYPE_CAPTION))
+        self.status_info.setStyleSheet(
+            f"color:{muted_color(self.status_info)};padding:0 {SPACE}px")
+        sb.addPermanentWidget(self.status_info)
+        self.setStatusBar(sb)
+        self.setWindowIcon(QIcon(brand_pixmap(64)))
+
+        self._install_shortcuts()
+
+        self.tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = QSystemTrayIcon(self)
+            self.tray.setIcon(QIcon(brand_pixmap(64)))
+            self.tray.setToolTip("GS66 Center")
+            self.tray.activated.connect(self._tray_activated)
+            # A context menu is not decoration here: closing the window
+            # only hides it (see closeEvent), so without this a user whose
+            # desktop does not surface the icon has no way back in *and* no
+            # way to quit.  Show and Quit are the two that matter.
+            menu = QMenu()
+            show_act = menu.addAction("Show window")
+            show_act.triggered.connect(self._show_window)
+            menu.addSeparator()
+            quit_act = menu.addAction("Quit")
+            quit_act.triggered.connect(QApplication.quit)
+            self.tray.setContextMenu(menu)
+            self.tray.show()
+            QApplication.setQuitOnLastWindowClosed(False)
+
+        self.poll = QTimer(self)
+        self.poll.timeout.connect(self.poll_status)
+        self.poll.start(POLL_MS)
+        self.poll_status()
+
+    def _install_shortcuts(self):
+        def cut(seq, slot):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.activated.connect(slot)
+            return sc
+        self._cuts = [cut("Ctrl+Q", self.close),
+                      cut("Ctrl+R", self.poll_status)]
+        for i in range(len(Sidebar.ITEMS)):
+            self._cuts.append(cut(
+                f"Ctrl+{i + 1}", lambda i=i: self.tabs.setCurrentIndex(i)))
+
+    # -- plumbing -----------------------------------------------------------
+
+    def send(self, cmd: dict, tag: str | None = None):
+        self.client.submit(cmd, tag)
+
+    def poll_status(self):
+        if self._pending_status:
+            return                      # never queue two polls
+        self._pending_status = True
+        self.client.submit({"cmd": "status"}, tag="status")
+
+    def flash(self, text: str, ok: bool = False):
+        """Report an outcome.  Status bar always; desktop notification only
+        for failures.
+
+        Notifying on every success is noise the user learns to ignore — and
+        a tray balloon for "shift eco" is not worth interrupting them for.
+        A failure, on the other hand, is exactly what a notification is for:
+        the window may well be hidden behind the game that just spiked the
+        fans.
+        """
+        self.statusBar().showMessage(text, 8000)
+        if not ok and self.tray:
+            self.tray.showMessage("GS66 Center — failed", text,
+                                  QSystemTrayIcon.Warning)
+
+    def set_key(self, key: str, value):
+        self.send({"cmd": "set", "key": key, "value": value})
+
+    def _sync_connection(self):
+        self.header.set_online(self.online)
+        self.banner.setVisible(self.online is False)
+        self.status_info.setText(self._conn_note)
+        self.status_info.setStyleSheet(
+            (f"color:{COL_CRIT}" if self.online is False
+             else f"color:{muted_color(self.status_info)}")
+            + f";padding:0 {SPACE}px")
+
+    def _on_reply(self, msg: dict):
+        tag, cmd = msg.get("tag"), msg.get("cmd", {})
+
+        if tag == "status":
+            self._pending_status = False
+            if "error" in msg:
+                # degraded: read what we can locally, say so, keep trying.
+                # The reason goes to the permanent readout rather than a
+                # transient message, so it is still visible ten seconds later
+                # — which is when you actually look for it.
+                self.online = False
+                st = core.local_status()
+                self._refresh(st,
+                              note=f"offline — read-only ({msg['error'][:60]})")
+                return
+            self.online = True
+            self._refresh(msg["data"])
+            return
+
+        if tag == "factory":
+            # read-only fetch of the factory profile body (see _refresh)
+            if "data" in msg:
+                self.profile_cache["factory"] = msg["data"]
+                self.fans.refresh_factory()
+            return
+
+        # anything else was an action.  The daemon reads every setting back
+        # before and after writing it, so its `summary` describes the
+        # hardware rather than our intention — use it verbatim.
+        data = msg.get("data") or {}
+        if "error" in msg:
+            self.flash(f"✗ {msg['error']}", ok=False)
+        elif cmd.get("cmd") == "raw":
+            self.settings.raw_out.setText(
+                f"0x{cmd['addr']:02x} = 0x{data.get('val', 0):02x} "
+                f"({data.get('val', 0)})")
+            self.flash(f"0x{cmd['addr']:02x} = 0x{data.get('val', 0):02x}",
+                       ok=True)
+        else:
+            self.flash(self._action_message(cmd, data, tag), ok=True)
+        self.poll_status()              # re-read so the UI shows EC truth
+
+    @staticmethod
+    def _action_message(cmd: dict, data: dict, tag) -> str:
+        """One honest sentence about what an action actually did.
+
+        The daemon reads every setting back before and after writing it, so
+        its `activity` describes the hardware, not our intention.  It is
+        phrased as what the person just did ("Set charge limit to 80%",
+        "Enabled cooler boost"), which is what a status bar or a tray
+        balloon should say — the `a -> b` diff form stays available for
+        --json consumers but is the wrong shape for a notification.
+        """
+        activity = data.get("activity")
+        if activity:
+            return activity
+        summary = data.get("summary")
+        if summary:
+            return summary
+        kind, action = cmd.get("cmd"), cmd.get("action")
+        if kind == "set":
+            return core.describe_activity(cmd.get("key"),
+                                          data.get("was"), data.get("now"))
+        if kind == "curve":
+            return f"{cmd.get('which', 'fan')} curve written"
+        if kind == "profile":
+            name = cmd.get("name") or "profile"
+            what = {"apply": "Applied", "save-current": "Saved",
+                    "save": "Saved", "delete": "Deleted"}.get(
+                        action, action or "")
+            msg = f"{what} profile {name}"
+            # A profile apply that changed nothing must not read as if the
+            # hardware moved — the daemon tells us via `changes`.
+            if action == "apply" and data.get("changes") is not None \
+                    and not data["changes"]:
+                msg += " — nothing to change"
+            return msg
+        if kind == "reapply":
+            return "Re-applied settings"
+        if kind == "capture-factory":
+            return "Captured factory profile"
+        # `tag` is optional and can be None; never call .replace on it.
+        return (tag or "done").replace(":", " ") or "done"
+
+    def _refresh(self, st: dict, note: str | None = None):
+        # The status bar's permanent readout is a property of the state we
+        # were just handed, so it is derived here rather than remembered from
+        # whichever reply happened to arrive first.  `note` overrides it for
+        # the one case the state cannot describe: a daemon that did not
+        # answer and the reason why.
+        self._conn_note = note or self._conn_note_of(st)
+        # Cache the factory profile body once, so the fans tab can draw it as
+        # a ghost under the editable curve.  "show" is read-only — never
+        # "apply", which would push settings into the EC as a side effect.
+        profs = st.get("profiles") or {}
+        if "factory" in (profs.get("saved") or []) \
+                and "factory" not in self.profile_cache:
+            self.client.submit({"cmd": "profile", "action": "show",
+                                "name": "factory"}, tag="factory")
+        self.dash.refresh(st)
+        self.perf.refresh(st)
+        self.fans.refresh(st)
+        self.batt.refresh(st)
+        self.profs.refresh(st)
+        self.settings.refresh(st)
+        self._sync_connection()
+        if self.tray:
+            t = (st.get("cpu", {}).get("temp"), st.get("gpu", {}).get("temp"))
+            worst = max([x for x in t if x is not None], default=None)
+            # Brand mark until there is a reading to show, then the same mark
+            # tinted by the hottest sensor with the number on it.
+            self.tray.setIcon(QIcon(brand_pixmap(64) if worst is None
+                                    else temp_pixmap(64, worst, str(worst))))
+            self.tray.setToolTip(
+                f"GS66 · CPU {t[0] if t[0] is not None else '?'}°C · "
+                f"GPU {t[1] if t[1] is not None else '?'}°C")
+
+    @staticmethod
+    def _conn_note_of(st: dict) -> str:
+        """One line naming what we are talking to — the status bar's right
+        hand side, where it stays instead of being overwritten every poll."""
+        drv = st.get("driver") or {}
+        return " · ".join(x for x in (
+            "gs66-centerd",
+            f"fw {drv['fw']}" if drv.get("fw") else "",
+            "driver not loaded" if drv.get("present") is False else "",
+            "partial" if st.get("partial") else "",
+        ) if x)
+
+    def _show_window(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            if self.isVisible():
+                self.hide()
+            else:
+                self._show_window()
+
+    def closeEvent(self, ev):
+        if self.tray and self.tray.isVisible():
+            self.hide()
+            ev.ignore()
+            return
+        # A real quit: remember where the window was and which section was
+        # open.  Deliberately not done on the hide path above — saving there
+        # would persist a hidden window and a section the user never chose
+        # to leave.
+        self._qs.setValue("geometry", self.saveGeometry())
+        self._qs.setValue("tab", self.tabs.currentIndex())
+        self._qs.sync()
+        super().closeEvent(ev)
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("gs66-center")
+    apply_theme(app)
+    win = MainWindow()
+    win.show()
+
+    # Clean Ctrl-C exit: a plain default handler would raise inside the Qt
+    # event loop, so ask the window to close and quit the loop instead.
+    def _on_sigint(*_a):
+        app.quit()
+
+    signal.signal(signal.SIGINT, _on_sigint)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
