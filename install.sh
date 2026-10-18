@@ -67,6 +67,46 @@ fi
 
 [ -d "$DRIVER_SRC" ] || die "vendored driver source missing: $DRIVER_SRC"
 
+# ------------------------------------------------------ retire old install --
+# This program was formerly "GS66 Center".  Its daemon (gs66-centerd) has its
+# own socket and unit and may still be running; it writes the same EC through
+# the same kernel driver.  Two daemons owning the EC is exactly what this
+# program's one-writer rule forbids — so retire the old install first: stop
+# it, remove its units/files, and carry the user's saved profiles and config
+# across so nothing they chose is lost.  Without this an upgrade leaves a
+# second writer fighting the new daemon for the embedded controller.
+if [ -e /etc/systemd/system/gs66-centerd.service ] \
+   || [ -e /usr/local/bin/gs66-center ]; then
+    log "retiring the previous GS66 Center install"
+    systemctl disable --now gs66-centerd.service 2>/dev/null || true
+    rm -f /etc/systemd/system/gs66-centerd.service \
+          /usr/lib/systemd/system-sleep/gs66-center
+    systemctl daemon-reload
+    rm -f /usr/local/bin/gs66-center /usr/local/bin/gs66-gui
+    rm -rf /usr/local/lib/gs66-center /usr/local/share/doc/gs66-center
+    rm -f /usr/share/applications/gs66-center.desktop \
+          /usr/share/icons/hicolor/scalable/apps/gs66-center.svg
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+
+    # Carry the user's choices over, never clobbering anything already here.
+    install -d /etc/msi-control /var/lib/msi-control/profiles
+    if [ -f /etc/gs66-center/config.json ] \
+       && [ ! -f /etc/msi-control/config.json ]; then
+        install -m 644 /etc/gs66-center/config.json \
+            /etc/msi-control/config.json
+        log "  kept your config (from /etc/gs66-center/config.json)"
+    fi
+    if [ -f /var/lib/gs66-center/last.json ] \
+       && [ ! -f /var/lib/msi-control/last.json ]; then
+        cp -a /var/lib/gs66-center/last.json /var/lib/msi-control/last.json
+    fi
+    if [ -d /var/lib/gs66-center/profiles ]; then
+        cp -an /var/lib/gs66-center/profiles/. \
+            /var/lib/msi-control/profiles/ 2>/dev/null || true
+    fi
+    log "  your saved profiles were kept (/var/lib/msi-control/profiles)"
+fi
+
 # ------------------------------------------------------------- packages ----
 if ! command -v dkms >/dev/null; then
     log "installing dkms"

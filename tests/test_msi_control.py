@@ -574,6 +574,16 @@ class TestCurves(DaemonTest):
                        "speeds": [0, 30, 50, 60, 80, 90, 100]})
         self.assertIn("strictly increase", str(ctx.exception))
 
+    def test_set_curve_refuses_an_unknown_fan(self):
+        # Defence in depth: `handle` validates `which` by reading the curve
+        # first, but set_curve is also reached from profile application, so
+        # it must never index CURVE_REGS with a name it has not checked.
+        with self.assertRaises(core.ValidationError) as ctx:
+            self.service.ec.set_curve("bogus",
+                                      [50, 55, 60, 70, 80, 90],
+                                      [0, 30, 50, 60, 80, 90, 100])
+        self.assertIn("invalid fan curve", str(ctx.exception))
+
     def test_ec_byte_that_ignores_us_is_caught(self):
         # Make one register read-only: verify-by-readback must complain.
         self.ec.readonly.add(0x73)
@@ -707,19 +717,28 @@ class TestProfiles(DaemonTest):
                        "name": "../../etc/passwd"})
 
     def test_factory_profile_captured_once(self):
-        self.service.capture_factory()
+        # The return value is the point: a button that says "Captured" the
+        # second time, when nothing happened, is a small lie.
+        self.assertEqual(self.service.capture_factory(), "captured")
         first = None
         with open(os.path.join(self.state, "profiles", "factory.json"),
                   encoding="utf-8") as fh:
             first = fh.read()
-        # mutate the EC, capture again — the original must be preserved
+        # mutate the EC, capture again — the original must be preserved,
+        # and the daemon must report that it did nothing.
         self.ec.mem[0x72] = 99
-        self.service.capture_factory()
+        self.assertEqual(self.service.capture_factory(), "exists")
         with open(os.path.join(self.state, "profiles", "factory.json"),
                   encoding="utf-8") as fh:
             self.assertEqual(fh.read(), first)
         self.assertIn("factory",
                       self.call({"cmd": "profile", "action": "list"})["saved"])
+
+    def test_capture_factory_reports_through_the_protocol(self):
+        self.assertEqual(self.call({"cmd": "capture-factory"})["result"],
+                         "captured")
+        self.assertEqual(self.call({"cmd": "capture-factory"})["result"],
+                         "exists")
 
 
 class TestRestore(DaemonTest):
@@ -774,6 +793,10 @@ class TestRawGate(DaemonTest):
 # --------------------------------------------------------------------------
 
 class TestCli(DaemonTest):
+    def test_version_flag_is_a_version(self):
+        proc = self.run_cli("--version")
+        self.assertIn(core.VERSION, proc.stdout)
+
     def test_status_json(self):
         proc = self.run_cli("status", "--json")
         st = json.loads(proc.stdout)
@@ -1616,6 +1639,17 @@ class TestUnsupportedModelGating(unittest.TestCase):
         text = str(ctx.exception)
         self.assertIn("detect", text)
         self.assertIn("models/README.md", text)
+
+    def test_capture_factory_says_unsupported_instead_of_lying(self):
+        # Nothing to capture without curve registers, and the daemon must
+        # say so rather than report a capture that cannot have happened.
+        # A bare namespace is enough: the guard returns before it touches
+        # self.profiles.
+        import types
+        from msi_controld import Service
+        svc = types.SimpleNamespace()
+        svc.capture_factory = Service.capture_factory.__get__(svc)
+        self.assertEqual(svc.capture_factory(), "unsupported")
 
 
 if __name__ == "__main__":

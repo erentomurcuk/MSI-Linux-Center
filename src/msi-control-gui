@@ -2492,7 +2492,7 @@ class SettingsTab(QWidget):
         card = Card("Daemon")
         self._daemon_rows = {}
         for key in ("Model", "Model file", "Socket", "Driver",
-                    "State directory"):
+                    "State directory", "Version"):
             row, v = kv_row(key, card, selectable=True)
             card.box.addLayout(row)
             self._daemon_rows[key] = v
@@ -2608,6 +2608,9 @@ class SettingsTab(QWidget):
              else "NOT LOADED")
             + (" · debug interface on" if drv.get("debug") else ""))
         self._daemon_rows["State directory"].setText(core.state_dir())
+        self._daemon_rows["Version"].setText(
+            f"MSI Linux Control {core.VERSION}  ·  model schema "
+            f"{core.MODEL_SCHEMA}")
         cfg = st.get("config") or {}
         self.cfg_text.setPlainText(json.dumps(cfg, indent=2, sort_keys=True))
         # Re-apply and capture-factory are daemon writes; disable them with
@@ -2725,7 +2728,10 @@ class Header(QWidget):
                                                  THEME["text_dim"])))
         self.quit_btn.setIconSize(QSize(ICON_SM, ICON_SM))
         self.quit_btn.setToolTip("Quit MSI Linux Control (Ctrl+Q)")
-        self.quit_btn.clicked.connect(QApplication.quit)
+        # Quit for real, and save the window state on the way out — plain
+        # QApplication.quit() exits the loop without a closeEvent, so it
+        # would drop the geometry/tab this app deliberately remembers.
+        self.quit_btn.clicked.connect(self.win.quit_app)
         lay.addWidget(self.quit_btn)
 
         self.set_online(None)
@@ -2977,7 +2983,7 @@ class MainWindow(QMainWindow):
             sc = QShortcut(QKeySequence(seq), self)
             sc.activated.connect(slot)
             return sc
-        self._cuts = [cut("Ctrl+Q", self.close),
+        self._cuts = [cut("Ctrl+Q", self.quit_app),
                       cut("Ctrl+R", self.poll_status)]
         for i in range(len(Sidebar.ITEMS)):
             self._cuts.append(cut(
@@ -3060,7 +3066,12 @@ class MainWindow(QMainWindow):
             self.flash(f"0x{cmd['addr']:02x} = 0x{data.get('val', 0):02x}",
                        ok=True)
         else:
-            self.flash(self._action_message(cmd, data, tag), ok=True)
+            msg = self._action_message(cmd, data, tag)
+            # A capture that did not actually capture (already saved, or it
+            # failed) is worth a tray balloon: the window may be hidden.
+            bad = cmd.get("cmd") == "capture-factory" \
+                and data.get("result") in ("failed", "unsupported")
+            self.flash(msg, ok=not bad)
         self.poll_status()              # re-read so the UI shows EC truth
 
     @staticmethod
@@ -3101,7 +3112,15 @@ class MainWindow(QMainWindow):
         if kind == "reapply":
             return "Re-applied settings"
         if kind == "capture-factory":
-            return "Captured factory profile"
+            # The daemon says what really happened; a second capture does
+            # nothing, and claiming it captured again would be a lie.
+            return {
+                "captured": "Captured factory profile",
+                "exists": "Factory profile already captured — nothing changed",
+                "unsupported": "This laptop has no fan-curve registers to "
+                               "capture",
+                "failed": "Could not capture the factory profile",
+            }.get(data.get("result"), "Factory profile")
         # `tag` is optional and can be None; never call .replace on it.
         return (tag or "done").replace(":", " ") or "done"
 
@@ -3155,6 +3174,26 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _save_window_state(self):
+        """Remember where the window was and which section was open."""
+        self._qs.setValue("geometry", self.saveGeometry())
+        self._qs.setValue("tab", self.tabs.currentIndex())
+        self._qs.sync()
+
+    def quit_app(self):
+        """Quit for real — Ctrl+Q and the header's Quit both come here.
+
+        `close()` alone would only *hide* the window while a system tray is
+        available (see closeEvent), which is right for the window's X button
+        but wrong for a control labelled "Quit".  Saving here as well,
+        because QApplication.quit() leaves the event loop without ever
+        delivering a closeEvent — so without this the geometry and the open
+        section would be forgotten by exactly the button that promises to
+        leave.
+        """
+        self._save_window_state()
+        QApplication.quit()
+
     def _tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
             if self.isVisible():
@@ -3171,9 +3210,7 @@ class MainWindow(QMainWindow):
         # open.  Deliberately not done on the hide path above — saving there
         # would persist a hidden window and a section the user never chose
         # to leave.
-        self._qs.setValue("geometry", self.saveGeometry())
-        self._qs.setValue("tab", self.tabs.currentIndex())
-        self._qs.sync()
+        self._save_window_state()
         super().closeEvent(ev)
 
 

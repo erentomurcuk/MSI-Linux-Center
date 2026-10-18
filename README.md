@@ -158,6 +158,12 @@ default `/etc/msi-control/config.json` (only if none exists), enables the
 `msi-controld` systemd service, and installs a resume hook so settings
 survive suspend.
 
+Upgrading from the old **GS66 Center** is handled in the same run: if a
+`gs66-centerd` install is found, `install.sh` stops and disables its service,
+removes its unit, binaries, desktop entry and sleep hook, and copies your
+config and saved profiles into the new locations first — so two daemons can
+never end up owning the same embedded controller.
+
 `uninstall.sh` reverses all of it; `--purge` also removes your profiles and
 config.
 
@@ -397,7 +403,7 @@ src/msi-control        CLI (status · detect · monitor · mode · fan · boost 
 src/msi-control-gui           PySide6 GUI
 models/<id>/model.json one laptop model — the per-model EC map + features
 models/README.md       the model-file format, field by field
-tests/test_msi_control.py     138 offline tests — fake sysfs + RAM-backed EC
+tests/test_msi_control.py     142 offline tests — fake sysfs + RAM-backed EC
 tests/gui_smoke.py     headless GUI construction + behaviour + screenshots
 tests/shots/           committed screenshots — dark, and light/ beside it
 tools/                 hardware probes (need root) + fixup/recapture helpers
@@ -414,7 +420,7 @@ README.md CONTRIBUTING.md AGENTS.md CHANGELOG.md TODO.md APP_DETAILS.md
 ### Tests
 
 ```bash
-python3 tests/test_msi_control.py                     # 138 tests, no root, no hardware
+python3 tests/test_msi_control.py                     # 142 tests, no root, no hardware
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py   # needs PySide6
 
 make check                                     # both of the above + a syntax check

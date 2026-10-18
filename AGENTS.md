@@ -82,7 +82,7 @@ src/msi-control-gui     PySide6 GUI, six sections
 models/<id>/model.json  one laptop model — THE file you add for a new laptop
 models/README.md        the model-file format, field by field
 models/<id>/README.md   optional: notes on how that model's registers were found
-tests/test_msi_control.py  offline suite — fake sysfs + RAM-backed EC, 138 tests
+tests/test_msi_control.py  offline suite — fake sysfs + RAM-backed EC, 142 tests
 tests/gui_smoke.py         headless GUI build + behaviour + screenshots
 tests/shots/               committed screenshots — dark, light/ beside it
 tools/                  hardware probes (need root) + fixup/recapture helpers
@@ -104,7 +104,7 @@ DKMS build needs no network. Its device strings, identifiers and file names are
 There is no build step. To run a test you need nothing but Python 3.10+:
 
 ```bash
-python3 tests/test_msi_control.py                       # 138 tests, no root, ~6 s
+python3 tests/test_msi_control.py                       # 142 tests, no root, ~6 s
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py    # GUI, needs PySide6
 make check        # compile + the offline suite + the GUI smoke test
 make shots        # regenerate tests/shots/          (dark)

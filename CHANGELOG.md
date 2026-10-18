@@ -14,6 +14,51 @@ it was made; the runbook convention is documented in `CONTRIBUTING.md`.
 
 ---
 
+## 2026-10-18 — review pass: install safety, honest messages, version
+
+A full read-through of the daemon, CLI, GUI and install path after the rename.
+Four real defects found and fixed, one of which could have cost a machine; the
+test suite grew from 138 to 142.
+
+### Fixed
+- **`install.sh` could leave two daemons owning the EC.** An earlier **GS66
+  Center** install (`gs66-centerd`, its own socket and unit) is not removed by a
+  plain reinstall, so both daemons would have written the same embedded
+  controller through the same kernel driver — the one thing this program's
+  one-writer rule forbids. `install.sh` now stops and disables `gs66-centerd`,
+  removes its unit, binaries, desktop entry, icon, doc and sleep hook, and
+  **copies the existing config and saved profiles** into `/etc/msi-control` and
+  `/var/lib/msi-control` first (never overwriting anything already there).
+- **Ctrl+Q did not quit.** With a system tray available, `Ctrl+Q` and the
+  window's X only *hide* the window (correct for the X); the shortcut and the
+  header's Quit button are now wired to a real `quit_app()` that saves the
+  window geometry and open section on the way out. The Quit button previously
+  called `QApplication.quit()` directly, which leaves the event loop without a
+  `closeEvent` — so it silently forgot both.
+- **`msi-control curve` blamed the daemon for a missing model.** On a laptop
+  with no curve registers it said "is msi-controld running with debug=1?"; it
+  now says the model has no fan-curve registers and points at `detect` and
+  `CONTRIBUTING.md`.
+- **"Capture factory profile" claimed a capture that did not happen.** The
+  daemon now returns `captured` / `exists` / `unsupported` / `failed` and the
+  GUI reports which; a second capture reads *"Factory profile already captured
+  — nothing changed"* instead of *"Captured factory profile"*.
+- `MsiEc.set_curve` validates the fan name before indexing the register table
+  (defence in depth; the request path already checked it).
+
+### Added
+- **Version.** `VERSION` in `msi_control.py`, printed by `msi-control
+  --version` and shown in Settings (`MSI Linux Control 1.0.0 · model schema 1`),
+  so a build can be named in a bug report.
+
+### Tests
+- 138 → **142**: `set_curve` rejects an unknown fan, `capture_factory` returns
+  `captured` then `exists`, the capture result travels the protocol, the
+  unsupported model reports `unsupported`, and `--version` prints a version.
+  `gui_smoke.py` pins all four capture-factory messages.
+
+---
+
 ## 2026-10-18 — renamed to MSI Linux Control, and made model-driven
 
 The app is no longer "GS66 Center". It is **MSI Linux Control**, it works on

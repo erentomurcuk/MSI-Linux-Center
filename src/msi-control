@@ -346,6 +346,13 @@ def cmd_curve(args):
         st = status(args)
         curve = st.get("curve")
         if not curve:
+            # Two very different reasons produce an absent curve, and the old
+            # single message sent both to the daemon.  A model with no curve
+            # registers will *never* show one, so say that instead.
+            if not core.feature("fan_curve"):
+                die("this laptop has no model definition for fan curves — "
+                    "run `msi-control detect`, then see CONTRIBUTING.md -> "
+                    "\"Adding your model\"")
             die("fan curve unavailable — is msi-controld running with debug=1?")
         if args.json:
             print(json.dumps(curve, indent=2))
@@ -577,6 +584,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="msi-control", description="MSI Linux Control (CLI)",
         parents=[common])
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {core.VERSION}")
     # Do NOT set_defaults() the three shared flags here.  set_defaults()
     # mutates the *action object's* .default, and these actions are shared
     # with every subparser through parents=[common] — so `json=False` was

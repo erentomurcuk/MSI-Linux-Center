@@ -812,6 +812,17 @@ def check_action_messages(win) -> None:
     assert describe({"cmd": "mystery"}, {}, None) == "done"
     assert describe({"cmd": "mystery"}, {}, "profile:save") == "profile save"
 
+    # A factory capture must report what really happened: the second one
+    # does nothing, and "Captured factory profile" would be a lie about it.
+    assert describe({"cmd": "capture-factory"}, {"result": "captured"},
+                    None) == "Captured factory profile"
+    assert "already" in describe({"cmd": "capture-factory"},
+                                 {"result": "exists"}, None)
+    assert "no fan-curve" in describe({"cmd": "capture-factory"},
+                                      {"result": "unsupported"}, None)
+    assert "Could not" in describe({"cmd": "capture-factory"},
+                                   {"result": "failed"}, None)
+
 
 def check_offline_disables_writes(win) -> None:
     """Every daemon-writing control must go dead when the daemon is down.

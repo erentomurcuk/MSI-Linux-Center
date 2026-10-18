@@ -236,6 +236,7 @@ class MsiEc:
         return {"temps": temps, "speeds": speeds}
 
     def set_curve(self, which: str, temps, speeds) -> dict:
+        core.check_choice(which, ("cpu", "gpu"), "fan curve")
         if not core.feature("fan_curve"):
             raise NotSupported.feature("fan_curve")
         temps, speeds = core.check_curve(temps, speeds)
@@ -888,21 +889,29 @@ class Service:
         except (ValidationError, BackendError) as e:
             log.warning("restore failed: %s", e)
 
-    def capture_factory(self) -> None:
-        """Save the untouched firmware curve once, so it can always come back."""
+    def capture_factory(self) -> str:
+        """Save the untouched firmware curve once, so it can always come back.
+
+        Returns what actually happened — "captured", "exists" (one was
+        already saved, nothing was overwritten) or "unsupported" — because a
+        button that says "Captured factory profile" when it silently did
+        nothing is a small lie, and this one is easy to hit twice.
+        """
         if not core.feature("fan_curve"):
             # Nothing to capture: this model has no curve registers defined.
-            return
+            return "unsupported"
         if os.path.exists(self.profiles._path("factory")):
-            return
+            return "exists"
         try:
             data = {"curve": {w: self.ec.curve(w) for w in ("cpu", "gpu")}}
             data["fan"] = self.ec.read_opt("fan_mode")
             data["shift"] = self.ec.read_opt("shift_mode")
             self.profiles.save("factory", data)
             log.info("captured factory profile from EC")
+            return "captured"
         except Exception as e:                       # noqa: BLE001
             log.warning("could not capture factory profile: %s", e)
+            return "failed"
 
     def reapply(self) -> tuple:
         """After resume: put the persisted state back.  Returns (warnings,
@@ -1001,8 +1010,8 @@ class Service:
                 return {"saved": core.check_profile_name(name_)}
             raise ValidationError(f"unknown profile action {action!r}")
         if name == "capture-factory":
-            self.capture_factory()
-            return {"captured": "factory"}
+            result = self.capture_factory()
+            return {"captured": "factory", "result": result}
         if name == "graphics":
             action = cmd.get("action", "show")
             if action == "show":

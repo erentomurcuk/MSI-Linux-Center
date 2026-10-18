@@ -8,5 +8,5 @@ Exec=msi-control-gui
 Icon=msi-control
 Terminal=false
 Categories=Settings;System;HardwareSettings;
-Keywords=MSI;GS66;Stealth;laptop;fan;battery;EC;performance;curve;Linux;
+Keywords=MSI;laptop;notebook;fan;curve;battery;charge;EC;performance;shift;Linux;
 StartupNotify=true

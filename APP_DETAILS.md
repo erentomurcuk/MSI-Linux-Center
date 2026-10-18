@@ -111,6 +111,9 @@ Key behaviours:
 * `msi-control detect` (no root, works with the daemon down) prints the report a
   contributor pastes into a PR; `--json` machine output; `--write DIR` a valid
   draft; `--ec-dump` the 256-register map.
+* **`VERSION`** (near the top of `msi_control.py`) is the one version number —
+  the CLI's `--version` and the Settings card both read it, so a build can be
+  named in a bug report.
 
 The MUX addresses are **not** per-model — the whole MSI family shares one block
 (§3), so a model only sets `"mux": true`.
@@ -486,7 +489,7 @@ both had a live-write bug:
 
 ## 9. Tests
 
-**`tests/test_msi_control.py` — 138 tests, offline, unprivileged, ~6 s.**
+**`tests/test_msi_control.py` — 142 tests, offline, unprivileged, ~6 s.**
 
 Runs the *real* daemon (Service + Unix socket server + protocol), the real
 validation and the real CLI as a subprocess, against a fake sysfs tree and a
@@ -599,7 +602,8 @@ MSI-Linux-Control/
 │                   installed icon and mirrored by brand_pixmap()/MARK_BOX
 ├── etc/            config.json (the default install.sh copies in)
 ├── third_party/    msi-ec/   vendored teackot driver v0.13
-├── install.sh      privileged install (DKMS + deploy + services + models/)
+├── install.sh      privileged install (DKMS + deploy + services + models/);
+│                   retires an old gs66-center install and keeps its profiles
 ├── uninstall.sh    clean removal
 ├── verify.sh       live hardware verification — every shift/fan/charge
 │                   mode, cooler boost, fan-curve write-back round-trip

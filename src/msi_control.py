@@ -29,6 +29,17 @@ import re
 import socket
 
 # --------------------------------------------------------------------------
+# Version
+#
+# One number, in the shared core, so the CLI, the daemon, the GUI and a bug
+# report can never disagree about which build is running.  Follows the
+# usual `MAJOR.MINOR.PATCH` shape; bump PATCH for a fix, MINOR for a feature,
+# MAJOR for a change that breaks an installed config or protocol.
+# --------------------------------------------------------------------------
+
+VERSION = "1.0.0"
+
+# --------------------------------------------------------------------------
 # Paths — every one overridable through the environment so the whole stack
 # can be exercised against a fake sysfs tree without root (see tests/).
 # --------------------------------------------------------------------------

@@ -127,6 +127,56 @@ scan_ec only toggles the Cooler Boost bit).
 
 ---
 
+## Done in the 2026-10-18 review pass
+
+A full read-through of `msi_control.py`, `msi_controld.py`, `msi-control` and
+`msi-control-gui` after the rename, then the install path. 142 offline tests +
+the GUI smoke suite green. No live install was performed from the agent session
+(it needs root); the findings are fixed and the deploy command is in
+*Housekeeping*.
+
+### [x] One daemon per EC — the upgrade path could have broken this
+- The real find. `install.sh` did not know about the old **GS66 Center** install:
+  an already-running `gs66-centerd` and the new `msi-controld` would both hold
+  the embedded controller open through the same driver. Two writers is exactly
+  what the whole design forbids, and it is invisible until something misbehaves.
+- `install.sh` now detects `gs66-centerd.service` (or the old binary), stops and
+  disables it, removes its unit, binaries, desktop entry, icon, doc dir and
+  sleep hook, then **copies `/etc/gs66-center/config.json` and
+  `/var/lib/gs66-center/{last.json,profiles/}`** into the new locations before
+  anything is overwritten — so the person's charge limit, saved profiles and
+  captured factory curve survive the rename.
+
+### [x] Ctrl+Q hid the window instead of quitting
+- While a system tray is available, `closeEvent` hides the window — right for
+  the X button, wrong for a control labelled **Quit**. `Ctrl+Q` and the header
+  Quit now call a real `quit_app()`.
+- The header's Quit called `QApplication.quit()` directly, which skips
+  `closeEvent` entirely, so it also forgot the window geometry and open section
+  the app deliberately persists. `quit_app()` and `closeEvent` share one
+  `_save_window_state()`.
+
+### [x] Two messages that were not true
+- `msi-control curve` on a model with no curve registers told the user to check
+  whether the daemon was running with `debug=1`. It now names the real cause and
+  points at `detect` / `CONTRIBUTING.md`.
+- **Capture factory profile** said *"Captured factory profile"* every time, even
+  when a factory profile already existed and nothing was written. The daemon now
+  returns `captured` / `exists` / `unsupported` / `failed` and the GUI reports
+  which.
+
+### [x] Version, and a defensive guard
+- `VERSION` lives in `msi_control.py`: `msi-control --version` prints it and
+  Settings shows `MSI Linux Control 1.0.0 · model schema 1`.
+- `MsiEc.set_curve` validates the fan name before indexing the register table.
+
+### [x] 142 offline tests
+- Added coverage for the `set_curve` guard, `capture_factory`'s result, the
+  capture result crossing the protocol, the unsupported-model capture, and
+  `--version`. `gui_smoke.py` pins all four capture-factory messages.
+
+---
+
 ## Done in the 2026-10-18 rename + model pass
 
 The app stopped being "GS66 Center" and became **MSI Linux Control**: renamed,
