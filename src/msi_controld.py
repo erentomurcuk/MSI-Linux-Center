@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""msi-controld - the privileged half of msi-control.
+"""msi-controld, the privileged half of msi-control.
 
 Runs as root (systemd system service), owns every EC write, and speaks a
 tiny one-request-per-connection JSON protocol on a Unix socket:
@@ -11,12 +11,12 @@ tiny one-request-per-connection JSON protocol on a Unix socket:
     {"cmd":"raw","addr":242}                (read; gated by AllowRaw)
 
 Design rules:
-  * never trust a client - every value is validated by msi_control;
+  * never trust a client: every value is validated by msi_control;
   * every EC write is followed by a read-back, because an EC that silently
     ignores a byte is indistinguishable from one that accepted it;
   * all writes are serialised under one lock (the EC is a shared resource
     the kernel's ACPI code also talks to);
-  * no subprocesses, ever - only sysfs reads/writes at fixed paths.
+  * no subprocesses, ever: only sysfs reads/writes at fixed paths.
 
 Run: msi-controld [--socket PATH] [--sysfs PATH] [--config PATH] [--state PATH]
            [--no-restore]
@@ -91,7 +91,7 @@ class NotSupported(ValidationError):
                       f"not enable {name!r}")
         else:
             detail = (f"no model definition matches this machine yet, so "
-                      f"{name!r} is off - run `msi-control detect` and "
+                      f"{name!r} is off; run `msi-control detect` and "
                       f"contribute one")
         return cls(f"{detail}.  See models/README.md.")
 
@@ -105,7 +105,7 @@ FS_IMMUTABLE_FL = 0x00000010
 
 
 # --------------------------------------------------------------------------
-# Direct EC backend - sysfs of the out-of-tree msi-ec driver (debug=1)
+# Direct EC backend: sysfs of the out-of-tree msi-ec driver (debug=1)
 # --------------------------------------------------------------------------
 
 class MsiEc:
@@ -154,7 +154,7 @@ class MsiEc:
     def _check_ec_debug(self) -> None:
         if not os.path.isdir(self._p("debug")):
             raise BackendError(
-                "EC debug interface unavailable - load msi-ec with debug=1 "
+                "EC debug interface unavailable; load msi-ec with debug=1 "
                 "(install.sh sets this up in /etc/modprobe.d/msi-ec.conf)")
 
     def _xfer_read(self, addr: int) -> int:
@@ -266,8 +266,8 @@ class MsiEc:
     #
     # Everything here writes bytes the driver's G1_3 config does not describe
     # (see the comment on MUX_EC_ADDR in msi_control).  The EC half is a
-    # read-modify-write of exactly one bit, so the neighbouring bits - 0x2e
-    # bit 1 is the webcam - survive untouched, and every write goes through
+    # read-modify-write of exactly one bit, so the neighbouring bits (0x2e
+    # bit 1 is the webcam) survive untouched, and every write goes through
     # ec_write, which reads the byte back and refuses to report success unless
     # it stuck.
 
@@ -290,7 +290,7 @@ class MsiEc:
         raw = self.mux_var_raw()
         if raw is None:
             raise BackendError(
-                f"{core.mux_var_path()} is not present - this firmware has no "
+                f"{core.mux_var_path()} is not present; this firmware has no "
                 f"{core.MUX_VAR_NAME} variable, so the graphics mode cannot be "
                 "requested")
         attrs, data = core.parse_mux_var(raw)
@@ -329,7 +329,7 @@ class MsiEc:
         wants the 4 attribute bytes plus the payload delivered in a *single*
         write() (a buffered or split write is refused), and the file is
         normally marked immutable, so the flag has to come off first and go
-        back on afterwards.  Both are plain ioctls and a raw os.write - no
+        back on afterwards.  Both are plain ioctls and a raw os.write: no
         `chattr`, no subprocess, which is the daemon's standing rule.
 
         The flag goes back on in a `finally`, so a failed write cannot leave
@@ -371,8 +371,8 @@ class MsiEc:
     def _mux_write_ec(self, want_bit: int) -> None:
         """Arm the trigger, then set 0x2e bit 6 to `want_bit`.
 
-        Read-modify-write, so the bits this program has no business in -
-        0x2e bit 1 is the webcam - are carried through untouched.
+        Read-modify-write, so the bits this program has no business in
+        (0x2e bit 1 is the webcam) are carried through untouched.
         """
         with self.lock:
             trig = self.ec_read(core.MUX_TRIGGER_ADDR)
@@ -571,7 +571,7 @@ class Service:
         return st
 
     def snapshot(self) -> dict:
-        """What we would restore at next boot - only keys that exist here.
+        """What we would restore at next boot: only keys that exist here.
 
         The graphics mode is deliberately absent.  It is not a per-session
         setting: re-requesting it at every boot would fight the firmware for a
@@ -612,13 +612,13 @@ class Service:
         controller exists or it does not); `requested` is what the firmware
         will do at the next POST (the UEFI variable, falling back to the EC
         state bit when the variable is absent).  The two differ only in the
-        window between a switch and the reboot that applies it - which is
+        window between a switch and the reboot that applies it, which is
         exactly what `reboot_required` reports, and it is deliberately not
         derived from "we just wrote something".
         """
         if self._igpu is None:
             # The iGPU cannot appear or vanish without a reboot, so reading it
-            # once per daemon lifetime is not a cache - it is the truth, and
+            # once per daemon lifetime is not a cache; it is the truth, and
             # it keeps a 30-device PCI walk off the 1.5 s poll.
             self._igpu = core.igpu_present()
         igpu = self._igpu
@@ -691,7 +691,7 @@ class Service:
         """
         if not self.cfg.get("AllowMuxSwitch"):
             raise ValidationError(
-                "the graphics (MUX) switch is disabled - set "
+                "the graphics (MUX) switch is disabled; set "
                 f"\"AllowMuxSwitch\": true in {core.config_path()} first")
         if not core.feature("mux"):
             raise NotSupported.feature("mux")
@@ -700,7 +700,7 @@ class Service:
         if not before["supported"]:
             raise BackendError(
                 "this firmware exposes neither the EC graphics bit nor the "
-                f"{core.MUX_VAR_NAME} variable - the switch is not available "
+                f"{core.MUX_VAR_NAME} variable; the switch is not available "
                 "on this machine")
         was = before["requested"]
         if was == mode and before["effective"] == mode:
@@ -719,7 +719,7 @@ class Service:
             # Say so loudly rather than reporting a switch that did not happen.
             raise BackendError(
                 f"the graphics mode did not stick (asked for {mode}, read "
-                f"back {after['requested']}) - the running session is "
+                f"back {after['requested']}).  The running session is "
                 "unchanged; check the EC register and the UEFI variable")
         log.info("graphics mode %s -> %s (reboot required to apply)",
                  was, mode)
@@ -738,7 +738,7 @@ class Service:
         """Undo the last graphics switch from the recorded backup."""
         if not self.cfg.get("AllowMuxSwitch"):
             raise ValidationError(
-                "the graphics (MUX) switch is disabled - set "
+                "the graphics (MUX) switch is disabled; set "
                 f"\"AllowMuxSwitch\": true in {core.config_path()} first")
         if not core.feature("mux"):
             raise NotSupported.feature("mux")
@@ -770,7 +770,7 @@ class Service:
             "reboot_required": after["reboot_required"],
             "summary": f"graphics mode restored to {target}",
             "activity": (f"Restored graphics mode to {core.MUX_LABELS[target]}"
-                         " - reboot to apply"),
+                         "; reboot to apply"),
             "graphics": after,
         }
 
@@ -792,10 +792,10 @@ class Service:
         """Apply one profile.
 
         Returns (warnings, changes, activities).  `changes` is a list of
-        human sentences - "performance comfort -> sport", "cpu curve (3
-        points)" - computed by reading the EC back before and after, never
+        human sentences ("performance comfort -> sport", "cpu curve (3
+        points)") computed by reading the EC back before and after, never
         by echoing the request.  `activities` is the same information phrased
-        as what was *done* - "Set performance mode to sport" - which is what
+        as what was *done* ("Set performance mode to sport"), which is what
         a status bar or notification should say; the two come from the same
         read-back so they can never disagree.  A setting the profile does
         not mention is left out of both entirely rather than reported as
@@ -838,7 +838,7 @@ class Service:
             try:
                 self.ec.set_charge_end(prof["charge_end"])
             except BackendError as e:
-                # e.g. no battery currently present - profile is otherwise live
+                # e.g. no battery currently present; profile is otherwise live
                 warnings.append(str(e))
 
         after = self._read_settings(keys)
@@ -885,15 +885,15 @@ class Service:
                              "; ".join(changes) or "no change")
                 else:
                     self.capture_factory()
-                    log.info("no saved state yet - captured factory curve")
+                    log.info("no saved state yet; captured factory curve")
         except (ValidationError, BackendError) as e:
             log.warning("restore failed: %s", e)
 
     def capture_factory(self) -> str:
         """Save the untouched firmware curve once, so it can always come back.
 
-        Returns what actually happened - "captured", "exists" (one was
-        already saved, nothing was overwritten) or "unsupported" - because a
+        Returns what actually happened: "captured", "exists" (one was
+        already saved, nothing was overwritten) or "unsupported", because a
         button that says "Captured factory profile" when it silently did
         nothing is a small lie, and this one is easy to hit twice.
         """
@@ -915,7 +915,7 @@ class Service:
 
     def reapply(self) -> tuple:
         """After resume: put the persisted state back.  Returns (warnings,
-        changes, activities) - a resume that changes nothing says so, instead
+        changes, activities): a resume that changes nothing says so, instead
         of claiming it did something."""
         if not self.cfg.get("ReapplyOnResume", True):
             return [], [], []
@@ -1129,7 +1129,7 @@ def main(argv=None) -> int:
     if not args.sysfs:
         log.info("waiting up to %.0fs for the msi-ec driver", args.wait)
         if not wait_for_driver(args.wait):
-            log.warning("msi-ec driver not present yet - will report "
+            log.warning("msi-ec driver not present yet; will report "
                         "'driver absent' until it appears")
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -1155,7 +1155,7 @@ def main(argv=None) -> int:
     service.restore()
 
     def _stop(signum, frame):
-        log.info("signal %s - shutting down", signum)
+        log.info("signal %s, shutting down", signum)
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _stop)

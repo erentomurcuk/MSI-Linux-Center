@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh - install MSI Linux Control on this machine.
+# install.sh: install MSI Linux Control on this machine.
 #
 # Run this as root (sudo ./install.sh), or let install.sh re-exec itself
 # through pkexec so the password prompt appears on your desktop.
@@ -12,7 +12,7 @@
 #   4. installs the daemon/CLI/GUI under /usr/local
 #   5. enables + starts the systemd service, installs the resume hook
 #
-# Everything it writes is listed in uninstall.sh - the two are symmetric.
+# Everything it writes is listed in uninstall.sh; the two are symmetric.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +38,7 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 # working directory, so a relative $0 would be lost ("No such file or directory").
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 if [ "$(id -u)" -ne 0 ]; then
-    log "root required - asking via pkexec (a password dialog should appear)"
+    log "root required, asking via pkexec (a password dialog should appear)"
     exec pkexec env DISPLAY="${DISPLAY:-:0}" \
         XAUTHORITY="${XAUTHORITY:-}" \
         WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
@@ -55,7 +55,7 @@ if [ ! -d "/lib/modules/$KREL/build" ]; then
        (or matching your running kernel:  uname -r)"
 fi
 for tool in gcc make; do
-    command -v "$tool" >/dev/null || die "$tool not found - dnf install $tool"
+    command -v "$tool" >/dev/null || die "$tool not found: dnf install $tool"
 done
 
 # Secure Boot: an out-of-tree module will simply not load if it is on.
@@ -71,7 +71,7 @@ fi
 # This program was formerly "GS66 Center".  Its daemon (gs66-centerd) has its
 # own socket and unit and may still be running; it writes the same EC through
 # the same kernel driver.  Two daemons owning the EC is exactly what this
-# program's one-writer rule forbids - so retire the old install first: stop
+# program's one-writer rule forbids, so retire the old install first: stop
 # it, remove its units/files, and carry the user's saved profiles and config
 # across so nothing they chose is lost.  Without this an upgrade leaves a
 # second writer fighting the new daemon for the embedded controller.
@@ -143,7 +143,7 @@ grep -q 'DEST_MODULE_LOCATION\[0\]="/updates/drivers/platform/x86"' \
 install_driver_dkms() {
     log "building via DKMS"
     # dkms reads PACKAGE_NAME/PACKAGE_VERSION out of dkms.conf, and expects
-    # the source at /usr/src/<name>-<version> - which DRIVER_DST now matches.
+    # the source at /usr/src/<name>-<version>, which DRIVER_DST now matches.
     dkms add "msi-ec/$DRIVER_VER"
     dkms build "msi-ec/$DRIVER_VER" -k "$KREL"
     dkms install "msi-ec/$DRIVER_VER" -k "$KREL"
@@ -172,10 +172,10 @@ echo "msi-ec" > /etc/modules-load.d/msi-ec.conf
 # Load it now (if not already).  The in-tree msi-ec may be bound; ours
 # installs into updates/ which takes precedence, but only after a reload.
 if lsmod | grep -q '^msi_ec'; then
-    log "msi-ec already loaded - reloading to pick up the new build"
+    log "msi-ec already loaded; reloading to pick up the new build"
     modprobe -r msi-ec 2>/dev/null || warn "could not unload the in-tree msi-ec (in use); it will pick up on next boot"
 fi
-modprobe msi-ec || warn "modprobe msi-ec failed - will retry at boot"
+modprobe msi-ec || warn "modprobe msi-ec failed; will retry at boot"
 
 # --------------------------------------------------------------- programs --
 log "installing programs to $LIBDIR"
@@ -193,7 +193,7 @@ cp -a "$HERE/models/." "$LIBDIR/models/"
 
 # The GUI's shebang uses env python3; make sure PySide6 is present.
 if ! python3 -c 'import PySide6' >/dev/null 2>&1; then
-    warn "PySide6 is not installed - the GUI will not start.
+    warn "PySide6 is not installed: the GUI will not start.
        Install it with:  dnf install python3-pyside6
        (the CLI and daemon work without it)"
 fi
@@ -252,9 +252,9 @@ echo
 log "installed.  Checking the driver:"
 if [ -d /sys/devices/platform/msi-ec ]; then
     echo "   firmware: $(cat /sys/devices/platform/msi-ec/fw_version 2>/dev/null || echo '?')"
-    echo "   debug interface: $([ -d /sys/devices/platform/msi-ec/debug ] && echo yes || echo NO - RPM and fan curves will be unavailable)"
+    echo "   debug interface: $([ -d /sys/devices/platform/msi-ec/debug ] && echo yes || echo NO: RPM and fan curves will be unavailable)"
 else
-    warn "msi-ec did not create its sysfs directory - the driver is not bound.
+    warn "msi-ec did not create its sysfs directory; the driver is not bound.
        Check:  dmesg | tail -20        and:  modinfo msi-ec"
 fi
 echo

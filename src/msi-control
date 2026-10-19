@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""msi-control - command line control for MSI laptops running Linux.
+"""msi-control, command line control for MSI laptops running Linux.
 
 Reads work without the daemon (plain sysfs); anything that changes a setting
 needs msi-controld running as root.
@@ -33,7 +33,7 @@ def _add_lib_path() -> str:
     """Find msi_control.py, whether run from the source tree or installed.
 
     Installed layout puts the shared module in /usr/local/lib/msi-control
-    while the wrappers live in /usr/local/bin - so dirname(__file__) alone
+    while the wrappers live in /usr/local/bin, so dirname(__file__) alone
     is not enough, and the CLI would die with ModuleNotFoundError.
     """
     here = os.path.dirname(os.path.realpath(__file__))
@@ -82,7 +82,7 @@ def die(msg: str, code: int = 1):
 
 
 def need_daemon_hint() -> str:
-    return ("msi-controld is not running - start it with\n"
+    return ("msi-controld is not running; start it with\n"
             "    sudo systemctl start msi-controld\n"
             "(settings can only be changed by the privileged daemon)")
 
@@ -108,7 +108,7 @@ def print_status(st: dict, as_json: bool = False):
 
     drv = st.get("driver", {})
     if not drv.get("present"):
-        print(red("msi-ec driver is not loaded - fan/mode control unavailable"))
+        print(red("msi-ec driver is not loaded: fan/mode control unavailable"))
         print(dim("  sudo modprobe msi-ec        (or check install.sh)"))
     else:
         fw = drv.get("fw") or "?"
@@ -123,12 +123,12 @@ def print_status(st: dict, as_json: bool = False):
                   f"{dim('(' + str(model.get('id')) + ')')}")
         else:
             print(f"{bold('Model')} {yellow('unsupported')}  "
-                  f"{dim('no model file matches this laptop - fan curve, '
+                  f"{dim('no model file matches this laptop: fan curve, '
                         'RPM and graphics switch are off')}")
             print(dim("      run `msi-control detect` and see CONTRIBUTING.md"))
 
     if st.get("partial"):
-        print(yellow("offline view - daemon not running, no RPM/fan-curve"))
+        print(yellow("offline view: daemon not running, no RPM/fan-curve"))
         if st.get("_daemon_error"):
             print(dim(f"  ({st['_daemon_error']})"))
 
@@ -147,7 +147,7 @@ def print_status(st: dict, as_json: bool = False):
         temp = s.get("temp")
         pct = s.get("fan_pct")
         rpm = s.get("rpm")
-        # Same bands as the GUI (core.temp_band) - one definition, so a
+        # Same bands as the GUI (core.temp_band), one definition, so a
         # colour means the same thing in both front-ends.
         temp_s = "??" if temp is None else f"{temp}°C"
         band = core.temp_band(temp)
@@ -167,7 +167,7 @@ def print_status(st: dict, as_json: bool = False):
         ac_s = "AC" if ac else ("battery" if ac is False else "?")
         bar_len = 20
         filled = 0 if pct is None else round(pct * bar_len / 100)
-        bar = green("█" * filled) + dim("░" * (bar_len - filled))
+        bar = green("█" * filled) + dim("░" * (bar_len-filled))
         print(f"{bold('Batt')}   {bar} {pct if pct is not None else '?'}%  {dim(ac_s)}  "
               f"{dim(bat.get('status') or '')}")
         cs, ce = bat.get("charge_start"), bat.get("charge_end")
@@ -206,7 +206,7 @@ def cmd_status(args):
 def cmd_detect(args):
     """What this laptop is, and what a model file for it would need.
 
-    Works with no root and with the daemon down - the moment somebody
+    Works with no root and with the daemon down, the moment somebody
     wondering "is my laptop supported?" is most likely to run it.
     """
     if args.write:
@@ -350,10 +350,10 @@ def cmd_curve(args):
             # single message sent both to the daemon.  A model with no curve
             # registers will *never* show one, so say that instead.
             if not core.feature("fan_curve"):
-                die("this laptop has no model definition for fan curves - "
+                die("this laptop has no model definition for fan curves; "
                     "run `msi-control detect`, then see CONTRIBUTING.md -> "
                     "\"Adding your model\"")
-            die("fan curve unavailable - is msi-controld running with debug=1?")
+            die("fan curve unavailable: is msi-controld running with debug=1?")
         if args.json:
             print(json.dumps(curve, indent=2))
             return
@@ -430,7 +430,7 @@ def cmd_profile(args):
             for c in acts:
                 print(green("✓ ") + c)
         else:
-            print(dim(f"profile {out.get('applied')} - nothing to change"))
+            print(dim(f"profile {out.get('applied')}: nothing to change"))
     else:
         print(json.dumps(out, indent=2, sort_keys=True))
 
@@ -444,7 +444,7 @@ def _print_graphics(g: dict) -> None:
     """
     print(bold("Graphics (MUX)"))
     if not g:
-        print(f"  {dim('unavailable - is msi-controld running?')}")
+        print(f"  {dim('unavailable: is msi-controld running?')}")
         return
     if g.get("supported") is False:
         print(f"  {dim('this firmware exposes no graphics switch')}")
@@ -554,11 +554,11 @@ def cmd_reapply(args):
         for c in acts:
             print(green("✓ ") + c)
     else:
-        print(dim("state re-applied - nothing to change"))
+        print(dim("state re-applied: nothing to change"))
 
 
 def cmd_wait(args):
-    """Block until the daemon answers - handy in scripts/units."""
+    """Block until the daemon answers; handy in scripts/units."""
     deadline = time.time() + args.seconds
     while time.time() < deadline:
         if core.daemon_available():
@@ -573,7 +573,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Global flags are accepted BOTH before and after the subcommand
     # (`msi-control --json status` and `msi-control status --json`).
     # SUPPRESS keeps a subparser from resetting a flag given on the outer
-    # parser - argparse would otherwise clobber it with the default.
+    # parser: argparse would otherwise clobber it with the default.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true",
                         default=argparse.SUPPRESS, help="machine output")
@@ -588,7 +588,7 @@ def build_parser() -> argparse.ArgumentParser:
                     version=f"%(prog)s {core.VERSION}")
     # Do NOT set_defaults() the three shared flags here.  set_defaults()
     # mutates the *action object's* .default, and these actions are shared
-    # with every subparser through parents=[common] - so `json=False` was
+    # with every subparser through parents=[common], so `json=False` was
     # written onto the same --json action each subparser reuses, and the
     # subparser then planted json=False into the namespace, clobbering a
     # `--json` given before the subcommand.  The flag was silently dropped

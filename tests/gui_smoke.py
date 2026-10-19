@@ -894,7 +894,8 @@ def check_action_messages(win) -> None:
     # An apply that moved nothing must not claim it did.
     assert describe({"cmd": "profile", "action": "apply", "name": "gaming"},
                     {"changes": []},
-                    "profile:apply").endswith("nothing to change")
+                    "profile:apply") == "Applied profile gaming " \
+                                        "(nothing to change)"
 
     assert describe({"cmd": "profile", "action": "delete", "name": "x"},
                     {}, "profile:delete") == "Deleted profile x"

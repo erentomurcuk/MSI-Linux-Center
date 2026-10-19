@@ -3,12 +3,12 @@
 One directory per laptop model, each holding a `model.json`. This is what makes
 MSI Linux Control about MSI laptops in general instead of about the one machine
 it was written for. If your laptop is not fully supported, **this is the
-directory you add to** - see [`../CONTRIBUTING.md`](../CONTRIBUTING.md) §
+directory you add to**; see [`../CONTRIBUTING.md`](../CONTRIBUTING.md) §
 "Adding your model" and [`../AGENTS.md`](../AGENTS.md) §6.
 
 ```
 models/
-├── README.md                 this file - the format, field by field
+├── README.md                 this file: the format, field by field
 └── gs66-stealth-10se/
     ├── model.json            the worked example
     └── README.md             how those registers were found and confirmed
@@ -25,8 +25,8 @@ crash.
 
 Search order, first hit wins:
 
-1. `$MSI_MODELS` if set - how the tests and a contributor trying a model out
-   point somewhere else;
+1. `$MSI_MODELS` if set, which is how the tests and a contributor trying a
+   model out point somewhere else;
 2. `<dir of msi_control.py>/models` (source tree: `src/../models`);
 3. `/usr/local/lib/msi-control/models` (the installed location);
 4. `/usr/lib/msi-control/models`.
@@ -77,7 +77,7 @@ defaults to `Micro-Star International Co., Ltd.`; `status` is `draft`,
 `testing` or `stable` (default `stable`).
 
 `provenance` is a list of strings and it matters more than it looks: say where
-each address came from - a project and section (YoyPa/isw `[16V1EMS1]`), a
+each address came from: a project and section (YoyPa/isw `[16V1EMS1]`), a
 driver table (`teackot/msi-ec CONF_G1_3`), a live dump, or your own measurement.
 `notes` is for the one or two non-obvious facts about *this* firmware.
 
@@ -99,9 +99,10 @@ firmware family is shared across models, and it is what saves a machine whose
 DMI string MSI changed between BIOS revisions.
 
 **Pin the firmware with a wildcard, never a full revision.** `16V1EMS1.118`
-becomes `16V1EMS1.*` - the trailing revision arrives with every firmware update,
-so a pattern that pinned it would stop matching for everyone who updated. Use
-the same wildcard for a DMI string only if the vendor really does vary it.
+becomes `16V1EMS1.*`; the trailing revision arrives with every firmware
+update, so a pattern that pinned it would stop matching for everyone who
+updated. Use the same wildcard for a DMI string only if the vendor really does
+vary it.
 
 ### `ec` (optional, but it is the point)
 
@@ -158,25 +159,25 @@ register-backed ones `false`):
 | `fan` | driver | fan modes |
 | `cooler_boost` | driver | Cooler Boost |
 | `charge_limit` | driver | battery charge threshold |
-| `fan_curve` | register | custom fan curves - **requires `ec.curve`** |
-| `rpm` | register | fan tachometers - **requires `ec.rpm`** |
+| `fan_curve` | register | custom fan curves: **requires `ec.curve`** |
+| `rpm` | register | fan tachometers: **requires `ec.rpm`** |
 | `mux` | register | graphics-mode (MUX) switch |
 | `webcam`, `webcam_block`, `super_battery`, `fn_key`, `win_key` | driver | optional features only some firmwares have |
 
 The first four are also checked at runtime against the attributes the driver
 actually exposes, so a model cannot enable a control the driver does not offer.
 `fan_curve: true` with no `ec.curve`, or `rpm: true` with no `ec.rpm`, is a
-**load error** - a model may not claim a feature it has no registers for.
+**load error**; a model may not claim a feature it has no registers for.
 
 Only turn a flag on for something you have proven. `fan_curve` and `mux` in
 particular write registers, and a guessed address is a machine that will not
 boot. Note that **`mux` is a plain enable here**: the MUX addresses themselves
-are not per-model - the whole MSI family shares one block in
+are not per-model; the whole MSI family shares one block in
 `src/msi_control.py`, and a model only says whether its firmware supports it.
 
 ### `profiles`
 
-This model's built-in profiles - the everyday bundles. They are model-specific
+This model's built-in profiles: the everyday bundles. They are model-specific
 because a curve is. A profile is a partial setting bundle:
 
 ```jsonc
@@ -198,7 +199,7 @@ because a curve is. A profile is a partial setting bundle:
 * A profile that does **not** mention a charge limit does **not** touch one.
   Only `battery` sets a limit on the GS66, on purpose: applying a performance
   profile must never silently undo a charge limit you chose for battery health.
-* No profile may be named `factory` - that name is reserved for the snapshot
+* No profile may be named `factory`; that name is reserved for the snapshot
   captured from the live EC on first run, which is the guaranteed way back.
 * Every profile is validated by the same `clean_profile` the daemon uses, so a
   bad curve in a model file fails at load with the file and the profile named.
@@ -212,7 +213,7 @@ enables everything the `msi-ec` driver exposes by itself:
 
 * **works**: temperatures, fan duty, shift modes, fan modes, Cooler Boost, the
   charge limit;
-* **refused**: fan curves, RPM, and the graphics switch - these need registers
+* **refused**: fan curves, RPM, and the graphics switch; these need registers
   only a model file can supply, and the program refuses rather than guesses.
 
 The GUI shows an amber banner, the Fan tab becomes read-only with a notice, and
@@ -229,5 +230,5 @@ MSI_MODELS=$PWD/models MSI_MODEL=my-model msi-control status
 ```
 
 `MSI_MODELS` overrides the registry directory; `MSI_MODEL` forces one id. An id
-that is not in the registry is a hard error, not a silent fallback - a typo must
+that is not in the registry is a hard error, not a silent fallback; a typo must
 not look like "unsupported".

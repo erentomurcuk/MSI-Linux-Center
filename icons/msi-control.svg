@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  MSI Linux Control - application icon.
+  MSI Linux Control: application icon.
 
   An MSI-red heraldic shield bearing Tux, centred on a transparent square.
   The shield is the badge; the penguin is the "Linux" half of the name, so the
@@ -10,7 +10,7 @@
   two-colour penguin on a bold field still reads.
 
   This is the same mark the GUI paints at runtime in `brand_pixmap()` (and its
-  temperature-tinted twin `temp_pixmap()`, used for the tray) - kept in step
+  temperature-tinted twin `temp_pixmap()`, used for the tray), kept in step
   deliberately, so the window, the menu entry and the tray are recognisably one
   application.  `check_brand_mark` rasterises both this file and the painted
   mark and compares their ink boxes, so they cannot drift apart.
@@ -33,7 +33,7 @@
     </linearGradient>
   </defs>
 
-  <!-- The shield: x 19, y 12, 90 wide, 104 tall - MARK_BOX in the GUI. -->
+  <!-- The shield: x 19, y 12, 90 wide, 104 tall; MARK_BOX in the GUI. -->
   <path d="M19,12 H109 V52.5 C109,84.8 86,103.3 64,116 C42,103.3 19,84.8 19,52.5 Z"
         fill="url(#shield)"/>
 

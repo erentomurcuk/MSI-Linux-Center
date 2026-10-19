@@ -1,4 +1,4 @@
-# MSI Linux Control - ignore rules
+# MSI Linux Control: ignore rules
 #
 # The repo ships the *source* of the driver, daemon, CLI and GUI.  Anything a
 # build or a test run produces is disposable and must never be committed.
@@ -30,6 +30,22 @@ modules.order
 # run can never touch ~/.config.  That is throwaway state, not a fixture.
 tests/shots/**/_xdg_config/
 tests/shots/_xdg_config/
+
+# --- release / packaging artefacts ------------------------------------------
+# `make release` drops the tarball and every built rpm into dist/, and `make
+# rpm` works in rpmbuild/ (its own BUILD/SPECS/SOURCES tree).  Both are
+# outputs, never inputs; a built .rpm or the release tarball must not be
+# committed, because the version they carry lives in src/msi_control.py.
+rpmbuild/
+*.rpm
+*.tar.gz
+
+# --- tool caches (not the Python bytecode cache above) ----------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # --- editor / OS ------------------------------------------------------------
 *~

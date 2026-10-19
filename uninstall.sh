@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# uninstall.sh - remove everything install.sh put on this machine.
+# uninstall.sh: remove everything install.sh put on this machine.
 #
 # Does NOT touch: your saved profiles (/var/lib/msi-control), your config
 # (/etc/msi-control), or the DKMS registration of a driver you may have
@@ -11,7 +11,7 @@ PURGE=0
 
 LIBDIR=/usr/local/lib/msi-control
 # Both spellings: the installer uses the dkms-conformant hyphen, but an
-# earlier layout used an underscore - clean up whichever is present.
+# earlier layout used an underscore; clean up whichever is present.
 DRIVER_DST_HYPHEN=/usr/src/msi-ec-0.13
 DRIVER_DST_UNDERSCORE=/usr/src/msi_ec-0.13
 KREL="$(uname -r)"

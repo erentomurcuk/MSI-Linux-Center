@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""msi-control-gui - Qt control centre for MSI laptops running Linux.
+"""msi-control-gui: Qt control centre for MSI laptops running Linux.
 
 Front-end to msi-controld (which owns every EC write); this process is never
 privileged and never touches sysfs directly.  All daemon traffic runs on one
@@ -13,9 +13,9 @@ Sections (sidebar):
   Profiles     built-in + saved setting bundles
   Settings     daemon state, re-apply, factory capture, raw EC console
 
-Design rules (same ones the daemon enforces - the GUI is just a client):
+Design rules (same ones the daemon enforces; the GUI is just a client):
   * every value is validated by msi_control before it is sent;
-  * nothing is written optimistically - the UI re-reads state after each
+  * nothing is written optimistically; the UI re-reads state after each
     command, so what you see is what the EC actually holds;
   * with the daemon down the GUI degrades to read-only instead of lying.
 
@@ -26,15 +26,15 @@ forces one; otherwise the desktop's own colour scheme decides, defaulting to
 dark when the platform does not report one (as offscreen does not).
 
 The look is MSI's: the accent is MSI red, and the app mark is a red shield
-carrying the model name - the badge language a gaming laptop is expected to
+carrying the model name: the badge language a gaming laptop is expected to
 have.  The temperature bands stay green→amber→orange→red, because those are
 *status* rather than chrome, so the red accent never has to double as
 "critical": an interactive control is red because it is the brand, a hot
 reading is red because it is hot, and the two never mean the same thing.
 
 Shape, spacing and type each come from one scale (`SPACE`, `R_CARD`/`R_CTRL`/
-`R_INNER`, `TYPE_*`).  They used to be chosen per widget - six different corner
-radii, and a mix of point- and pixel-sized fonts - which is the kind of drift
+`R_INNER`, `TYPE_*`).  They used to be chosen per widget: six different corner
+radii, and a mix of point- and pixel-sized fonts, which is the kind of drift
 that makes an interface read as assembled rather than designed.
 
 Font sizes are deliberately set in code, never in the stylesheet: a Qt
@@ -56,7 +56,7 @@ def _add_lib_path() -> str:
     """Find msi_control.py, whether run from the source tree or installed.
 
     Installed layout puts the shared module in /usr/local/lib/msi-control
-    while the wrappers live in /usr/local/bin - so dirname(__file__) alone
+    while the wrappers live in /usr/local/bin, so dirname(__file__) alone
     is not enough.
     """
     here = os.path.dirname(os.path.realpath(__file__))
@@ -94,7 +94,7 @@ import msi_control as core                                     # noqa: E402
 POLL_MS = 1500
 
 # --------------------------------------------------------------------------
-# Temperature palette - the SEMANTIC colours.  They are status, not chrome,
+# Temperature palette: the SEMANTIC colours.  They are status, not chrome,
 # so they are fixed across themes and shared with the CLI via msi_control's
 # bands: 62 °C is "warm" in every front-end, which they used to disagree on.
 # --------------------------------------------------------------------------
@@ -117,7 +117,7 @@ def temp_color(temp):
 
 
 # --------------------------------------------------------------------------
-# Design tokens - shape, spacing and type, in one scale so they cannot drift.
+# Design tokens: shape, spacing and type, in one scale so they cannot drift.
 # --------------------------------------------------------------------------
 
 SPACE = 8             # one spacing unit; margins and gaps are multiples of it
@@ -132,7 +132,7 @@ R_BAR = 5             # progress bars and the slider groove
 
 # Control geometry.  One rung for every button, single-line field, spin box
 # and sidebar row, so they are the same height by construction rather than by
-# a minimum height each widget sets for itself - which is how “Apply” on the
+# a minimum height each widget sets for itself, which is how “Apply” on the
 # battery page ended up 10 px taller than the “60%” preset beside it.  H_* are
 # *content* heights (see the stylesheet's control block); the hero is the only
 # deliberate exception, and it says so where it is used.
@@ -141,7 +141,7 @@ PAD_HERO_V = 12       # the one oversized control (cooler boost)
 H_CTRL = 22           # → a 36 px rendered control
 H_SPIN = 19           # → also 36 px: a spin box adds 3 px of its own
 H_SLIDER = 28         # the charge slider's touch target (a slider, not a
-                      # button - the handle needs room the text does not)
+                      # button; the handle needs room the text does not)
 H_BAR = 8             # the stat tiles' progress bar
 ICON_SM = 16          # every icon drawn in a row of text, so none of them
                       # can make its own row taller than the text beside it
@@ -189,7 +189,7 @@ def _srgb(v: float) -> float:
 def text_on(background: str) -> str:
     """Black or white text, whichever is readable on `background`.
 
-    White on the amber "hot" colour measures ~2.9:1 - it looks fine in a
+    White on the amber "hot" colour measures ~2.9:1; it looks fine in a
     mockup and fails WCAG AA in use.  Luminance decides, not habit.
     """
     c = QColor(background)
@@ -221,7 +221,7 @@ def muted_color(widget) -> str:
 
 
 # --------------------------------------------------------------------------
-# Theme - one token set per theme, one stylesheet, so nothing drifts.
+# Theme: one token set per theme, one stylesheet, so nothing drifts.
 # --------------------------------------------------------------------------
 
 _DARK = {
@@ -289,8 +289,8 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 QLabel { background: transparent; }
 
 /* The control rung.  Every button, single-line field, spin box and sidebar
-   row is the same height, so a row that mixes them - the battery presets
-   beside Apply, the raw console's two fields beside Read and Write - lines
+   row is the same height, so a row that mixes them (the battery presets
+   beside Apply, the raw console's two fields beside Read and Write) lines
    up instead of stepping.  Qt's stylesheet min-height is the *content* box,
    so the rendered height is this plus twice the padding plus the border;
    both numbers come from the tokens above, and check_control_sizes measures
@@ -298,7 +298,7 @@ QLabel { background: transparent; }
    that sets one is a button that no longer lines up with its neighbours. */
 QPushButton, QLineEdit { min-height: %(h_ctrl)s; }
 /* A spin box spends 3 px on its arrow buttons on top of everything else
-   (measured, and unaffected by their height or their padding) - so it gets
+   (measured, and unaffected by their height or their padding), so it gets
    3 px less content to come out on the same rung.  Leave it out and the one
    spin box in the fans editor is the only control that does not match. */
 QSpinBox { min-height: %(h_spin)s; }
@@ -494,7 +494,7 @@ def accent_icon_color() -> str:
 
 
 # --------------------------------------------------------------------------
-# painted glyphs - a handful of vector icons, so the UI has a visual language
+# painted glyphs: a handful of vector icons, so the UI has a visual language
 # without shipping (and licensing) an icon theme.
 # --------------------------------------------------------------------------
 
@@ -595,7 +595,7 @@ def nav_icon(name: str, size: int = ICON_SM) -> QIcon:
 
     QPushButton draws its icon in the QIcon.On state when checked, so the
     two pixmaps give the selected row both a tinted background *and* a
-    brightened icon - a colour change on its own is easy to miss."""
+    brightened icon; a colour change on its own is easy to miss."""
     ic = QIcon()
     ic.addPixmap(glyph_pixmap(name, size, THEME["text_dim"]),
                  QIcon.Mode.Normal, QIcon.State.Off)
@@ -632,14 +632,14 @@ def shield_path(rect: QRectF) -> QPainterPath:
 
 
 # Where the shield sits on the mark's square, as x, y, width, height
-# fractions.  Sized so the shape fills the canvas with an even margin - the
-# mark *is* the shield, so whatever is left over is wasted - and centred, so
+# fractions.  Sized so the shape fills the canvas with an even margin (the
+# mark *is* the shield, so whatever is left over is wasted), and centred, so
 # it sits level with its neighbours in a taskbar.  The same four numbers are
 # baked into `icons/msi-control.svg`; `check_brand_mark` rasterises both and
 # compares the outlines, so the two cannot drift apart.
 MARK_BOX = (19.0 / 128, 12.0 / 128, 90.0 / 128, 104.0 / 128)
 
-# The shield's three gradient stops - the same three the SVG carries, in the
+# The shield's three gradient stops: the same three the SVG carries, in the
 # same order and at the same positions.
 BRAND_RED = ("#ff4a3d", "#e2231a", "#9c0a19")
 
@@ -831,7 +831,7 @@ def temp_pixmap(size: int, temp, label: str = "",
 
 
 def hint_label(text: str, parent=None) -> QLabel:
-    """The one helper for explanatory small print - themed, wrapping, muted."""
+    """The one helper for explanatory small print: themed, wrapping, muted."""
     h = QLabel(text, parent)
     h.setWordWrap(True)
     h.setFont(ui_font(TYPE_BODY))
@@ -842,8 +842,8 @@ def hint_label(text: str, parent=None) -> QLabel:
 def notice_style(colour: str, background: str | None = None) -> str:
     """Inline QSS for a warning / status strip inside a page.
 
-    One helper so the fan-curve and MUX warnings - which are both "here is
-    why this control is not going to work" - cannot end up with different
+    One helper so the fan-curve and MUX warnings, which are both "here is
+    why this control is not going to work", cannot end up with different
     padding, radius or text colour, as they did.
     """
     if background:
@@ -869,7 +869,7 @@ MUX_SHORT = {core.MUX_HYBRID: "Hybrid", core.MUX_DISCRETE: "Discrete"}
 
 
 def graphics_mode(g: dict):
-    """The mode to *display* - the running one, or the pending one loudly."""
+    """The mode to *display*: the running one, or the pending one loudly."""
     if not g:
         return None
     if g.get("reboot_required"):
@@ -887,7 +887,7 @@ def graphics_summary(g: dict) -> str | None:
 
 
 # --------------------------------------------------------------------------
-# daemon client - every request answered on the worker thread, delivered
+# daemon client: every request answered on the worker thread, delivered
 # to the GUI as a queued Qt signal
 # --------------------------------------------------------------------------
 
@@ -934,7 +934,7 @@ class QSignalBlockerSafe:
 
 
 class Card(QFrame):
-    """A titled surface with a tidy vertical layout - the GUI's layout atom.
+    """A titled surface with a tidy vertical layout, the GUI's layout atom.
 
     A plain QFrame + an uppercase caption rather than a QGroupBox: the
     groupbox title is drawn by the style at a size and colour we cannot
@@ -960,7 +960,7 @@ class Card(QFrame):
             self.box.addLayout(self.header)
 
 
-def kv_row(label: str, parent=None, value: str = "-",
+def kv_row(label: str, parent=None, value: str = "?",
            selectable: bool = False) -> tuple:
     """One label / right-aligned value row, styled in exactly one place.
 
@@ -1004,7 +1004,7 @@ def stat_row(label: str, value: str, parent=None) -> tuple:
 
 
 def field_label(text: str) -> QLabel:
-    """The caption above a form field - defined in exactly one place, so the
+    """The caption above a form field, defined in exactly one place, so the
     profile form and the raw console cannot label their fields differently."""
     lab = QLabel(text)
     lab.setFont(ui_font(TYPE_CAPTION, bold=True))
@@ -1024,7 +1024,7 @@ class StatCard(Card):
         self.chip.setVisible(False)
         self.header.addWidget(self.chip)
 
-        self.value = QLabel("-")
+        self.value = QLabel("?")
         self.value.setFont(ui_font(TYPE_DISPLAY, bold=True))
         self.value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.bar = QProgressBar()
@@ -1098,7 +1098,7 @@ def scrolled(page: QWidget) -> QScrollArea:
 
 
 def page_layout(widget: QWidget) -> QVBoxLayout:
-    """The standard page frame - one margin and one gap for all six sections.
+    """The standard page frame: one margin and one gap for all six sections.
 
     Every tab used to repeat the same three lines; centralising them is what
     keeps a card on the Dashboard aligned with a card on Settings."""
@@ -1109,7 +1109,7 @@ def page_layout(widget: QWidget) -> QVBoxLayout:
 
 
 # --------------------------------------------------------------------------
-# fan-curve canvas - drag the six threshold points; the factory curve is
+# fan-curve canvas: drag the six threshold points; the factory curve is
 # drawn behind as a ghost so you can see how far you have strayed
 # --------------------------------------------------------------------------
 
@@ -1127,7 +1127,7 @@ class CurveCanvas(QWidget):
     # The axes span the *whole* valid range, so a legal point can never be
     # drawn outside the plot.  TMIN used to be a hardcoded 20 while the EC
     # accepts down to core.TEMP_MIN (10): a keyboard nudge could then move
-    # point 0 to 10 °C, which sits left of the plot - the handle vanished off
+    # point 0 to 10 °C, which sits left of the plot; the handle vanished off
     # the edge and the mouse could no longer reach the value its own spin box
     # was showing.  Keep these tied to core, not to a taste call.
     TMIN, TMAX = core.TEMP_MIN, core.TEMP_MAX   # x axis, °C
@@ -1227,7 +1227,7 @@ class CurveCanvas(QWidget):
         lab = tcol("muted")
         p.setPen(QPen(lab))
         p.setFont(ui_font(TYPE_MICRO))
-        # Gridlines every 10 °C, but round-number labels only - the axis now
+        # Gridlines every 10 °C, but round-number labels only; the axis now
         # starts at core.TEMP_MIN (10), so 20…100 stay the natural labels.
         for t in (20, 40, 60, 80, 100):
             p.drawText(QRectF(self._x(t) - 14, plot.bottom() + 3, 28, 14),
@@ -1243,7 +1243,7 @@ class CurveCanvas(QWidget):
             # live position of the machine wears its temperature-band colour
             # instead, so "what I configured" and "how hot it is right now"
             # can never be mistaken for one another.  (The curve itself used
-            # to be tinted by the live temperature - an identical curve then
+            # to be tinted by the live temperature: an identical curve then
             # changed colour from minute to minute, and the accent ended up
             # meaning nothing at all.)
             col = tcol("accent")
@@ -1268,7 +1268,7 @@ class CurveCanvas(QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawPath(path)
 
-            # Live marker: where the machine actually is right now - drawn in
+            # Live marker: where the machine actually is right now, drawn in
             # the temperature band colour and labelled, so the one coloured
             # thing on the plot is the reading it stands for.
             if self.live and self.live[0] is not None:
@@ -1488,7 +1488,7 @@ class DashboardTab(QWidget):
             # "fan 48%" here printed one number twice and made a temperature
             # card read as a fan card, so this one carries the temperature,
             # its bar and its band chip and nothing else.
-            card.show(f"{t}°C" if t is not None else "-",
+            card.show(f"{t}°C" if t is not None else "?",
                       (t / 100.0) if t is not None else None,
                       "",
                       temp_color(t),
@@ -1500,11 +1500,11 @@ class DashboardTab(QWidget):
             # `is not None`, not truthiness: a stopped fan reads 0 RPM and
             # that is a real answer, not a missing daemon.
             if rpm is None:
-                sub = ("RPM off - no model definition for this laptop"
+                sub = ("RPM off: no model definition for this laptop"
                        if not core.feature("rpm") else "RPM needs the daemon")
-                card.show("-", None, sub, COL_DEAD)
+                card.show("?", None, sub, COL_DEAD)
             else:
-                # The bar is fan duty, the number is RPM - say so.  With the
+                # The bar is fan duty, the number is RPM.  Say so.  With the
                 # sub-line just reading "RPM" the bar's meaning was anyone's
                 # guess, and it does not track the number beside it.
                 card.show(f"{rpm:,}", (pct / 100.0) if pct is not None else None,
@@ -1514,7 +1514,7 @@ class DashboardTab(QWidget):
         bat = st.get("battery") or {}
         pct = bat.get("pct")
         # Wear is *capacity now* against *capacity when new*.  This used to be
-        # energy_now / energy_full, which is the state of charge - so the
+        # energy_now / energy_full, which is the state of charge, so the
         # dashboard announced "67% of new" beside a big 67% and told you
         # nothing about the battery's health at all.
         wear = None
@@ -1526,7 +1526,7 @@ class DashboardTab(QWidget):
         # The chip names the state and colours it by whether it wants your
         # attention.  Charging and full are simply fine (green); "not
         # charging" while on AC is the one state people actually ask about -
-        # usually the charge limit doing its job - so it takes the amber that
+        # usually the charge limit doing its job, so it takes the amber that
         # means "look, but nothing is wrong"; everything else, including
         # running on battery, is neutral.
         if word in ("charging", "full"):
@@ -1540,7 +1540,7 @@ class DashboardTab(QWidget):
         # "a value we are reporting" everywhere else.  (It used to be green
         # whatever the charge was, so 8% on battery looked as "fine" as 100%.)
         self.battery.show(
-            f"{pct}%" if pct is not None else "-",
+            f"{pct}%" if pct is not None else "?",
             (pct / 100.0) if pct is not None else None,
             " · ".join(x for x in [
                 "AC" if bat.get("ac_online") else ("battery" if bat.get(
@@ -1560,7 +1560,7 @@ class DashboardTab(QWidget):
             "Graphics": graphics_summary(st.get("graphics") or {}),
         }
         for k, v in rows.items():
-            self.mode_rows[k].setText(str(v) if v else "-")
+            self.mode_rows[k].setText(str(v) if v else "?")
 
         drv = st.get("driver") or {}
         model = st.get("model") or core.MODEL.summary()
@@ -1571,7 +1571,7 @@ class DashboardTab(QWidget):
              + (f"  ·  curve/rpm/mux: {len(on)}/3" if on else
                 "  ·  no fan-curve, RPM or MUX definition"))
             if model.get("supported") else
-            "unrecognised - no model file matches this laptop")
+            "unrecognised: no model file matches this laptop")
         self.sys_rows["Driver"].setText(
             (f"{drv.get('fw') or 'driver'}"
              + (f"  ·  {drv['fw_date']}" if drv.get("fw_date") else ""))
@@ -1585,7 +1585,7 @@ class DashboardTab(QWidget):
             bits.append("raw access " + ("ON" if cfg.get("AllowRaw") else "off"))
             bits.append("MUX switch "
                         + ("ON" if cfg.get("AllowMuxSwitch") else "off"))
-        self.sys_rows["Config"].setText("  ·  ".join(bits) or "-")
+        self.sys_rows["Config"].setText("  ·  ".join(bits) or "?")
 
 
 class PerformanceTab(QWidget):
@@ -1615,12 +1615,12 @@ class PerformanceTab(QWidget):
             row.addWidget(b)
         card.box.addLayout(row)
         card.box.addWidget(hint_label(
-            "eco · quiet and cool - comfort · everyday - sport · sustained "
-            "load - turbo · maximum (loud)", card))
+            "eco · quiet and cool; comfort · everyday; sport · sustained "
+            "load; turbo · maximum (loud)", card))
         lay.addWidget(card)
 
         boost = Card("Cooling")
-        self.boost_btn = QPushButton("COOLER BOOST - hold both fans at 100%")
+        self.boost_btn = QPushButton("COOLER BOOST: hold both fans at 100%")
         self.boost_btn.setCheckable(True)
         # The one oversized control in the app: its height comes from the
         # [hero="true"] rule in the stylesheet, so it is a token like every
@@ -1634,7 +1634,7 @@ class PerformanceTab(QWidget):
             "Forced maximum cooling, e.g. right after a gaming session.  "
             "It stays on until you turn it off (or the daemon re-applies "
             "your saved state at boot).  The duty registers do not move under "
-            "Cooler Boost - watch the RPM beside them.", boost))
+            "Cooler Boost; watch the RPM beside them.", boost))
         lay.addWidget(boost)
 
         # ---- graphics mode (MUX) -----------------------------------------
@@ -1644,7 +1644,7 @@ class PerformanceTab(QWidget):
         gfx.box.addWidget(hint_label(
             "Which GPU drives the built-in display.  A switch is written to "
             "the embedded controller and to a UEFI variable, and takes effect "
-            "at the next reboot - this session is unaffected.", gfx))
+            "at the next reboot; this session is unaffected.", gfx))
 
         self.gfx_rows = {}
         for label in ("running now", "at next boot"):
@@ -1679,7 +1679,7 @@ class PerformanceTab(QWidget):
             f"{core.MUX_VAR_NAME}.  It is off unless “AllowMuxSwitch” is set "
             "in the config, it always needs a reboot, and on a laptop whose "
             "MUX was never reverse engineered it can leave the machine with "
-            "no display - recovery would then mean resetting the firmware.  "
+            "no display; recovery would then mean resetting the firmware.  "
             "The previous value is backed up first.", gfx))
         lay.addWidget(gfx)
         lay.addStretch(1)
@@ -1700,7 +1700,7 @@ class PerformanceTab(QWidget):
             f"Switch the graphics mode to {core.MUX_LABELS[mode]}?\n\n"
             "This writes EC register 0x2e, the EC switch trigger and the "
             f"UEFI variable {core.MUX_VAR_NAME}.  It takes effect at the "
-            "NEXT REBOOT - nothing changes in this session.\n\n"
+            "NEXT REBOOT: nothing changes in this session.\n\n"
             "On a laptop whose MUX was never reverse engineered this can "
             "leave the machine without a display, and recovery would then "
             "mean resetting the firmware.  The current value is saved to a "
@@ -1756,15 +1756,15 @@ class PerformanceTab(QWidget):
         # than leaving a greyed-out button to be interpreted.
         if not model_mux:
             note = ("no model definition for this laptop enables the graphics "
-                    "switch - run `msi-control detect` and see CONTRIBUTING.md")
+                    "switch; run `msi-control detect` and see CONTRIBUTING.md")
             style = notice_style(muted_color(self))
         elif not g.get("supported", True):
             note = ("✗ this firmware exposes neither the EC graphics bit nor "
-                    f"the {core.MUX_VAR_NAME} variable - the switch is not "
+                    f"the {core.MUX_VAR_NAME} variable; the switch is not "
                     "available here")
             style = notice_style(COL_CRIT, COL_CRIT)
         elif not g.get("enabled"):
-            note = ("switching is disabled - set “AllowMuxSwitch”: true in "
+            note = ("switching is disabled; set “AllowMuxSwitch”: true in "
                     f"{core.config_path()} and restart msi-controld")
             style = notice_style(muted_color(self))
         elif not online:
@@ -1793,13 +1793,13 @@ class PerformanceTab(QWidget):
         with QSignalBlockerSafe(self.boost_btn):
             self.boost_btn.setChecked(on)
         self.boost_btn.setEnabled(bool(self.win.online))
-        self.boost_btn.setText("COOLER BOOST ON - tap to release"
+        self.boost_btn.setText("COOLER BOOST ON: tap to release"
                                if on else
-                               "COOLER BOOST - hold both fans at 100%")
+                               "COOLER BOOST: hold both fans at 100%")
         # Only restyle when it is actually on.  "On" is the same filled accent
         # as every other selected control, so the tab has one meaning for one
         # look; the amber this used to wear read as "hot", which Cooler Boost
-        # - the thing that *cools* - is the opposite of.
+        # (the thing that *cools*) is the opposite of.
         if on:
             self.boost_btn.setStyleSheet(
                 f"QPushButton{{background:{THEME['accent']};"
@@ -1817,7 +1817,7 @@ class FansTab(QWidget):
 
     The curves carry **unsaved-change tracking**.  Without it the 1.5 s poll
     re-adopted the EC's curve on every refresh and silently reverted whatever
-    the user had just dragged - the edit vanished mid-thought, and the Apply
+    the user had just dragged; the edit vanished mid-thought, and the Apply
     button then applied the EC's own value back to the EC.  A refresh may now
     only replace the editor when the editor holds no unsaved change, and the
     pending state clears by itself the moment the EC agrees (i.e. the write
@@ -1831,7 +1831,7 @@ class FansTab(QWidget):
         self.win = win
         # Fan curves need this model's EC registers; without a model file they
         # are simply unknown, so the editor is refused rather than allowed to
-        # write a guessed address.  Read once - the model cannot change while
+        # write a guessed address.  Read once; the model cannot change while
         # the process lives.
         self.curve_ok = core.feature("fan_curve")
         lay = page_layout(self)
@@ -1842,7 +1842,7 @@ class FansTab(QWidget):
         if not self.curve_ok:
             self.curve_notice.setText(
                 "This laptop has no model definition yet, so its fan-curve "
-                "registers are unknown - the curve editor is read-only.  Fan "
+                "registers are unknown; the curve editor is read-only.  Fan "
                 "mode, cooler boost and the charge limit still work, because "
                 "the msi-ec driver provides those directly.  Run "
                 "`msi-control detect` and see CONTRIBUTING.md → “Adding your "
@@ -1874,7 +1874,7 @@ class FansTab(QWidget):
         mode.box.addWidget(hint_label(
             "EC fan modes.  “advanced” lets the fan follow the custom curve "
             "below; “silent” caps the speed; “auto” is the firmware default.  "
-            + ("The curve editor is live - drag a point and Apply writes it."
+            + ("The curve editor is live: drag a point and Apply writes it."
                if self.curve_ok else
                "The curve below needs a model definition for this laptop."),
             mode))
@@ -1953,7 +1953,7 @@ class FansTab(QWidget):
             self.apply_btns[which] = apply_btn
             self.reset_btns[which] = reset_btn
             self.pending_labels[which] = pending
-            # One warning label per canvas, stored directly - the old code
+            # One warning label per canvas, stored directly; the old code
             # kept a shared self.warn that ended up pointing at whichever
             # fan was built last.
             warn = QLabel("")
@@ -2046,7 +2046,7 @@ class FansTab(QWidget):
             # meaningful share of users, and an invisible warning is no
             # warning at all.  Text colour is derived from the badge
             # background rather than assumed white.
-            warn.setText(f"✗ {e} - Apply is disabled until this is fixed")
+            warn.setText(f"✗ {e}: Apply is disabled until this is fixed")
             warn.setStyleSheet(notice_style(COL_CRIT, COL_CRIT))
             warn.setVisible(True)
             return False
@@ -2067,7 +2067,7 @@ class FansTab(QWidget):
         elif not online:
             btn.setToolTip("the daemon is offline, so nothing can be written")
         elif not dirty:
-            btn.setToolTip("no changes - edit the curve or a spin box first")
+            btn.setToolTip("no changes; edit the curve or a spin box first")
         elif not valid:
             btn.setToolTip("the curve is not valid yet")
         else:
@@ -2135,7 +2135,7 @@ class FansTab(QWidget):
             if got:
                 if self._unsaved[which]:
                     # The editor holds a change the EC has not got yet.  We
-                    # may only clear the flag when the EC now *agrees* - that
+                    # may only clear the flag when the EC now *agrees*: that
                     # is the read-back confirming the write.
                     if self._same_curve(self.curve_state[which], got):
                         self._unsaved[which] = False
@@ -2168,7 +2168,7 @@ class BatteryTab(QWidget):
         lay = page_layout(self)
 
         card = Card("Charge limit")
-        self.label = QLabel("-")
+        self.label = QLabel("?")
         self.label.setFont(ui_font(TYPE_H1, bold=True))
         self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
@@ -2213,7 +2213,7 @@ class BatteryTab(QWidget):
         row.addWidget(self.revert_btn)
         row.addWidget(self.apply_btn)
 
-        # "60% applied · 80% pending" - the difference between the slider
+        # "60% applied · 80% pending": the difference between the slider
         # and the hardware, stated rather than guessed.
         self.pending_label = QLabel("")
         self.pending_label.setWordWrap(True)
@@ -2233,13 +2233,13 @@ class BatteryTab(QWidget):
         card.box.addWidget(self.detail)
         card.box.addWidget(hint_label(
             "Charging stops at the limit and resumes when the battery dips "
-            "about 10% below it - keeping a laptop at 60-80% is the single "
+            "about 10% below it; keeping a laptop at 60-80% is the single "
             "biggest thing you can do for long-term battery health.  "
             "Choose a value, then press Apply.", card))
         lay.addWidget(card)
 
         info = Card("Battery")
-        self.info = QLabel("-")
+        self.info = QLabel("?")
         self.info.setWordWrap(True)
         self.info.setFont(ui_font(TYPE_BODY))
         info.box.addWidget(self.info)
@@ -2254,7 +2254,7 @@ class BatteryTab(QWidget):
 
         An unreadable threshold (`_applied is None`) counts as *dirty*, not
         as "nothing to do".  The driver returns -ENODATA when the charge byte
-        reads 0, which is this machine's genuine unset boot state - so the
+        reads 0, which is this machine's genuine unset boot state, so the
         old `is not None` guard left Apply permanently disabled on a fresh
         boot, in precisely the situation where the limit most needs setting.
         """
@@ -2281,10 +2281,10 @@ class BatteryTab(QWidget):
         # nothing pending it reads as the disabled state it is.
         self.apply_btn.setText(f"Apply {val}%" if dirty else "Apply")
         # The buttons must not be the only thing telling you it is unsafe to
-        # press Apply - say why when they are off.
+        # press Apply; say why when they are off.
         self.apply_btn.setToolTip(
             f"Write {val}% to the battery charge threshold" if (online and dirty)
-            else "Nothing pending - move the slider first" if online else
+            else "Nothing pending; move the slider first" if online else
             "The daemon is not running, so nothing can be written")
 
         if not self._loaded:
@@ -2299,7 +2299,7 @@ class BatteryTab(QWidget):
             self.pending_label.setStyleSheet(f"color:{THEME['accent']}")
             self.pending_label.setVisible(True)
         else:
-            self.pending_label.setText(f"{val}% applied - no pending change")
+            self.pending_label.setText(f"{val}% applied, no pending change")
             self.pending_label.setStyleSheet(f"color:{muted_color(self)}")
             self.pending_label.setVisible(True)
 
@@ -2322,7 +2322,7 @@ class BatteryTab(QWidget):
         self._sync_pending()
 
     def _preset(self, pct: int):
-        """Select a preset - deliberately does NOT apply it."""
+        """Select a preset; deliberately does NOT apply it."""
         self.slider.setValue(pct)
         self._sync_pending()
 
@@ -2341,7 +2341,7 @@ class BatteryTab(QWidget):
         self._loaded = True
 
         # Adopt the EC's value, unless the user is mid-drag or still has an
-        # unapplied choice on screen - yanking the slider out from under
+        # unapplied choice on screen; yanking the slider out from under
         # them is how a user ends up applying a value they did not pick.
         if not slider_held and not had_pending:
             with QSignalBlockerSafe(self.slider):
@@ -2416,9 +2416,9 @@ class ProfilesTab(QWidget):
         right.box.addWidget(hint_label(
             "A profile stores performance mode, fan mode, cooler boost and "
             "both fan curves.  “factory” is captured from "
-            "the EC on first start - apply it to return to exactly what the "
+            "the EC on first start; apply it to return to exactly what the "
             "laptop shipped with.\n\n"
-            "Applying one does not touch your charge limit - that is a "
+            "Applying one does not touch your charge limit; that is a "
             "battery choice, not a performance one.  Only the “battery” "
             "profile sets it (to 60%).", right))
         # Top-aligned so the card is only as tall as its contents: letting it
@@ -2486,7 +2486,7 @@ class ProfilesTab(QWidget):
             for n in builtin:
                 it = QListWidgetItem(f"{n}  ·  built-in")
                 it.setData(Qt.ItemDataRole.UserRole, n)
-                it.setToolTip("shipped with the daemon - delete is refused")
+                it.setToolTip("shipped with the daemon; delete is refused")
                 self.listw.addItem(it)
             for n in saved:
                 it = QListWidgetItem(f"{n}  ·  saved")
@@ -2532,7 +2532,7 @@ class SettingsTab(QWidget):
         row.addStretch(1)
         card.box.addLayout(row)
         card.box.addWidget(hint_label(
-            "“Re-apply” pushes your persisted settings back into the EC - "
+            "“Re-apply” pushes your persisted settings back into the EC; "
             "useful after a suspend, when firmware sometimes resets it.  "
             "“Capture factory” snapshots the current EC state as the "
             "“factory” profile, once.", card))
@@ -2578,7 +2578,7 @@ class SettingsTab(QWidget):
         self.cfg_text.setFont(mono_font(TYPE_BODY))
         cfg.box.addWidget(self.cfg_text)
         cfg.box.addWidget(hint_label(
-            f"{core.config_path()} - edit by hand, the daemon re-reads it at "
+            f"{core.config_path()}: edit by hand, the daemon re-reads it at "
             "start-up.", cfg))
         lay.addWidget(cfg)
 
@@ -2611,13 +2611,13 @@ class SettingsTab(QWidget):
         row.addWidget(self.raw_write)
         row.addStretch(1)
         raw.box.addLayout(row)
-        self.raw_out = QLabel("-")
+        self.raw_out = QLabel("?")
         self.raw_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.raw_out.setFont(mono_font(TYPE_BODY))
         raw.box.addWidget(self.raw_out)
         raw.box.addWidget(hint_label(
             "Unvalidated EC access.  One wrong byte here can crash the "
-            "embedded controller and the machine with it - which is why it "
+            "embedded controller and the machine with it, which is why it "
             "is off unless AllowRaw is set in the config.", raw))
         lay.addWidget(raw)
         lay.addStretch(1)
@@ -2677,7 +2677,7 @@ class SettingsTab(QWidget):
                 f"·  {model.get('status')}")
         else:
             self._daemon_rows["Model"].setText(
-                "unrecognised - no model file matches this laptop")
+                "unrecognised: no model file matches this laptop")
         errs = core.model_errors()
         if errs:
             self._daemon_rows["Model file"].setText(
@@ -2685,7 +2685,7 @@ class SettingsTab(QWidget):
                 + "; ".join(errs))
         else:
             self._daemon_rows["Model file"].setText(
-                core.MODEL.source or f"none - registry: {core.models_dir()}")
+                core.MODEL.source or f"none; registry: {core.models_dir()}")
         self._daemon_rows["Socket"].setText(core.sock_path())
         self._daemon_rows["Driver"].setText(
             (f"loaded · {drv.get('fw')}" if drv.get("present")
@@ -2711,7 +2711,7 @@ class SettingsTab(QWidget):
         # cap it so a future key cannot push the raw console off the tab.
         # Measured from the line count and the font, NOT from
         # QTextDocument.size(): an unshown document reports its (lazy, wrong)
-        # layout size - 8 px for an eight-line dump - which is how the box
+        # layout size, 8 px for an eight-line dump, which is how the box
         # ended up one line tall with a scrollbar behind it.
         fm = self.cfg_text.fontMetrics()
         lines = max(1, self.cfg_text.document().blockCount())
@@ -2721,11 +2721,11 @@ class SettingsTab(QWidget):
         elif not self.win.online:
             note, enabled = "raw access allowed, but the daemon is offline", False
         else:
-            note, enabled = "raw access is ENABLED - be careful", True
+            note, enabled = "raw access is ENABLED; be careful", True
         self.allow_raw.setText(note)
         self.allow_raw.setStyleSheet(
             f"color:{COL_WARM}" if enabled else f"color:{muted_color(self)}")
-        # The two raw fields directly - no findChildren walk over widgets
+        # The two raw fields directly: no findChildren walk over widgets
         # we already hold by name.
         for w in (self.raw_addr, self.raw_val,
                   self.raw_read, self.raw_write):
@@ -2734,7 +2734,7 @@ class SettingsTab(QWidget):
 
 
 # --------------------------------------------------------------------------
-# chrome - header, connection pill, offline banner, sidebar, nav stack
+# chrome: header, connection pill, offline banner, sidebar, nav stack
 # --------------------------------------------------------------------------
 
 class NavStack(QStackedWidget):
@@ -2813,7 +2813,7 @@ class Header(QWidget):
                                                  THEME["text_dim"])))
         self.quit_btn.setIconSize(QSize(ICON_SM, ICON_SM))
         self.quit_btn.setToolTip("Quit MSI Linux Control (Ctrl+Q)")
-        # Quit for real, and save the window state on the way out - plain
+        # Quit for real, and save the window state on the way out: plain
         # QApplication.quit() exits the loop without a closeEvent, so it
         # would drop the geometry/tab this app deliberately remembers.
         self.quit_btn.clicked.connect(self.win.quit_app)
@@ -2835,7 +2835,7 @@ class Header(QWidget):
         self.pill.setToolTip(
             "The msi-controld daemon is answering" if online else
             "Waiting for the daemon's first reply" if online is None else
-            "The daemon is not reachable - the app is read-only")
+            "The daemon is not reachable; the app is read-only")
 
 
 class Banner(QFrame):
@@ -2855,7 +2855,7 @@ class Banner(QFrame):
         icon = QLabel()
         icon.setPixmap(glyph_pixmap("warn", ICON_SM, text_on(COL_CRIT)))
         text = QLabel(
-            "The msi-controld daemon is not reachable - every reading below is "
+            "The msi-controld daemon is not reachable; every reading below is "
             "read-only and no setting can be written.  Start it with "
             "<code>sudo systemctl start msi-controld</code>.")
         text.setWordWrap(True)
@@ -2873,7 +2873,7 @@ class ModelBanner(QFrame):
     Shown when the registry matched nothing, which is a *supported* state, not
     an error: everything the msi-ec driver exposes already works.  Amber, so
     it reads as a caveat next to the red daemon-offline banner rather than as
-    a second failure - and it names the two things that are off and the one
+    a second failure, and it names the two things that are off and the one
     command that fixes it, rather than leaving a greyed-out control to be
     guessed at.
     """
@@ -2922,7 +2922,7 @@ class Sidebar(QWidget):
             b.setCheckable(True)
             b.setProperty("nav", True)
             # 16 px, the same as every other icon in the app, and no taller
-            # than a line of text - an 18 px icon made a nav row taller than
+            # than a line of text; an 18 px icon made a nav row taller than
             # the buttons it sits level with.
             b.setIconSize(QSize(ICON_SM, ICON_SM))
             b.setIcon(nav_icon(glyph, ICON_SM))
@@ -3032,8 +3032,8 @@ class MainWindow(QMainWindow):
         sb = QStatusBar()
         sb.setSizeGripEnabled(False)
         # What we are talking to lives here permanently.  This used to be
-        # pushed as a *transient* message on every poll - and the poll is
-        # 1.5 s - so an action's confirmation ("shift → turbo") was wiped off
+        # pushed as a *transient* message on every poll (and the poll is
+        # 1.5 s), so an action's confirmation ("shift → turbo") was wiped off
         # the bar within a second and a half of appearing, and a slow reply
         # never showed at all.
         self.status_info = QLabel("connecting…")
@@ -3097,7 +3097,7 @@ class MainWindow(QMainWindow):
         """Report an outcome.  Status bar always; desktop notification only
         for failures.
 
-        Notifying on every success is noise the user learns to ignore - and
+        Notifying on every success is noise the user learns to ignore, and
         a tray balloon for "shift eco" is not worth interrupting them for.
         A failure, on the other hand, is exactly what a notification is for:
         the window may well be hidden behind the game that just spiked the
@@ -3105,7 +3105,7 @@ class MainWindow(QMainWindow):
         """
         self.statusBar().showMessage(text, 8000)
         if not ok and self.tray:
-            self.tray.showMessage("MSI Linux Control - failed", text,
+            self.tray.showMessage("MSI Linux Control: failed", text,
                                   QSystemTrayIcon.Warning)
 
     def set_key(self, key: str, value):
@@ -3128,12 +3128,12 @@ class MainWindow(QMainWindow):
             if "error" in msg:
                 # degraded: read what we can locally, say so, keep trying.
                 # The reason goes to the permanent readout rather than a
-                # transient message, so it is still visible ten seconds later
-                # - which is when you actually look for it.
+                # transient message, so it is still visible ten seconds later,
+                # which is when you actually look for it.
                 self.online = False
                 st = core.local_status()
                 self._refresh(st,
-                              note=f"offline - read-only ({msg['error'][:60]})")
+                              note=f"offline, read-only ({msg['error'][:60]})")
                 return
             self.online = True
             self._refresh(msg["data"])
@@ -3148,7 +3148,7 @@ class MainWindow(QMainWindow):
 
         # anything else was an action.  The daemon reads every setting back
         # before and after writing it, so its `summary` describes the
-        # hardware rather than our intention - use it verbatim.
+        # hardware rather than our intention; use it verbatim.
         data = msg.get("data") or {}
         if "error" in msg:
             self.flash(f"✗ {msg['error']}", ok=False)
@@ -3175,7 +3175,7 @@ class MainWindow(QMainWindow):
         its `activity` describes the hardware, not our intention.  It is
         phrased as what the person just did ("Set charge limit to 80%",
         "Enabled cooler boost"), which is what a status bar or a tray
-        balloon should say - the `a -> b` diff form stays available for
+        balloon should say; the `a -> b` diff form stays available for
         --json consumers but is the wrong shape for a notification.
         """
         activity = data.get("activity")
@@ -3197,10 +3197,10 @@ class MainWindow(QMainWindow):
                         action, action or "")
             msg = f"{what} profile {name}"
             # A profile apply that changed nothing must not read as if the
-            # hardware moved - the daemon tells us via `changes`.
+            # hardware moved; the daemon tells us via `changes`.
             if action == "apply" and data.get("changes") is not None \
                     and not data["changes"]:
-                msg += " - nothing to change"
+                msg += " (nothing to change)"
             return msg
         if kind == "reapply":
             return "Re-applied settings"
@@ -3209,7 +3209,7 @@ class MainWindow(QMainWindow):
             # nothing, and claiming it captured again would be a lie.
             return {
                 "captured": "Captured factory profile",
-                "exists": "Factory profile already captured - nothing changed",
+                "exists": "Factory profile already captured; nothing changed",
                 "unsupported": "This laptop has no fan-curve registers to "
                                "capture",
                 "failed": "Could not capture the factory profile",
@@ -3225,7 +3225,7 @@ class MainWindow(QMainWindow):
         # answer and the reason why.
         self._conn_note = note or self._conn_note_of(st)
         # Cache the factory profile body once, so the fans tab can draw it as
-        # a ghost under the editable curve.  "show" is read-only - never
+        # a ghost under the editable curve.  "show" is read-only, never
         # "apply", which would push settings into the EC as a side effect.
         profs = st.get("profiles") or {}
         if "factory" in (profs.get("saved") or []) \
@@ -3243,7 +3243,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _conn_note_of(st: dict) -> str:
-        """One line naming what we are talking to - the status bar's right
+        """One line naming what we are talking to: the status bar's right
         hand side, where it stays instead of being overwritten every poll."""
         drv = st.get("driver") or {}
         return " · ".join(x for x in (
@@ -3305,13 +3305,13 @@ class MainWindow(QMainWindow):
         self._qs.sync()
 
     def quit_app(self):
-        """Quit for real - Ctrl+Q and the header's Quit both come here.
+        """Quit for real: Ctrl+Q and the header's Quit both come here.
 
         `close()` alone would only *hide* the window while a system tray is
         available (see closeEvent), which is right for the window's X button
         but wrong for a control labelled "Quit".  Saving here as well,
         because QApplication.quit() leaves the event loop without ever
-        delivering a closeEvent - so without this the geometry and the open
+        delivering a closeEvent, so without this the geometry and the open
         section would be forgotten by exactly the button that promises to
         leave.
         """
@@ -3331,7 +3331,7 @@ class MainWindow(QMainWindow):
             ev.ignore()
             return
         # A real quit: remember where the window was and which section was
-        # open.  Deliberately not done on the hide path above - saving there
+        # open.  Deliberately not done on the hide path above; saving there
         # would persist a hidden window and a section the user never chose
         # to leave.
         self._save_window_state()

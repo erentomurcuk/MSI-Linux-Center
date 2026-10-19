@@ -30,7 +30,7 @@ import time
 
 EC = "/sys/devices/platform/msi-ec/debug"
 # The driver's own constant, imported rather than re-typed.  This file used
-# to carry `N = 21300` while its comment claimed 478000 - every reading it
+# to carry `N = 21300` while its comment claimed 478000; every reading it
 # produced was ~22x too low, which is what produced the "RPM scale must be
 # wrong, ~90-360 RPM is implausible" entry in TODO.md.  The scale was never
 # wrong; the probe was.  With the real constant the same registers read
@@ -41,7 +41,7 @@ import msi_control as core                                # noqa: E402
 
 N = core.RPM_NUMERATOR
 
-CURVE = {  # which: (temps regs, speeds regs) - mirrors core.CURVE_REGS
+CURVE = {  # which: (temps regs, speeds regs); mirrors core.CURVE_REGS
     "cpu": (list(range(0x6A, 0x70)), list(range(0x72, 0x79))),
     "gpu": (list(range(0x82, 0x88)), list(range(0x8A, 0x91))),
 }
@@ -71,7 +71,7 @@ def period_of(a: int) -> int:
 
     Printed alongside every derived RPM on purpose.  The whole "the RPM
     scale must be wrong, ~90-360 RPM is implausible" detour in TODO.md came
-    from this file carrying N = 21300 instead of the driver's 478000 - a
+    from this file carrying N = 21300 instead of the driver's 478000, a
     ~22x error that is invisible when only the derived number is shown.  With
     the period printed too, a wrong constant is one division away from being
     obvious, and the raw data stays interpretable whatever the constant is.
@@ -133,7 +133,7 @@ def show(tag: str, r: dict, base: dict | None = None) -> None:
 
 def main() -> int:
     if not os.path.isdir(EC):
-        print("no EC debug interface - load msi-ec with debug=1", file=sys.stderr)
+        print("no EC debug interface; load msi-ec with debug=1", file=sys.stderr)
         return 1
 
     saved = {w: read_curve(w) for w in CURVE}

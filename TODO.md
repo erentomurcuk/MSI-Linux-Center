@@ -1,4 +1,4 @@
-# TODO - MSI Linux Control Center
+# TODO: MSI Linux Control Center
 
 Companion to [`APP_DETAILS.md`](APP_DETAILS.md), which holds all the context
 this list assumes. Status markers: `[x]` done · `[~]` deferred · `[ ]` open.
@@ -9,49 +9,49 @@ Last updated: 2026-10-18.
 
 ## Done
 
-- [x] **Research + design** - EC map cross-checked against isw, teackot's
+- [x] **Research + design**: EC map cross-checked against isw, teackot's
       msi-ec and the in-tree driver. Daemon + CLI + PySide6 GUI chosen.
-- [x] **All source written** - `msi_control.py`, `msi_controld.py`, `msi-control`,
+- [x] **All source written**: `msi_control.py`, `msi_controld.py`, `msi-control`,
       `msi-control-gui`.
-- [x] **Model-driven core + registry** - the laptop-specific facts moved out of
+- [x] **Model-driven core + registry**: the laptop-specific facts moved out of
       the code into `models/<id>/model.json`; 138 offline tests passing. See
       *Done in the 2026-10-18 rename + model pass* below.
-- [x] **138 offline tests passing** - `python3 tests/test_msi_control.py`.
-- [x] **GUI smoke test with behaviour assertions** - contrast, the battery
+- [x] **138 offline tests passing**: `python3 tests/test_msi_control.py`.
+- [x] **GUI smoke test with behaviour assertions**: contrast, the battery
       state machine, the curve keyboard path, every confirmation's wording,
       the dashboard's numbers against their labels, and four MUX states. Since
       2026-10-17 it also pins the *invariants*: identical token keys in both
       themes, the model number in the same ink box in the shipped SVG and the
       painted mark, a glyph behind every nav row, the sidebar and the page
       stack being the same list, and one type scale across the tiles.
-- [x] **MSI rebrand, app icon and consistency pass** - see *Done in the
+- [x] **MSI rebrand, app icon and consistency pass**: see *Done in the
       2026-10-17* below (MSI-red accent, the centred-shield icon, the tray mark
       tinted by temperature, and the colour/type/spacing inconsistencies the
       first pass left behind).
-- [x] **Deployed to the desktop and verified live** - GUI + icon + `.desktop`
+- [x] **Deployed to the desktop and verified live**: GUI + icon + `.desktop`
       installed by three `install` calls from a single `pkexec` prompt, no
       daemon restart, md5-verified, GUI relaunched and screenshotted. See
       *Redeployed and re-verified* in Open for the recipe and the one gotcha
       (a replaced icon does not show in the menu until the shell re-reads it).
-- [x] **GUI smoke test passing** - renders one PNG per tab to `tests/shots/`.
-- [x] **Installed and verified on real hardware** - driver bound
+- [x] **GUI smoke test passing**: renders one PNG per tab to `tests/shots/`.
+- [x] **Installed and verified on real hardware**: driver bound
       (`16V1EMS1.118`, debug interface on), DKMS `msi-ec/0.13 installed`,
       `msi-controld` active, all 5 profiles apply correctly, `factory`
       captured honestly.
-- [x] **`verify.sh` reports ALL CHECKS PASSED** - every shift mode, fan mode,
+- [x] **`verify.sh` reports ALL CHECKS PASSED**: every shift mode, fan mode,
       cooler boost, charge threshold, fan-curve write-back round-trip.
 - [x] **Moved project** `~/msi-control` → `~/Projects/MSIControl` (later
       renamed in place to `~/Projects/MSI-Linux-Control`, 2026-10-18).
 - [x] **Moved hardware probes** out of `/tmp/opencode/` (wiped nightly) into
       `tools/`.
-- [x] **GUI/UX overhaul + repo preparation** - see *Done in the 2026-10-16
+- [x] **GUI/UX overhaul + repo preparation**: see *Done in the 2026-10-16
       UI/UX overhaul* below (theme system, sidebar shell, offline banner, the
       fan-curve poll-clobber fix, and the repo files: `Makefile`, `.gitignore`,
       `.editorconfig`, `CONTRIBUTING.md`, `CHANGELOG.md`, `etc/config.json`).
 - [x] **Fan line off the temperature cards, tray ink options, and the em-dash
-      sweep** - see *Done in the 2026-10-18 polish pass* below.
+      sweep**: see *Done in the 2026-10-18 polish pass* below.
 
-### Bugs found and fixed along the way - do not reintroduce
+### Bugs found and fixed along the way (do not reintroduce)
 
 - pkexec relative-path failure → `SELF="$(readlink -f "${BASH_SOURCE[0]}")"`.
 - `ModuleNotFoundError: msi_control` in the *installed* CLI/GUI → added
@@ -65,23 +65,23 @@ Last updated: 2026-10-18.
   `QPointF` import, dead imports, unreadable Cooler Boost styling, `--json`
   only accepted before the subcommand, GUI factory-ghost used read-write
   `apply` → switched to read-only `show`.
-- Earlier `Mode unspecified` / `Limit 0%` readings were **not** bugs - they
+- Earlier `Mode unspecified` / `Limit 0%` readings were **not** bugs: they
   were the EC's genuine unset boot state. Writes work correctly.
 
 ---
 
 ## Deferred
 
-### [~] Third fan support - *the register is unidentified, so it is not exposed*
+### [~] Third fan support: *the register is unidentified, so it is not exposed*
 
 The GS66 Stealth has **3 fans** (1 CPU + 2 GPU side); LibreHardwareMonitor
 reports `GS66 Stealth 10SG: 3`. The driver only models `cpu` + `gpu`.
 
-**Settled 2026-10-16 - `0xc8` is not a fan, and the earlier note was wrong.**
+**Settled 2026-10-16: `0xc8` is not a fan, and the earlier note was wrong.**
 
 An earlier probe concluded "`0xc8` never moves", which was a
 **period-versus-RPM misreading**: the recorded values (87-91) were raw 16-bit
-*periods*, and `478000 // 87` is ~5500 RPM - a number nobody stopped to
+*periods*, and `478000 // 87` is ~5500 RPM, a number nobody stopped to
 interpret. Sampled properly, `0xc8` oscillates 1889→2069 RPM continuously.
 
 But it is still not a fan. The decisive test is Cooler Boost:
@@ -98,11 +98,11 @@ two fans and contains **no** mention of `fan3`, `sys_fan` or any third
 tachometer, so there is nothing to model it against either.
 
 **Decision: no third-fan reading is shipped.** An unidentified register
-rendered as a fan would be a guess wearing a fact's clothes - the same reason
+rendered as a fan would be a guess wearing a fact's clothes, the same reason
 `temp_band` is shared rather than reimplemented per widget. Re-opening this
 needs one of:
 
-1. a byte-level scan (`tools/scan_ec.py`, **never yet run** - needs root) that
+1. a byte-level scan (`tools/scan_ec.py`, **never yet run**, needs root) that
    finds a *pair* which drifts on its own **and** responds to a fan control;
 2. an MSI service manual or EC disassembly naming the address;
 3. `nvidia-smi -q -d FAN` (or another independent readback) agreeing with a
@@ -122,7 +122,7 @@ pkexec env PATH=/usr/local/bin:/usr/bin:/bin python3 tools/fanprobe.py
 pkexec env PATH=/usr/local/bin:/usr/bin:/bin python3 tools/scan_ec.py
 ```
 
-The `env PATH=…` prefix is **mandatory** - pkexec sanitises `PATH` and drops
+The `env PATH=…` prefix is **mandatory**: pkexec sanitises `PATH` and drops
 `/usr/local/bin`, so the script dies with `FileNotFoundError: msi-control`.
 Both restore what they touch (fanprobe restores the original curves;
 scan_ec only toggles the Cooler Boost bit).
@@ -137,7 +137,7 @@ tree was full of em-dashes. 142 offline tests + the GUI smoke suite green, both
 theme screenshot sets regenerated.
 
 ### [x] The temperature cards no longer repeat the fan duty
-- The CPU and GPU cards carried `fan 48%` under the bar - the same number the
+- The CPU and GPU cards carried `fan 48%` under the bar, the same number the
   CPU-fan / GPU-fan cards beside them show as their value *and* name. Showing
   one reading twice made a temperature card read as a fan card, so the
   sub-line is gone; `StatCard.show()` now **hides** an empty sub-line rather
@@ -145,15 +145,15 @@ theme screenshot sets regenerated.
 - The bar and the band chip (`COOL` / `WARM` / `HOT` / `CRITICAL`) stay: they
   are the temperature's own encoding, not the fan's.
 
-### [x] The tray icon's ink is a choice - colour, white or black, or off
+### [x] The tray icon's ink is a choice: colour, white or black, or off
 - `temp_pixmap()` gained a `mode`: `"colour"` is the band tint with a
   contrast-colour number (the old behaviour), `"white"` and `"black"` are a
   flat monochrome shield for matching a light or a dark panel. The number is
   written in the opposite ink so it stays readable either way.
 - A new **Tray icon** card in Settings: a `Show the temperature on the tray
   icon` switch, and Colour / White / Black buttons. The preference is the
-  GUI's own, so it lives in `QSettings` beside the geometry - never in the
-  daemon config, which describes the EC, not this window - and it repaints the
+  GUI's own, so it lives in `QSettings` beside the geometry, never in the
+  daemon config, which describes the EC, not this window, and it repaints the
   tray immediately instead of waiting out the next 1.5 s poll.
 - With the number off the icon falls back to the plain brand mark, but the
   **tooltip still carries both temperatures**: it is the one place left to read
@@ -164,14 +164,17 @@ theme screenshot sets regenerated.
   the window instead of keeping a second copy. `check_tray_options` drives the
   write path and the reload, the same way the geometry check does.
 
-### [x] No em-dashes anywhere
-- Every em-dash (and the handful of en-dashes and Unicode minus signs, which
-  look like the same family) across the tracked text became a plain hyphen: 713
-  characters in 25 files, covering the docs, the source, the SVG comment and
-  the tests.
-- `third_party/msi-ec/` was untouched by construction - the sweep skips it, and
-  it held none to begin with - so the vendored driver stays upstream's byte for
-  byte.
+### [x] The prose was rewritten to need no em-dashes
+- The tracked text was rewritten so the prose never needs an em-dash: where a
+  dash once joined two clauses, the sentence now uses an ordinary comma, a
+  semicolon, a colon, a pair of parentheses or a full stop. The handful of
+  en-dashes and Unicode minus signs that looked like the same family were
+  re-punctuated the same way. 713 characters in 25 files, covering the docs,
+  the source, the SVG comment and the tests.
+- No em-dash, en-dash or Unicode minus sign survives anywhere in the tree, and
+  nothing was swapped one-for-one.
+- `third_party/msi-ec/` was left untouched: the rewrite only covers our own
+  text, so the vendored driver stays upstream's byte for byte.
 - Both theme screenshot sets were regenerated, because the change reaches text
   the GUI draws (the shift-mode hint and the dashboard's sub-lines among them).
 
@@ -185,7 +188,7 @@ the GUI smoke suite green. No live install was performed from the agent session
 (it needs root); the findings are fixed and the deploy command is in
 *Housekeeping*.
 
-### [x] One daemon per EC - the upgrade path could have broken this
+### [x] One daemon per EC: the upgrade path could have broken this
 - The real find. `install.sh` did not know about the old **GS66 Center** install:
   an already-running `gs66-centerd` and the new `msi-controld` would both hold
   the embedded controller open through the same driver. Two writers is exactly
@@ -194,11 +197,11 @@ the GUI smoke suite green. No live install was performed from the agent session
   disables it, removes its unit, binaries, desktop entry, icon, doc dir and
   sleep hook, then **copies `/etc/gs66-center/config.json` and
   `/var/lib/gs66-center/{last.json,profiles/}`** into the new locations before
-  anything is overwritten - so the person's charge limit, saved profiles and
+  anything is overwritten, so the person's charge limit, saved profiles and
   captured factory curve survive the rename.
 
 ### [x] Ctrl+Q hid the window instead of quitting
-- While a system tray is available, `closeEvent` hides the window - right for
+- While a system tray is available, `closeEvent` hides the window, right for
   the X button, wrong for a control labelled **Quit**. `Ctrl+Q` and the header
   Quit now call a real `quit_app()`.
 - The header's Quit called `QApplication.quit()` directly, which skips
@@ -233,33 +236,33 @@ The app stopped being "GS66 Center" and became **MSI Linux Control**: renamed,
 generalised to any MSI laptop through a model registry, and documented so the
 next person (or agent) can add their own model.
 
-- [x] **Renamed** - `GS66 Center` → `MSI Linux Control`; CLI `msi-control`, GUI
+- [x] **Renamed**: `GS66 Center` → `MSI Linux Control`; CLI `msi-control`, GUI
       `msi-control-gui`, daemon/service `msi-controld`, socket
       `/run/msi-controld.sock`, config `/etc/msi-control/`, state
       `/var/lib/msi-control/`, environment `MSI_*`. The daemon module is
       `src/msi_controld.py` (underscore) so it stays importable. The hardware's
       own name (GS66 Stealth 10SE, 16V1EMS1) is a fact and was **not** renamed;
       neither was anything in `third_party/msi-ec/`.
-- [x] **Model registry** - `models/<id>/model.json` holds `match`, `ec`,
+- [x] **Model registry**: `models/<id>/model.json` holds `match`, `ec`,
       `charge`, `features` and `profiles`; loaded and validated at import, scored
       against DMI + EC firmware, highest score wins.
-- [x] **Unsupported mode** - no matching model is a working state: the driver-
+- [x] **Unsupported mode**: no matching model is a working state. The driver-
       provided features keep working, and fan curves / RPM / MUX are refused with
       `NotSupported` instead of guessed. The GUI shows an amber banner, a
       read-only Fans tab and the model in Settings.
-- [x] **`msi-control detect`** - `--json`, `--write DIR` (a valid draft model) and
+- [x] **`msi-control detect`**: `--json`, `--write DIR` (a valid draft model) and
       `--ec-dump` (the 256-register map). Needs no root and no daemon.
-- [x] **GS66 profile** - `models/gs66-stealth-10se/` with `model.json` and a
+- [x] **GS66 profile**: `models/gs66-stealth-10se/` with `model.json` and a
       README recording where every address came from and what was confirmed on
       hardware.
-- [x] **Tux on the shield** - `brand_pixmap()` draws the mark from one unit-box
+- [x] **Tux on the shield**: `brand_pixmap()` draws the mark from one unit-box
       description (black body, white belly/face, orange beak/feet) and
       `icons/msi-control.svg` mirrors it; the smoke test compares them. The tray
       copy stays the plain tinted shield + number.
-- [x] **Docs for contributors and agents** - new `AGENTS.md` (the procedure),
+- [x] **Docs for contributors and agents**: new `AGENTS.md` (the procedure),
       a rewritten `CONTRIBUTING.md` ("Adding your model" + PR flow),
       `models/README.md` (the format, field by field) and a model README.
-- [x] **138 offline tests** - added `TestRegistry`, `TestModelSelection`,
+- [x] **138 offline tests.** Added `TestRegistry`, `TestModelSelection`,
       `TestDetectAndDraft` and `TestUnsupportedModelGating`.
 
 ---
@@ -273,7 +276,7 @@ untouched; 114 offline tests + the GUI smoke suite green.
 
 By-hand rollback point: `~/backup-pre-ui-overhaul-20261017-112844/`.
 
-### [x] The app mark - a centred red shield, and nothing else
+### [x] The app mark: a centred red shield, and nothing else
 
 - `icons/msi-control.svg` is the installed icon (`install.sh` puts it in the
   menu entry and `hicolor/scalable`), and the GUI paints the **same** shield for
@@ -283,19 +286,19 @@ By-hand rollback point: `~/backup-pre-ui-overhaul-20261017-112844/`.
 - The first cut of this pass drew MSI's badge literally (dark rounded tile,
   shield, `66`); the user's verdict was *"just make it a centered red shield.
   Thats enough."* The tile and the lettering are gone and the shield is drawn as
-  large as the canvas allows - which is also the variant that still reads as a
+  large as the canvas allows, which is also the variant that still reads as a
   mark at the 16-22 px a taskbar and a menu entry actually render.
 - **The tray mark is tinted by the hottest reading** and carries that number;
   it was a plain coloured circle, which shared nothing with the app's identity.
   It is the only mark that carries text, and `tray_digit_font()` sizes the digits
   off the label because `100` at the two-digit size is wider than the badge.
-  The ink is now a user choice (colour / white / black, or no reading at all) -
+  The ink is now a user choice (colour / white / black, or no reading at all),
   see *Done in the 2026-10-18 polish pass*.
 
 ### [x] MSI colours, and one meaning per colour
 
 - Accent → MSI red (dark `#e2231a` / `#ff4a3d`, light `#c8102e` / `#a30d25`).
-  The green→amber→orange→red band stays exactly as it was: it is temperature -
+  The green→amber→orange→red band stays exactly as it was: it is temperature
   status, not chrome.
 - **The accent is the only "selected / this is your value" colour.** Three
   contradictions fixed:
@@ -306,7 +309,7 @@ By-hand rollback point: `~/backup-pre-ui-overhaul-20261017-112844/`.
     amber "not charging" on AC, accent otherwise. The sub-line is now
     `AC · health 91% · limit 60%`.
   * The **fan curve** is drawn in the accent with the live position marked in
-    its temperature colour and labelled - the curve itself used to be tinted by
+    its temperature colour and labelled. The curve itself used to be tinted by
     the live temperature, so an untouched curve changed colour minute to minute.
 - The **offline banner and the offline pill share one colour** (they used
   `COL_HOT` and `COL_CRIT`).
@@ -314,7 +317,7 @@ By-hand rollback point: `~/backup-pre-ui-overhaul-20261017-112844/`.
 ### [x] Consistency sweep
 
 - `page_layout()` for all six pages; `kv_row()` for every label/value row
-  (Dashboard Right now + System, Performance graphics state, Settings daemon) -
+  (Dashboard Right now + System, Performance graphics state, Settings daemon);
   hand-built rows are how their values had drifted to different weights. The
   value label carries the stretch; a trailing `addStretch(1)` hands a wrapping
   label its minimum width and breaks short strings across two lines.
@@ -328,13 +331,13 @@ By-hand rollback point: `~/backup-pre-ui-overhaul-20261017-112844/`.
 - **The profiles list and the config box gained a `:focus` border.** Every other
   field already had hover/focus/disabled states; those two had hover and
   nothing else, so tabbing into them gave no cue.
-- **`set_chip()` clears the style as well as the text when it hides a chip** - a
+- **`set_chip()` clears the style as well as the text when it hides a chip**: a
   hidden chip that keeps the last colour is a surprise for the next caller.
 
-### [x] 🔴 The painted mark and the shipped icon had drifted - FIXED, then superseded
+### [x] 🔴 The painted mark and the shipped icon had drifted: FIXED, then superseded
 
 `brand_pixmap()` put `66` with glyph centre at **0.575** of the tile; the SVG
-put it at **0.479** - twelve pixels apart at 128 px. Side by side they clearly
+put it at **0.479**, twelve pixels apart at 128 px. Side by side they clearly
 disagreed; in any screenshot of one of them it looked perfect. The fix brought
 the SVG's size and baseline onto the painted mark's numbers, and
 `check_brand_mark` rasterises both and compares the ink boxes, so they cannot
@@ -343,7 +346,7 @@ was proven to guard something. **The `66` and the tile are gone now** (see the
 mark section above); the check outlived them cleanly because it compares the
 *shield's* ink box against `MARK_BOX` rather than a glyph.
 
-### [x] 🔴 The status bar erased every confirmation - FIXED
+### [x] 🔴 The status bar erased every confirmation: FIXED
 
 The daemon's `connected · fw …` line was pushed with `showMessage(…, 2500)` on
 **every poll**, and the poll is 1.5 s: an action's "Set charge limit to 80%"
@@ -369,7 +372,7 @@ is a **decision** (a state, not a reading), so it is pinned.
 ### [x] Both themes re-screenshotted
 
 `tests/shots/` (dark) and `tests/shots/light/` regenerated from the smoke run.
-The Makefile gained **`make shots-light`** - regenerating the light set was a
+The Makefile gained **`make shots-light`**; regenerating the light set was a
 documented-but-unmemorable incantation, which is how a checked-in screenshot set
 goes stale.
 
@@ -381,14 +384,14 @@ The GUI was rebuilt (`src/msi-control-gui`, ~2 700 lines) around one token set p
 theme and a sidebar + stacked-page shell. The daemon protocol is untouched and
 both suites stay green.
 
-### [x] A real theme system - light and dark
+### [x] A real theme system: light and dark
 
 * **One token set per theme**, fed into a `QPalette` and one application
   stylesheet. Choice order: `MSI_THEME=light|dark` → the desktop's colour
   scheme → **dark** when the platform reports *Unknown* (an offscreen test run
   reports exactly that, so headless screenshots are deterministic).
 * `apply_theme(app)` is called from **both** `MainWindow.__init__` and
-  `main()` - the smoke test never calls `main()`, so the `__init__` call is the
+  `main()`; the smoke test never calls `main()`, so the `__init__` call is the
   one that runs there.
 * Font sizes live in code (`setFont`), never QSS: a QSS `font-size` overrides
   `setFont`, which is a quietly reliable way to get inconsistent type.
@@ -397,22 +400,22 @@ both suites stay green.
 
 ### [x] Navigation, header, banner, shortcuts
 
-* `Sidebar` (208 px, runtime-painted glyph icons - no icon-theme dependency) +
+* `Sidebar` (208 px, runtime-painted glyph icons, no icon-theme dependency) +
   `NavStack`. `NavStack` keeps the `addTab`/`count`/`currentIndex`/`tabText`
   surface, so the smoke test and the geometry/tab persistence were not touched
   by the move off `QTabWidget`.
 * `Header` with a tri-state connection pill (`connecting…` / `daemon online` /
   `daemon offline`), Refresh, Quit.
-* `Banner` - appears **only** when the daemon is unreachable, and says plainly
+* `Banner`: appears **only** when the daemon is unreachable, and says plainly
   that every reading is read-only and how to start the daemon.
 * `Ctrl+1…6` navigate, `Ctrl+R` refresh, `Ctrl+Q` quit.
 * Every page is wrapped in a scroll area, so a short window scrolls instead of
   clipping.
 
-### [x] 🔴 Fan-curve edits were lost on the next poll - FIXED
+### [x] 🔴 Fan-curve edits were lost on the next poll: FIXED
 
 `FansTab.refresh()` adopted the EC's curve on every 1.5 s poll, so a point you
-had just dragged was overwritten before Apply - the edit simply vanished.
+had just dragged was overwritten before Apply; the edit simply vanished.
 
 * An `_unsaved` flag per fan; `_canvas_changed`/`_spin_changed`/`_load_ghost`
   set it, `refresh()` only adopts the EC curve while it is clear, and the flag
@@ -429,7 +432,7 @@ had just dragged was overwritten before Apply - the edit simply vanished.
   two config flags), with a trailing stretch so no card is left tall and empty.
 * Profiles: `QListWidget` + a top-aligned detail card; selection survives a
   poll.
-* Settings: the config box no longer keeps a scrollbar at six keys - the height
+* Settings: the config box no longer keeps a scrollbar at six keys; the height
   is computed from the font metrics and capped (the old
   `QTextDocument.adjustSize()` returned 8 px for 8 lines).
 
@@ -437,7 +440,7 @@ had just dragged was overwritten before Apply - the edit simply vanished.
 
 * **The curve canvas could draw a legal point off its own edge.**
   `CurveCanvas.TMIN` was a hardcoded `20` while the EC accepts
-  `core.TEMP_MIN = 10`, so a keyboard step could move point 0 to 10 °C - left
+  `core.TEMP_MIN = 10`, so a keyboard step could move point 0 to 10 °C, left
   of the plot, where the handle vanished and the mouse could no longer reach
   the value the spin box showed. The axes now derive from
   `core.TEMP_MIN/MAX` and `core.SPEED_MIN/MAX`, and `check_curve_keyboard`
@@ -450,15 +453,15 @@ had just dragged was overwritten before Apply - the edit simply vanished.
 
 Added the files a repo needs, **without** running `git init`:
 
-* `.gitignore` - bytecode, DKMS/kernel build output, and the scratch
+* `.gitignore`: bytecode, DKMS/kernel build output, and the scratch
   `_xdg_config` a smoke run parks under `tests/shots/`.
-* `.editorconfig` - LF, UTF-8, 4-space Python, tabs for the Makefile.
-* `Makefile` - `make check` (compile + tests + smoke), plus `test`, `smoke`,
+* `.editorconfig`: LF, UTF-8, 4-space Python, tabs for the Makefile.
+* `Makefile`: `make check` (compile + tests + smoke), plus `test`, `smoke`,
   `lint`, `verify`, `install`, `uninstall`, `clean`.
-* `CONTRIBUTING.md` - the one rule (the daemon owns every EC write), how to run
+* `CONTRIBUTING.md`: the one rule (the daemon owns every EC write), how to run
   the tests, the style, and the changelog convention.
-* `CHANGELOG.md` - dated passes, newest first, from the history in this file.
-* `etc/config.json` - the default config as a repo template, now installed by
+* `CHANGELOG.md`: dated passes, newest first, from the history in this file.
+* `etc/config.json`: the default config as a repo template, now installed by
   `install.sh` so the shipped and documented defaults cannot drift.
 
 ### [x] Both themes screenshotted
@@ -471,39 +474,39 @@ and the red pill.
 
 ## Done in the 2026-10-16 pass
 
-### [x] Graphics mode (MUX) switch - new
+### [x] Graphics mode (MUX) switch: new
 
 The user asked for this explicitly ("add MUX Switch for GPU, currently in only
-Nvidia mode"). The machine is genuinely in discrete mode - three independent
+Nvidia mode"). The machine is genuinely in discrete mode; three independent
 signals agree (EC `0x2e` = `0x5b`, UEFI `data[1]` = 1, no Intel display
 controller on the PCI bus).
 
 Full design, risk analysis and the three-source read model are documented in
-`README.md` § *Graphics mode - the MUX switch* and `APP_DETAILS.md` §3. What
+the *Graphics mode* section of `README.md` and in `APP_DETAILS.md` §3. What
 matters here:
 
 * Gated behind **`AllowMuxSwitch`** (default `false`) **and** `--yes` / a
   confirmation dialog. It can leave a laptop with no display, and MSI's own
   MUX model list excludes the 10th-gen MSI.
-* **Never automatic** - excluded from `RestoreLast`, `ReapplyOnResume` and
+* **Never automatic**: excluded from `RestoreLast`, `ReapplyOnResume` and
   every profile, with a comment on `snapshot()` saying why.
 * Backs the raw efivarfs image up to `/var/lib/msi-control/mux-backup.json`
   before writing; `graphics revert` puts it back byte for byte.
 * Read-modify-write of one bit, so the webcam bit beside it survives.
-* The write path itself is **unproven on this model** - it needs a reboot to
+* The write path itself is **unproven on this model**: it needs a reboot to
   test and the user should decide when to take that risk.
 
 ### [x] Bugs found in the review and fixed
 
 * 🔴 **Dashboard reported state of charge as battery health.** The tile divided
-  `energy_now / energy_full` and printed it as *"N% of new"* - so it announced
+  `energy_now / energy_full` and printed it as *"N% of new"*, so it announced
   "67% of new" directly beside a big **67%** and told you nothing about the
   battery. `BatteryTab` had always done it right
   (`energy_full / energy_full_design`); the dashboard did not. Now `health
   91%`, and `check_dashboard_facts` asserts the two numbers **cannot**
   coincide again.
 * 🔴 **`verify.sh` did not put the fan mode back.** It captured the original
-  shift mode and restored it, then hardcoded `fan auto` - so running the
+  shift mode and restored it, then hardcoded `fan auto`, so running the
   verifier silently moved anyone who had deliberately chosen `advanced` back
   onto the firmware default, in a script whose header promises *"nothing here
   leaves the machine in a state other than the one it found"*.
@@ -512,7 +515,7 @@ matters here:
   not track the number beside it. Now `RPM · fan 48%`.
 * **The mode buttons' selected state was too subtle** to read at a glance
   (`mark_checked()`).
-* **Settings showed only part of the config** - the daemon's `status()`
+* **Settings showed only part of the config**: the daemon's `status()`
   omitted `SocketGroup` and now omitted `AllowMuxSwitch` too. Both published.
 * **`msi-control profile show` printed compact JSON** while every other
   `--json` path indents. Now consistent.
@@ -521,7 +524,7 @@ matters here:
 
 ### [x] What was investigated and deliberately *not* changed
 
-* **No third fan.** See Deferred above - `0xc8` does not follow Cooler Boost
+* **No third fan.** See Deferred above: `0xc8` does not follow Cooler Boost
   and the driver maps two fans. Shipping it would have been a guess.
 * **`fan_pct` under Cooler Boost.** `0x71`/`0x89` stay at 70 while the fans
   run at ~8100 RPM. That is not a bug to fix; RPM is displayed next to it for
@@ -541,15 +544,15 @@ drag across the track silently reprogrammed the charger several times on the
 way to wherever you were aiming.
 
 * `Apply` / `Revert` buttons; enabled only when the slider differs from the
-  EC's value. The button names its own value - `Apply 80%` - instead of the
+  EC's value. The button names its own value, `Apply 80%`, instead of the
   bare `Apply` that made you check the slider first.
 * Presets (60/80/100) now **select only**; they never write.
 * `60% applied  ·  80% pending` states the difference explicitly, and
-  `N% applied - no pending change` when there is none.
+  `N% applied` with no pending change when there is none.
 * The big label is still built from the **EC's** value, so the UI cannot
   claim a limit that did not stick.
 * `refresh()` decides whether to adopt the EC value *before* updating
-  `_applied` - once it does, "the slider is behind the EC" is no longer
+  `_applied`; once it does, "the slider is behind the EC" is no longer
   observable, which was the subtle part.
 
 ### [x] "applied" notifications describe what changed
@@ -562,7 +565,7 @@ both before and after a write.
 * `describe_change()` / `diff_settings()` / `curve_points_changed()` live in
   `msi_control`, so the CLI and the GUI can never phrase the same event
   differently. Both render the daemon's `summary` verbatim.
-* `profile apply` returns a `changes` list - only the keys that actually
+* `profile apply` returns a `changes` list: only the keys that actually
   moved, plus `cpu curve (3 points)`. A setting the profile never mentions
   is left out rather than reported as "unchanged".
 * The no-op is honest: `performance already eco`, `applied gaming: nothing
@@ -577,7 +580,7 @@ both before and after a write.
 * **`muted_color()`** derives secondary text from the live palette (blend
   0.6 fg → 0.4 bg) instead of the hardcoded `rgba(160,160,160,1)`, which was
   near-invisible on a light background. Verified ~4.0:1 light, ~5.5:1 dark.
-* **`CurveCanvas` is keyboard-operable** - `StrongFocus`, arrows to move a
+* **`CurveCanvas` is keyboard-operable**: `StrongFocus`, arrows to move a
   point, Alt+arrows to walk the selection, Shift for the coarse step. Mouse
   and keyboard share one `_set_point()` clamp, so neither can produce a
   curve the user cannot Apply. The selected point gets a focus ring, since a
@@ -591,7 +594,7 @@ both before and after a write.
 * **`QSignalBlockerSafe`** moved above the first class that uses it.
 * **Notifications:** status bar for routine outcomes, tray balloon **only**
   for failures. A balloon for "shift eco" is noise people learn to ignore.
-* Deleting a profile now asks - the one irreversible action in that tab.
+* Deleting a profile now asks; it is the one irreversible action in that tab.
 * pyflakes clean over `src/` and `tests/`.
 
 ### [x] Small correctness fixes found along the way
@@ -620,13 +623,13 @@ Oct 14 22:32:54  msi-controld: applied profile balanced: charge limit 60% -> 100
 Fixed at the **table**, not in the apply path: `_apply_profile_dict` already
 skipped an absent/`None` `charge_end`, so the three performance profiles now
 simply omit the key. The rule is uniform and documented in
-`BUILTIN_PROFILES` - **a profile that does not mention a charge limit does not
-touch one** - and `battery` keeps `charge_end: 60`, because battery
+`BUILTIN_PROFILES`: **a profile that does not mention a charge limit does not
+touch one**, and `battery` keeps `charge_end: 60`, because battery
 preservation is that profile's entire purpose. `RestoreLast` is unaffected:
 `last.json` *does* carry the limit, so a reboot still restores it.
 
 * `test_performance_profiles_leave_the_charge_limit_alone` sets the machine to
-  80%, applies all three, and asserts the limit is still 80% - in the EC
+  80%, applies all three, and asserts the limit is still 80%, in the EC
   **and** in both the `changes` and `activities` confirmations, because the
   message has to agree with the hardware.
 * `test_only_battery_carries_a_charge_end` pins the shape of the table. "The
@@ -641,7 +644,7 @@ preservation is that profile's entire purpose. `RestoreLast` is unaffected:
 
 ### [ ] Graphics-mode write is unproven on this model
 
-Everything about the MUX is verified **except the write itself** - reading it
+Everything about the MUX is verified **except the write itself**: reading it
 is confirmed from three independent sources, the write path is
 reverse-engineered from a tool developed on a *different* MSI laptop, and
 testing it requires a reboot that can plausibly leave the machine with no
@@ -651,12 +654,12 @@ If they want to take it: switch, reboot, and check `msi-control graphics`
 reports `running now: Hybrid` (an Intel controller will appear on the PCI
 bus). Recovery is a firmware reset if it does not come back.
 
-### [x] Battery limit is at 60 - verified live, not just against a fake payload
+### [x] Battery limit is at 60, verified live, not just against a fake payload
 
 The user set the charge limit to **60%** themselves. Checked against the live
 daemon on 2026-10-17: the Battery tab shows the slider at 60, reads
 `Limit stop at 60%, start at 50%`, `Apply` is **disabled** and the line under it
-says `60% applied - no pending change`; `msi-control battery` agrees.
+says `60% applied` with no pending change; `msi-control battery` agrees.
 
 The GUI's reading and the CLI's reading of the same EC value are the two things
 that had to agree, and they do. The **restore** side is covered offline rather
@@ -665,9 +668,9 @@ applies all three performance profiles, asserts the limit is still 80% in the EC
 *and* in both confirmations), `test_only_battery_carries_a_charge_end`, and
 `RestoreLast` replaying `last.json`, which does carry the limit.
 
-### [x] Redeployed and re-verified - 2026-10-17
+### [x] Redeployed and re-verified, 2026-10-17
 
-The GUI rewritten in this pass needed to reach the desktop, and it did - without
+The GUI rewritten in this pass needed to reach the desktop, and it did, without
 touching the daemon:
 
 * **Minimal targeted install, one `pkexec` prompt, three files.** `src/msi-control-gui`
@@ -682,23 +685,23 @@ touching the daemon:
   the live Plasma Wayland session, and all six md5 pairs were verified equal.
 * ⚠️ **A replaced icon does not appear in the menu until the shell re-reads it.**
   After the install, `kiconfinder6 msi-control` already resolved to the new file
-  and the `ksycoca6` database had already been rebuilt - yet the launcher kept
+  and the `ksycoca6` database had already been rebuilt, yet the launcher kept
   painting the **old** dark tile with `66`, while the panel's task entry (whose
   icon comes from `setWindowIcon()`) was new immediately. A running Plasma caches
   the *rendered* pixmap in memory and nothing on disk invalidates it:
   **`systemctl --user restart plasma-plasmashell.service`** (or a re-login) is
   part of judging an icon change, and the launcher showed the new mark straight
   afterwards. Do not go hunting for a second icon file, a theme override or a bad
-  `Icon=` key - there is none. Qt re-registers the tray item with
+  `Icon=` key; there is none. Qt re-registers the tray item with
   `StatusNotifierWatcher` by itself, so the shell restart costs nothing.
 
 ```bash
 cd /home/eren/Projects/MSI-Linux-Control
 make check        # 138 offline + GUI smoke (also: make shots-light)
 
-# 1. deploy - installs only, so no DKMS rebuild and no daemon bounce.
+# 1. deploy: installs only, so no DKMS rebuild and no daemon bounce.
 #    NOTE the absolute paths (and --keep-cwd): pkexec runs PROGRAM in $HOME,
-#    so a bare `install src/...` cannot stat its source - see Housekeeping.
+#    so a bare `install src/...` cannot stat its source; see Housekeeping.
 R=/home/eren/Projects/MSI-Linux-Control
 pkexec bash -c "install -m 755 $R/src/msi-control-gui /usr/local/bin/msi-control-gui
                 install -m 644 $R/icons/msi-control.svg /usr/share/icons/hicolor/scalable/apps/
@@ -708,18 +711,18 @@ pkexec bash -c "install -m 755 $R/src/msi-control-gui /usr/local/bin/msi-control
 # 2. make the new menu icon visible (see the gotcha above)
 systemctl --user restart plasma-plasmashell.service
 
-# 3. relaunch the GUI on the live session - find it first; never pgrep -f,
+# 3. relaunch the GUI on the live session: find it first; never pgrep -f,
 #    whose pattern self-matches the shell running it
 ps -eo pid,args | awk '/[g]s66-gui/ {print $1}'
 setsid /usr/local/bin/msi-control-gui >/dev/null 2>&1 &
 ```
 
 For a **daemon** change instead, `./install.sh` is still the whole answer (it
-also enables the service and installs the resume hook), and the full recipe -
-`verify.sh`, then put the machine back to a sensible mode - is in the
+also enables the service and installs the resume hook), and the full recipe (
+`verify.sh`, then put the machine back to a sensible mode) is in the
 *Housekeeping* notes below.
 
-### [x] `tools/fixup.sh` has a stale source path - FIXED
+### [x] `tools/fixup.sh` has a stale source path: FIXED
 
 `tools/fixup.sh:5` said `SRC=/home/eren/msi-control` after the project moved
 to `/home/eren/Projects/MSIControl`. It now derives the root from its own
@@ -740,11 +743,11 @@ it through a path that is itself a link.
   (from its man page; `--keep-cwd` overrides). Every `install src/...` in an
   `install.sh`/deploy chain therefore fails with `cannot stat 'src/...'` until
   `--keep-cwd` is added. It is deterministic, so an identical retry without
-  the flag fails identically - do not "try again", add the flag.
+  the flag fails identically; do not "try again", add the flag.
 * **`--json` must be given BEFORE or AFTER the subcommand, never both
   assumed.** `argparse`'s `set_defaults()` mutates the *action object's*
   `.default`, and a shared parent parser (`parents=[common]`) hands the same
-  action to every subparser - so `set_defaults(json=False)` wrote `json=False`
+  action to every subparser, so `set_defaults(json=False)` wrote `json=False`
   into the namespace and silently clobbered a leading `--json`. A script
   reading JSON off stdout got prose with exit code 0. Fixed by leaving the
   actions at `default=SUPPRESS` and applying the fallbacks in `main()`
@@ -757,7 +760,7 @@ it through a path that is itself a link.
   constructs a `QSettings`.
 * **Run the light screenshots with an *absolute* outdir.** A **relative** outdir
   makes Qt ignore the redirected `XDG_CONFIG_HOME`, so the run writes the real
-  `~/.config/msi-control/msi-control.conf` after all - the exact leak the
+  `~/.config/msi-control/msi-control.conf` after all, the exact leak the
   previous bullet prevents. Use:
   `MSI_THEME=light QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py "$PWD/tests/shots/light"`.
 * **Replacing the app icon does not update the menu until the shell restarts.**
@@ -765,7 +768,7 @@ it through a path that is itself a link.
   while the launcher keeps painting the *previous* pixmap: a running Plasma caches
   the rendered icon in memory and nothing on disk invalidates that. It is not a
   second icon file, a theme override or a bad `Icon=` key, and it is not
-  fixable by re-running `gtk-update-icon-cache` - `systemctl --user restart
+  fixable by re-running `gtk-update-icon-cache`; `systemctl --user restart
   plasma-plasmashell.service` (or a re-login) is. The **tray** icon is different
   in kind: the app publishes its own ARGB pixels over `StatusNotifierItem`, so
   there the app is authoritative and the shell's copy is what goes stale. See
@@ -780,10 +783,10 @@ it through a path that is itself a link.
   and keep the raw string out of the same command.
 * **`AGENTS.md` / `CHANGELOG.md`** at `~/` document an unrelated **Samsung
   M20** Android server, not this laptop. Their changelog mandate most likely
-  does not apply here - but confirm with the user before assuming, since the
+  does not apply here, but confirm with the user before assuming, since the
   mandate is written strongly ("edit this document in the same session").
 * `tests/__pycache__/` exists and is harmless; `src/__pycache__/` was removed
   during the move.
 * Anything fetched or generated for a *run* belongs in the project, never
-  `/tmp/opencode/` - it is wiped nightly and has already cost this project
+  `/tmp/opencode/`: it is wiped nightly and has already cost this project
   time once.

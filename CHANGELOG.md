@@ -14,7 +14,57 @@ it was made; the runbook convention is documented in `CONTRIBUTING.md`.
 
 ---
 
-## 2026-10-18 - polish pass: plain dashes, temperature cards, tray ink
+## 2026-10-19 - release preparation: licence, packaging, model-PR guides
+
+The pass that turns the tree into something publishable: a licence, an rpm
+and tarball build, and two step-by-step guides for the project's most common
+contribution, adding your laptop's model.
+
+### Added
+- **`LICENSE`, GPL-2.0-or-later.** The repo had none, which is a blocker for
+  any public release; the vendored driver is GPL-2.0-or-later in its own
+  right, so the license file is copied from the GPL-2 text already carried
+  in `third_party/msi-ec/` and README.md grew a License section stating
+  what is ours, what is upstream's, and which licence copies from other
+  projects may legally bring a register map in.
+- **Release builds: `make release`.** Produces
+  `dist/msi-control-<VERSION>.tar.gz` plus `msi-control`,
+  `-driver-dkms` and `-gui` rpms (and a `src.rpm`) from `dist/`, and
+  `dist/` is gitignored, so an artifact can never be committed while its
+  version lives in `src/msi_control.py`. `VERSION` is read out of
+  `src/msi_control.py` by the Makefile, so the tarball, the rpms and
+  `msi-control --version` cannot drift apart.
+- **`packaging/rpm/msi-control.spec`.** Three packages matching who needs
+  what: `msi-control` (daemon, CLI, models, systemd unit + resume hook),
+  `msi-control-driver-dkms` (the driver source under `/usr/src/` plus
+  non-fatal DKMS build/install hooks: missing kernel-devel defers to the
+  next boot instead of failing the transaction) and `msi-control-gui`
+  (`python3-pyside6` dependency quarantined there). The unit and sleep
+  hook are sed'd to `/usr` paths; README's packaged-install section says
+  to `./uninstall.sh` a checkout install first, because a manual unit
+  under `/etc/systemd/system` shadows the packaged one.
+- **CONTRIBUTING.md § "Adding your model" is now the full user guide**:
+  detect, draft, dynamic register identification with a diff table,
+  proving each feature flag (including the MUX warning), `verify.sh`,
+  and a complete PR checklist with what a reviewer accepts and rejects.
+- **AGENTS.md § 6 gained agent-specific PR rules** for the same workflow:
+  never run `verify.sh` unless the user asked; never invent a register;
+  commit only the model directory; ship a `draft` status as a complete
+  contribution.
+- **`.gitignore` covers release and tool artifacts**: `rpmbuild/`,
+  `*.rpm`, `*.tar.gz`, and the common test-tool caches, alongside the
+  existing `dist/`.
+
+### Fixed
+- **`make check` failed on the smoke test's action-message assert** after
+  the 2026-10-18 dash-to-parenthesis decoration pass changed
+  "applied - nothing to change" to "applied (nothing to change)": the
+  source no longer contains the dash, but the test still asserted the
+  message *ends with* "nothing to change", which a trailing parenthesis
+  drops. The test now asserts the full sentence, matching the UI string
+  that ships instead of a fragment of it.
+
+---
 
 Three changes from a review of the running app: the temperature cards were
 repeating the fan duty, the tray icon had one fixed look, and the whole tree
