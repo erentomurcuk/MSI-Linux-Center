@@ -47,6 +47,16 @@ FAKE = {
                       "speeds": [0, 55, 65, 70, 80, 85, 90]}},
     "profiles": {"builtin": ["balanced", "battery", "gaming", "silent"],
                  "saved": ["factory", "quiet-office"]},
+    "freq": {"present": True, "policies": 8,
+             "cpuinfo_min_khz": 800_000, "cpuinfo_max_khz": 5_000_000,
+             "max_khz": 4_000_000, "min_khz": 800_000,
+             "max_khz_list": [4_000_000] * 8,
+             "min_khz_list": [800_000] * 8,
+             "cur_khz_list": [3_500_000] * 8},
+    "overdrive": {"supported": True, "on": False},
+    "undervolt": {"planes": {"core": -80, "gpu": 0, "cache": -60,
+                             "uncore": 0, "analogio": 0},
+                  "msr_present": True},
     "graphics": {"supported": True, "enabled": True,
                  "effective": "discrete", "requested": "discrete",
                  "reboot_required": False, "ec_bit": 0x5B,
@@ -56,6 +66,7 @@ FAKE = {
                  "backup": None},
     "config": {"RestoreLast": True, "DefaultProfile": None,
                "AllowRaw": False, "AllowMuxSwitch": True,
+               "AllowUndervolt": True,
                "SocketGroup": "wheel", "ReapplyOnResume": True},
     "partial": False,
 }
@@ -148,12 +159,40 @@ def check_theme_tokens() -> None:
             f"{name} accent_ink {t['accent_ink']} on surface {t['surface']} "
             f"is only {ink:.2f}:1")
         for key in ("r_card", "r_ctrl", "r_inner", "r_pill", "r_bar",
-                    "pad_ctrl_v", "pad_hero_v", "h_ctrl", "h_spin"):
+                    "r_btn", "pad_ctrl_v", "pad_hero_v", "h_ctrl", "h_spin"):
             assert t[key].endswith("px") and t[key][:-2].isdigit(), t[key]
+        # A button is a full pill: its radius must be half the rendered
+        # control rung (content + 2x padding + 2x border), so it cannot
+        # drift back into a rounded rectangle without this noticing.
+        rung = int(t["h_ctrl"][:-2]) + 2 * int(t["pad_ctrl_v"][:-2]) + 2
+        assert int(t["r_btn"][:-2]) == rung // 2, (
+            f"{name} r_btn {t['r_btn']} is not half of the {rung} px "
+            "control rung; a pill button is the whole point of the shape")
 
     # A light and a dark accent that happen to be identical means one of them
     # was never picked for its background.
     assert themes["light"]["accent"] != themes["dark"]["accent"]
+
+    # Every accent preset must clear the same bars in both themes, not only
+    # the one this process happens to be wearing: a preset that fails AA
+    # with white text would ship a button nobody can read.
+    for key in gui.ACCENTS:
+        for tname in ("dark", "light"):
+            t = gui.build_theme(tname, key)
+            assert set(t) == keys["dark"], (
+                f"accent {key} on {tname} drifted from the token set")
+            ratio = contrast(t["on_accent"], t["accent"])
+            assert ratio >= 4.5, (
+                f"{key}/{tname} accent {t['accent']} with text "
+                f"{t['on_accent']} is {ratio:.2f}:1 - WCAG AA needs 4.5:1")
+            ink = contrast(t["accent_ink"], t["surface"])
+            assert ink >= 3.0, (
+                f"{key}/{tname} accent_ink {t['accent_ink']} on surface "
+                f"{t['surface']} is only {ink:.2f}:1")
+    # and no preset may be a duplicate of another: a dead choice reads as
+    # a broken button
+    seen = [v["dark"]["accent"] for v in gui.ACCENTS.values()]
+    assert len(set(seen)) == len(gui.ACCENTS), "duplicate accent hex"
 
 
 def _ink_box(img, alpha: int = 128):
@@ -335,12 +374,12 @@ def check_control_sizes(win) -> None:
 def check_glyphs(win) -> None:
     """Every glyph the UI names must actually draw something.
 
-    A typo in `Sidebar.ITEMS` does not raise: `glyph_pixmap` falls through its
+    A typo in a glyph name does not raise: `glyph_pixmap` falls through its
     if-chain and returns a fully transparent pixmap, so the sidebar simply
     shows a label with a hole beside it - which reads as a design choice
     rather than a bug.  Nothing else in the suite would notice.
     """
-    names = [glyph for _label, glyph in gui.Sidebar.ITEMS]
+    names = [glyph for _label, glyph, _i in win.sidebar._entries]
     names += ["refresh", "power", "warn"]
 
     def opaque(pm) -> int:
@@ -363,13 +402,16 @@ def check_nav_matches_tabs(win) -> None:
     """The sidebar and the tab stack are one list, not two that happen to
     agree today: a section with no nav entry is unreachable, and a nav entry
     with no section is a dead click."""
-    assert len(gui.Sidebar.ITEMS) == win.tabs.count(), (
-        f"{len(gui.Sidebar.ITEMS)} nav entries vs {win.tabs.count()} sections")
+    assert len(win.sidebar._entries) == win.tabs.count(), (
+        f"{len(win.sidebar._entries)} nav entries vs {win.tabs.count()} "
+        "sections")
     assert len(win.sidebar.buttons) == win.tabs.count()
-    labels = [t for t, _ in gui.Sidebar.ITEMS]
+    labels = [t for t, _g, _i in win.sidebar._entries]
     assert len(set(labels)) == len(labels), f"duplicate nav labels: {labels}"
-    for i, (label, _glyph) in enumerate(gui.Sidebar.ITEMS):
+    for i, (label, _glyph, _index) in enumerate(win.sidebar._entries):
         assert win.tabs.tabText(i) == label, (i, win.tabs.tabText(i), label)
+    assert {e[2] for e in win.sidebar._entries} == set(range(win.tabs.count())), \
+        "nav entries must point at distinct pages"
 
 
 def check_type_scale(win) -> None:
@@ -666,6 +708,23 @@ def check_graphics(win) -> None:
     assert not perf.gfx_warn.isHidden()
     assert "AllowMuxSwitch" in perf.gfx_warn.text(), perf.gfx_warn.text()
 
+    # --- the variable's capability bit says no discrete: exactly that one
+    # button is dead, with the reason on show, and hybrid stays live.  The
+    # bits exist so a firmware can say "this mode does not exist here";
+    # pretending the option is universal is how a user ends up rebooting
+    # into a machine that cannot honour what was asked.
+    win._refresh({**FAKE, "graphics": {**FAKE["graphics"],
+                                       "effective": "hybrid",
+                                       "requested": "hybrid",
+                                       "ec_mode": "hybrid",
+                                       "var_mode": "hybrid",
+                                       "var_three_mode": True,
+                                       "caps": {"discrete": False,
+                                                "integrated": True}}})
+    assert perf.gfx_buttons["hybrid"].isEnabled()
+    assert not perf.gfx_buttons["discrete"].isEnabled()
+    assert "discrete mode" in perf.gfx_warn.text(), perf.gfx_warn.text()
+
     # --- offline: dead, and the daemon is named as the reason ---
     win.online = False
     win._refresh(FAKE)
@@ -680,6 +739,96 @@ def check_graphics(win) -> None:
                      "reboot to apply",
          "mode": "hybrid", "now": "hybrid"}, None)
     assert "reboot" in msg and "Hybrid" in msg, msg
+    win._refresh(FAKE)
+
+
+def check_frequency_page(win) -> None:
+    """The all-core frequency page: pending-vs-applied, the quick slots,
+    and the settings gate that removes the page from the sidebar."""
+    f = win.cpu
+    # The FAKE payload says every core sits at 4.00 GHz.
+    assert f.rows["all cores at"].text().startswith("4.00"), \
+        f.rows["all cores at"].text()
+    assert f.slider.value() * gui.FREQ_STEP_KHZ == 4_000_000
+    assert not f.apply_btn.isEnabled(), "Apply must wait for a change"
+
+    f.slider.setValue(3_000_000 // gui.FREQ_STEP_KHZ)
+    assert f.apply_btn.isEnabled() and f.revert_btn.isEnabled()
+    assert "pending" in f.pending_label.text()
+    assert f.slot_store_btns[0].isEnabled(), "Store needs a live value"
+
+    # Store keeps the pending choice in the user's settings and the slot
+    # names its value; applying it is still an explicit click.
+    f.slot_store_btns[0].click()
+    assert f._slot_khz(0) == 3_000_000, "slot did not store the value"
+    assert "3.00 GHz" in f.slot_btns[0].text()
+    f._slot_clear(0)
+    assert f._slot_khz(0) is None, "slot did not clear"
+    f.slider.setValue(4_000_000 // gui.FREQ_STEP_KHZ)
+
+    # The Settings gate: hiding the section removes it from the sidebar and
+    # the shortcuts, and showing it returns exactly one entry.
+    n0 = len(win.sidebar._entries)
+    win.set_section_visible("freq", False)
+    assert len(win.sidebar._entries) == n0 - 1
+    assert all(t != "Frequency" for t, _g, _i in win.sidebar._entries)
+    win.set_section_visible("freq", True)
+    assert len(win.sidebar._entries) == n0
+    assert win.settings.sec_freq.isChecked()
+
+
+def check_undervolt_page(win) -> None:
+    """The undervolt page: offsets shown from the daemon's own read, the
+    BIOS warning never disappears, and the startup set is honest."""
+    u = win.uv
+    assert u.planes["core"].value() == -80
+    assert u.planes["cache"].value() == -60
+    assert "Overclocking Lock" in u.notice.text(), \
+        "the BIOS unlock warning is the page's safety caution and must stay"
+    assert u.apply_btn.isEnabled() and u.startup_save.isEnabled()
+    # No startup set: the row says so and Remove cannot be clicked.
+    assert u.startup_values() is None
+    assert not u.startup_del.isEnabled()
+
+    u.planes["core"].setValue(-100)
+    u._startup_save()
+    saved = u.startup_values()
+    assert saved and saved["core"] == -100 and saved["cache"] == -60, saved
+    assert u.startup_del.isEnabled()
+    u._startup_del()
+    assert u.startup_values() is None
+
+    # Startup apply fires once per run on the first allowed status, and
+    # twice-set means once-applied (a poll storm would re-write the MSR).
+    assert win._uv_startup_done
+
+    # Diving past the clamp is refused as a value, not as a frozen spin.
+    try:
+        u.planes["core"].setValue(-500)
+        assert u.planes["core"].value() == -300, \
+            "the spin box clamps to the app-wide -300 mV floor"
+    finally:
+        u.planes["core"].setValue(-80)
+
+
+def check_overdrive_card(win) -> None:
+    """Panel overdrive: the Dragon Center toggle, honest when unsupported."""
+    assert win.perf.od_val.text() == "off", win.perf.od_val.text()
+    assert win.perf.od_buttons["off"].isChecked()
+    assert win.perf.od_buttons["on"].isEnabled()
+    assert not win.perf.od_note.isVisible(), \
+        "FAKE says the model supports overdrive; there is no caveat to show"
+
+    # A model that has no proven register keeps the reading but refuses
+    # the write, with the reason on the card instead of a dead button.
+    fake = dict(FAKE)
+    fake["overdrive"] = {"supported": False, "on": None}
+    win._refresh(fake)
+    assert win.perf.od_buttons["on"].isEnabled() is False
+    assert "model file" in win.perf.od_note.text()
+    # isHidden, not isVisible: this check can run while another page is
+    # showing, and a widget on a background page is never "visible".
+    assert not win.perf.od_note.isHidden(), "the unsupported note must show"
     win._refresh(FAKE)
 
 
@@ -707,10 +856,13 @@ def check_dashboard_facts(win) -> None:
     # nothing else: the duty number belongs to the fan cards beside them, and
     # printing it twice made a temperature card read as a fan card.  The
     # sub-line is hidden as well as blank, so it does not reserve a row.
+    # The band chip is sentence case ("Warm", not "WARM"): on the quiet
+    # surfaces of this UI a chip is a small label, and the all-caps shout
+    # was the old badge look.
     for card in (win.dash.cpu, win.dash.gpu):
         assert card.sub.text() == "", card.sub.text()
         assert not card.sub.isVisible(), "an empty sub-line still takes space"
-        assert card.chip.text() in ("COOL", "WARM", "HOT", "CRITICAL"), \
+        assert card.chip.text() in ("Cool", "Warm", "Hot", "Critical"), \
             card.chip.text()
 
     # The battery chip names the state and colours it by whether that state
@@ -731,7 +883,8 @@ def check_dashboard_facts(win) -> None:
                              ("Not charging", True, gui.COL_WARM),
                              ("Discharging", False, gui.THEME["accent"])):
         text, css, vis = chip(status, ac)
-        assert text == status.upper() and vis, (status, text, vis)
+        # Sentence case, the kernel's own spelling: no .upper() reformat.
+        assert text == status and vis, (status, text, vis)
         assert f"background:{want}" in css, (status, want, css)
     text, css, vis = chip("", True)
     assert text == "" and not vis and "background" not in css, \
@@ -788,9 +941,132 @@ def check_tray_icon(win) -> None:
 
     # The Settings card mirrors the window, it does not keep its own copy.
     win._refresh(FAKE)
+    assert win.settings.tray_show.isEnabled() == bool(win.tray), \
+        "tray controls must go dead when there is no tray to change"
     assert win.settings.tray_show.isChecked() == bool(win.tray_temp)
     for key, btn in win.settings.tray_mode_btns.items():
         assert btn.isChecked() == (key == win.tray_colour), key
+
+
+def check_tray_menu(win) -> None:
+    """The tray's quick actions are a status mirror, not a second copy.
+
+    A check mark that names a mode the machine is not in is worse than no
+    menu at all, so every quick action is checked/enabled from the last
+    status round-trip, exactly like the full pages.  Verified on a
+    platform with no tray (the menu exists without one, by design).
+    """
+    assert win._tray_menu, "the tray menu must exist without a tray"
+    win.online = True
+    win._refresh(FAKE)
+    assert win._tray_shift["comfort"].isChecked(), \
+        "the current shift mode is not checked"
+    assert not win._tray_shift["eco"].isChecked()
+    assert not win._tray_boost.isChecked(), "boost checked while off"
+    assert win._tray_charge[60].isChecked(), "the charge limit is 60"
+    assert not win._tray_charge[80].isChecked()
+    for act in (win._tray_shift["eco"], win._tray_boost,
+                win._tray_charge[80]):
+        assert act.isEnabled(), "quick actions must be live online"
+
+    # A mode the firmware does not offer is not clickable at all.
+    st = dict(FAKE, shift={"current": "sport",
+                           "available": ["eco", "comfort", "sport"]})
+    win._refresh(st)
+    assert not win._tray_shift["turbo"].isVisible(), \
+        "an unavailable mode must leave the menu"
+    assert win._tray_shift["sport"].isChecked()
+
+    # Offline the whole menu goes read-only with the rest of the app.
+    win.online = False
+    win._refresh(FAKE)
+    for act in (win._tray_shift["eco"], win._tray_boost,
+                win._tray_charge[80]):
+        assert not act.isEnabled(), "a quick action stayed live offline"
+    win.online = True
+
+
+def check_selftest_card(win) -> None:
+    """The Settings self-test: results rendered, report copyable, errors
+    honest, the button dead offline like every other writer."""
+    win.online = True
+    win._refresh(FAKE)
+    assert win.settings.selftest_btn.isEnabled()
+    assert not win.settings.copy_report_btn.isEnabled(), \
+        "nothing is copyable before a report exists"
+
+    # A finished run: the text carries OK and failure lines, the markdown
+    # it produced is what the Copy button copies.
+    win.settings.selftest_reply({"data": {
+        "ok": False,
+        "summary": "self-test: 1 of 2 checks failed",
+        "results": [
+            {"section": "driver", "name": "msi-ec driver bound",
+             "ok": True, "detail": FAKE["driver"]["fw"]},
+            {"section": "sanity", "name": "cpu RPM plausible at 2290",
+             "ok": False, "detail": "implausible tachometer count"},
+        ],
+        "markdown": "## Hardware self-test report\nmock",
+    }})
+    out = win.settings.selftest_out.toPlainText()
+    assert "✓ msi-ec driver bound" in out, out
+    assert "✗ cpu RPM plausible at 2290" in out, out
+    assert "sanity" in out, "sections must separate the lines"
+    assert win.settings.copy_report_btn.isEnabled()
+    assert win.settings._selftest_markdown.startswith("## Hardware"), \
+        "the paste-ready markdown must be kept whole"
+    win.settings._copy_report()
+    from PySide6.QtWidgets import QApplication
+    assert "mock" in QApplication.clipboard().text(), \
+        "Copy must copy the markdown report, not the rendered text"
+
+    # A failed run reports its error; there is still nothing to copy.
+    win.settings.selftest_reply({"error": "the daemon hung up"})
+    assert "✗ the daemon hung up" in win.settings.selftest_out.toPlainText()
+    assert not win.settings.copy_report_btn.isEnabled()
+
+
+def check_accent_switch(app, win) -> None:
+    """The accent presets are real switches, not decoration.
+
+    Pinned: the click lands in THEME (so every later paint uses it), in
+    the app stylesheet (so already-built widgets repaint), in QSettings
+    (so it survives a restart), and in the sidebar (nav icons bake the
+    accent into their pixmaps, so they must be rebuilt, not just
+    restyled).  A bogus id must change nothing.  This runs after the
+    screenshots and restores the default before it returns, so the rest
+    of the suite stays on the shipped look.
+    """
+    st = win.settings
+    assert set(st.accent_btns) == set(gui.ACCENTS), \
+        "the Settings row and the registry disagreed"
+    assert st.accent_btns[gui.ACCENT_DEFAULT].isChecked(), \
+        "the default accent must start checked"
+
+    old_first = win.sidebar.buttons[0]
+    side = gui.THEME["name"]          # dark or light: each preset has a pair
+    expect = gui.ACCENTS["blue"][side]["accent"]
+    st.accent_btns["blue"].click()
+    app.processEvents()
+    assert gui.ACCENT == "blue", "the click never reached the accent"
+    assert gui.THEME["accent"] == expect
+    assert expect in app.styleSheet(), \
+        "the stylesheet was not rebuilt after the accent change"
+    assert win._qs.value("style/accent") == "blue", "accent not persisted"
+    assert st.accent_btns["blue"].isChecked()
+    assert win.sidebar.buttons[0] is not old_first, \
+        "nav glyphs bake the accent in; the sidebar must rebuild"
+
+    # a bogus id is refused and nothing moves
+    win.set_accent("nonsense")
+    assert gui.ACCENT == "blue", "an unknown accent id was accepted"
+    assert st.accent_btns["blue"].isChecked()
+
+    # back to the factory look for the rest of the suite
+    win.set_accent(gui.ACCENT_DEFAULT)
+    app.processEvents()
+    assert gui.ACCENT == gui.ACCENT_DEFAULT
+    assert st.accent_btns[gui.ACCENT_DEFAULT].isChecked()
 
 
 def check_settings_persistence(app) -> None:
@@ -809,7 +1085,7 @@ def check_settings_persistence(app) -> None:
     probe.poll.stop()
     probe.online = True
     probe._refresh(FAKE)
-    probe.tabs.setCurrentIndex(3)       # Battery
+    probe.tabs.setCurrentIndex(5)       # Battery
     probe.tray = None                   # the tray branch deliberately skips save
     probe.show()
     app.processEvents()
@@ -820,17 +1096,21 @@ def check_settings_persistence(app) -> None:
     again = gui.MainWindow()
     again.poll.stop()
     try:
-        assert again.tabs.currentIndex() == 3, \
+        # Five visible pages sit in front of Battery now (Frequency and
+        # Undervolt joined between Performance and Fans), so 5 is Battery.
+        assert again.tabs.currentIndex() == 5, \
             f"tab not restored (got {again.tabs.currentIndex()})"
+        assert again.tabs.tabText(5) == "Battery", \
+            again.tabs.tabText(again.tabs.currentIndex())
         assert again._qs.value("geometry") is not None, "geometry not saved"
 
         # A stale index is a guess, not a preference: it must be dropped.
-        again._qs.setValue("tab", 6)
+        again._qs.setValue("tab", 9)
         again._qs.sync()
         stale = gui.MainWindow()
         stale.poll.stop()
         try:
-            assert stale.tabs.currentIndex() != 6, "stale tab index accepted"
+            assert stale.tabs.currentIndex() != 9, "stale tab index accepted"
         finally:
             stale.close()
             app.processEvents()
@@ -934,6 +1214,13 @@ def check_offline_disables_writes(win) -> None:
     assert not win.profs.apply_btn.isEnabled(), "profiles Apply live offline"
     assert not win.settings.reapply_btn.isEnabled(), "re-apply live offline"
     assert not win.settings.factory_btn.isEnabled(), "capture live offline"
+    assert not win.settings.selftest_btn.isEnabled(), \
+        "self-test live offline"
+    assert not win.cpu.apply_btn.isEnabled(), "frequency Apply live offline"
+    assert not win.perf.od_buttons["on"].isEnabled(), \
+        "overdrive On live offline"
+    assert "daemon is offline" in win.uv.notice.text(), \
+        "the undervolt page must say why its controls are dead"
 
     win.online = True
     win._refresh(FAKE)
@@ -944,7 +1231,14 @@ def check_offline_disables_writes(win) -> None:
 
 
 def main() -> int:
-    outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "shots")
+    # Absolutised on purpose: this path becomes XDG_CONFIG_HOME below, and
+    # Qt silently falls back to the user's real $HOME/.config when
+    # XDG_CONFIG_HOME is not absolute.  A run invoked with a relative
+    # outdir (GUI smoke $REPO/tests/shots/light) once landed the probe
+    # window's geometry and "tab=5" in the developer's own msi-control.conf,
+    # which is exactly the leak the scratch dir exists to prevent.
+    arg = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else None
+    outdir = arg or os.path.join(HERE, "shots")
     os.makedirs(outdir, exist_ok=True)
 
     # QSettings persists the window geometry and the open tab into the
@@ -1018,17 +1312,27 @@ def main() -> int:
     check_control_sizes(win)
     check_dashboard_facts(win)
     check_tray_icon(win)
+    check_tray_menu(win)
     check_battery_apply_state(win)
     check_curve_keyboard(win)
     check_performance_tab(win)
     check_graphics(win)
+    check_frequency_page(win)
+    check_undervolt_page(win)
+    check_overdrive_card(win)
+    check_selftest_card(win)
     check_action_messages(win)
     check_offline_disables_writes(win)
     print("  behaviour checks: OK")
 
     # Last: it opens and closes extra windows, and must not disturb `win`.
+    # The accent switch comes after the persistence check for the same
+    # reason the tray one does: writing QSettings is what creates the
+    # file, and that check asserts it starts out absent.
     check_settings_persistence(app)
     print("  settings persistence: OK")
+    check_accent_switch(app, win)
+    print("  accent presets: OK")
     check_tray_options(app)
     print("  tray options: OK")
 

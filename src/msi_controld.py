@@ -114,6 +114,11 @@ class MsiEc:
             os.environ["MSI_SYSFS"] = sysfs_root   # keeps core.* in sync
         self.lock = threading.Lock()
         self._bat = None
+        # How long to wait for the three-mode firmware's acknowledge bit once
+        # a switch request is armed, and how often to poll it.  Attribute
+        # values (not module constants) so the tests can shorten the wait.
+        self.mux_ack_timeout = 5.0
+        self.mux_ack_interval = 0.1
 
     # -- sysfs helpers ----------------------------------------------------
 
@@ -136,6 +141,10 @@ class MsiEc:
             return core._read(self._p(*rel))
         except OSError as e:
             raise BackendError(f"cannot read {'/'.join(rel)}: {e.strerror}") from e
+
+    def debug_present(self) -> bool:
+        """Is the driver's debug interface mounted?  (needs debug=1)"""
+        return os.path.isdir(self._p("debug"))
 
     def read_opt(self, *rel):
         return core._read_opt(self._p(*rel))
@@ -286,23 +295,34 @@ class MsiEc:
             return None
 
     def mux_var_write(self, mode: str) -> bool:
-        """Request `mode` in the UEFI variable.  True if the bytes moved."""
+        """Request `mode` in the legacy byte-1 slot of the variable.
+
+        True if the bytes moved.  Only valid on firmware that does NOT carry
+        the three-mode marker (the Alpha 17's 17KK family; see the MUX block
+        in msi_control for the provenance, and why this byte is never read
+        back as a mode).  Three-mode firmware must go through
+        `_mux_apply_three_mode`, which writes byte 5 and needs the EC ack.
+        """
         raw = self.mux_var_raw()
         if raw is None:
             raise BackendError(
                 f"{core.mux_var_path()} is not present; this firmware has no "
                 f"{core.MUX_VAR_NAME} variable, so the graphics mode cannot be "
                 "requested")
+        if core.mux_var_three_mode(raw):
+            raise BackendError(
+                "this firmware speaks the three-mode protocol; the request "
+                "belongs in data byte 5, not byte 1")
         attrs, data = core.parse_mux_var(raw)
-        if len(data) <= core.MUX_VAR_MODE_BYTE:
+        if len(data) <= core.MUX_VAR_LEGACY_BYTE:
             raise BackendError(
                 f"{core.MUX_VAR_NAME} is too short to hold a mode "
                 f"({len(data)} data bytes)")
         want = 0x01 if mode == core.MUX_DISCRETE else 0x00
-        if data[core.MUX_VAR_MODE_BYTE] == want:
+        if data[core.MUX_VAR_LEGACY_BYTE] == want:
             return False
         new = bytearray(data)
-        new[core.MUX_VAR_MODE_BYTE] = want
+        new[core.MUX_VAR_LEGACY_BYTE] = want
         self._efivar_write(core.mux_var_path(), attrs.to_bytes(4, "little")
                            + bytes(new))
         return True
@@ -358,15 +378,108 @@ class MsiEc:
                 f"short write to {path}: {written} of {len(payload)} bytes")
 
     def mux_apply(self, mode: str) -> None:
-        """Write all three halves of the switch, in the reference tool's order.
+        """Write the switch, in the protocol this firmware actually speaks.
 
-        The UEFI variable first (what the firmware reads at POST), then the EC
-        trigger that asks firmware to act on it, then the state bit.  Nothing
-        here reboots and nothing here is reversible without one; the caller
-        owns the confirmation.
+        Three-mode firmware (the marker set in data byte 5) gets the MSI
+        Center handshake: the request into byte 5, then the EC trigger, then
+        a wait for the firmware's own acknowledge bit, which is raised by
+        its SMI handler once the request is *stored*.  Everything else gets
+        the legacy trio (variable byte 1, trigger, state bit), which is as
+        far as the 17KK provenance reaches.  Neither path reboots and
+        neither is reversible without one; the caller owns the confirmation.
         """
+        raw = self.mux_var_raw()
+        if raw is not None and core.mux_var_three_mode(raw):
+            self._mux_apply_three_mode(raw, mode)
+            return
         self.mux_var_write(mode)
         self._mux_write_ec(core.MUX_EC_MASK if mode == core.MUX_DISCRETE else 0)
+
+    def _mux_apply_three_mode(self, raw: bytes, mode: str) -> None:
+        """The MSI Center write: byte 5, trigger, acknowledge."""
+        attrs, data = core.parse_mux_var(raw)
+        if len(data) <= core.MUX_VAR_GPU_BYTE:
+            raise BackendError(
+                f"{core.MUX_VAR_NAME} is too short to hold the three-mode "
+                f"byte ({len(data)} data bytes)")
+        gpu = data[core.MUX_VAR_GPU_BYTE]
+        caps = core.mux_caps_from_var(raw)
+        if mode == core.MUX_DISCRETE and caps["discrete"] is False:
+            raise BackendError(
+                "the variable says this firmware does not offer discrete "
+                "mode (its capability bit is clear), so the switch would "
+                "ask for something the machine cannot do")
+        code = 0x01 if mode == core.MUX_DISCRETE else 0x00
+        new = bytearray(data)
+        new[core.MUX_VAR_GPU_BYTE] = \
+            (gpu & ~core.MUX_VAR_REQ_MASK) | (code & core.MUX_VAR_REQ_MASK)
+        self._efivar_write(core.mux_var_path(),
+                           attrs.to_bytes(4, "little") + bytes(new))
+        # A stored request is only a request if the firmware kept it; efivarfs
+        # would happily report our own write back to us on firmware that
+        # rewrites the variable, so this check is about bytes, not trust.
+        got = self.mux_var_raw()
+        if got is None or got[core.MUX_VAR_SKIP + core.MUX_VAR_GPU_BYTE] \
+                != new[core.MUX_VAR_GPU_BYTE]:
+            # Put the exact previous image back; a half-staged request is the
+            # worst state to leave behind, because nothing on screen can
+            # distinguish it from a made-up-our-mind one.
+            self._efivar_write(core.mux_var_path(), raw)
+            raise BackendError(
+                "the firmware did not keep the graphics request in "
+                f"{core.MUX_VAR_NAME}; the variable was restored")
+        self._mux_arm_trigger()
+        if not self._mux_wait_ack():
+            # The request is staged but the firmware never stored it.  Say
+            # so loudly: reporting success here is how a switch looks done
+            # while nothing was committed.
+            raise BackendError(
+                "the firmware did not acknowledge the graphics request "
+                f"within {self.mux_ack_timeout:.0f}s (EC "
+                f"{core.MUX_TRIGGER_ADDR:#04x} bit 1 stayed low).  The "
+                "request is still in the variable; revert it or leave it "
+                "for the next POST")
+
+    def _mux_arm_trigger(self) -> None:
+        """Ask the EC to act on the stored request (its _Q90 / SMI path).
+
+        Read-modify-write of exactly the two trigger bits: arm the request
+        and clear a stale acknowledge, so the wait below can only see an ack
+        this request produced.  The read-back verifies our own bits only:
+        the acknowledge bit belongs to the firmware and a fast SMI handler
+        is allowed to raise it between our write and our read, which the
+        generic verify-every-byte rule would misread as a rejection.
+        """
+        with self.lock:
+            trig = self.ec_read(core.MUX_TRIGGER_ADDR)
+            armed = ((trig & ~core.MUX_TRIGGER_MASK) | core.MUX_TRIGGER_ARM)
+            if armed != trig:
+                self.ec_write(core.MUX_TRIGGER_ADDR, armed, verify=False)
+            got = self.ec_read(core.MUX_TRIGGER_ADDR)
+            if got & core.MUX_TRIGGER_ARM != core.MUX_TRIGGER_ARM:
+                raise BackendError(
+                    f"EC rejected the switch request at "
+                    f"{core.MUX_TRIGGER_ADDR:#04x} (request bit stayed low, "
+                    f"read back {got:02x})")
+
+    def _mux_wait_ack(self) -> bool:
+        """Poll the EC until the firmware acknowledges, or the deadline.
+
+        Each read takes the EC lock for its own duration only, so the poll
+        never holds the lock across a sleep and starves other writers.
+        """
+        deadline = time.monotonic() + self.mux_ack_timeout
+        while True:
+            try:
+                with self.lock:
+                    cur = self.ec_read(core.MUX_TRIGGER_ADDR)
+            except (BackendError, ValidationError):
+                return False
+            if cur & core.MUX_TRIGGER_ACK:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self.mux_ack_interval)
 
     def _mux_write_ec(self, want_bit: int) -> None:
         """Arm the trigger, then set 0x2e bit 6 to `want_bit`.
@@ -374,18 +487,33 @@ class MsiEc:
         Read-modify-write, so the bits this program has no business in
         (0x2e bit 1 is the webcam) are carried through untouched.
         """
+        self._mux_arm_trigger()
         with self.lock:
-            trig = self.ec_read(core.MUX_TRIGGER_ADDR)
-            armed = (trig & ~core.MUX_TRIGGER_MASK) | core.MUX_TRIGGER_ARM
-            if armed != trig:
-                self.ec_write(core.MUX_TRIGGER_ADDR, armed)
             cur = self.ec_read(core.MUX_EC_ADDR)
             new = (cur & ~core.MUX_EC_MASK) | (want_bit & core.MUX_EC_MASK)
             if new != cur:
                 self.ec_write(core.MUX_EC_ADDR, new)
 
     def mux_restore(self, ec_bit: int | None, raw: bytes | None) -> None:
-        """Put a backed-up UEFI image and EC bit back."""
+        """Put a backed-up UEFI image and EC bit back.
+
+        The backed-up image says which protocol it came from: a three-mode
+        variable is put back with the same handshake it was taken from
+        (image, trigger, ack) and the 0x2e state bit is deliberately left
+        alone there, because the firmware owns it; a legacy variable gets
+        the image plus the bit, which is the state it was in."""
+        three_mode = core.mux_var_three_mode(raw)
+        if three_mode:
+            if raw is not None:
+                self.mux_var_restore(raw)
+                self._mux_arm_trigger()
+                if not self._mux_wait_ack():
+                    raise BackendError(
+                        "the image was restored but the firmware did not "
+                        "acknowledge it, so the restore may not be stored; "
+                        "check the daemon log and the variable before "
+                        "rebooting")
+            return
         if raw is not None:
             self.mux_var_restore(raw)
         if ec_bit is not None:
@@ -394,6 +522,50 @@ class MsiEc:
     def mux_var_restore(self, raw: bytes) -> None:
         """Put a previously saved efivarfs image back, byte for byte."""
         self._efivar_write(core.mux_var_path(), raw)
+
+    # -- display overdrive ---------------------------------------------------
+
+    def overdrive(self) -> int | None:
+        """The overdrive bit of the active model, or None when unsupported.
+
+        Only the bit named by the model file is read; the rest of the byte
+        (webcam, MUX state) belongs to other features and is not decoded
+        here.
+        """
+        regs = core.OVERDRIVE_REGS
+        if not regs:
+            return None
+        with self.lock:
+            val = self.ec_read(regs["address"])
+        return (val >> regs["bit"]) & 1
+
+    def set_overdrive(self, on: bool) -> dict:
+        """Toggle the model's overdrive bit with a one-bit read-modify-write.
+
+        The GS66's 0x2e carries the webcam at bit 1 and the MUX state at bit
+        6, which is exactly why this is a single-bit RMW and nothing wider.
+        Writable override values from the model file (off/on, for firmwares
+        whose EC treats the whole byte as owned) win over bit twiddling.
+        """
+        regs = core.OVERDRIVE_REGS
+        if not regs:
+            raise NotSupported("this model has no proven display overdrive "
+                              "register")
+        with self.lock:
+            cur = self.ec_read(regs["address"])
+            want = bool(on)
+            if regs.get("on") is not None and want:
+                val = regs["on"]
+            elif regs.get("off") is not None and not want:
+                val = regs["off"]
+            else:
+                val = (cur | (1 << regs["bit"])) if want \
+                    else (cur & ~(1 << regs["bit"]))
+            if val != cur:
+                self.ec_write(regs["address"], val)   # read-back inside
+        return {"address": regs["address"], "bit": regs["bit"],
+                "was": (cur >> regs["bit"]) & 1, "now": 1 if want else 0,
+                "same": val == cur}
 
     # -- modes ---------------------------------------------------------------
 
@@ -455,6 +627,203 @@ class MsiEc:
                 f"{key} not accepted (wanted {value!r}, read {got.strip()!r})")
         now = got.strip() if got else got
         return {"key": key, "was": was, "now": now, "changed": was != now}
+
+
+# --------------------------------------------------------------------------
+# CPU frequency backend: cpufreq sysfs (no EC involvement, but still
+# root-only to write, so the daemon owns it like every other write)
+# --------------------------------------------------------------------------
+
+class CpuFreq:
+    """The `scaling_max_freq` of every policy, as one knob.
+
+    Each policy file read back after the write, because that is the
+    house rule for every hardware write; the kernel clamps out-of-range
+    values itself, so a "read back differs" here means cpufreq is not
+    loaded rather than silent hardware refusal.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def _path(self, policy: str, name: str) -> str:
+        return os.path.join(core.cpufreq_dir(), policy, name)
+
+    def facts(self) -> dict:
+        with self.lock:
+            return core.cpufreq_facts()
+
+    @staticmethod
+    def _bound(facts: dict, key: str) -> int:
+        v = facts.get(key)
+        if not v:
+            raise BackendError("cpufreq did not report CPU frequency bounds; "
+                               f"({key} missing)")
+        return v
+
+    def set_all_max(self, khz: int) -> dict:
+        """One max frequency for every core.  khz in kilohertz."""
+        facts = self.facts()
+        if not facts.get("present"):
+            raise BackendError("cpufreq is unavailable on this machine")
+        hi = self._bound(facts, "cpuinfo_max_khz")
+        lo = self._bound(facts, "cpuinfo_min_khz")
+        wanted = core.check_freq_khz(khz, lo, hi, "max frequency")
+        pols = core.cpufreq_policies()
+        with self.lock:
+            stops = []
+            for pol in pols:
+                cur = core.read_khz(self._path(pol, "scaling_max_freq"))
+                # min must never overtake max: lift the floor when the
+                # requested max is below the current floor.
+                floor = core.read_khz(self._path(pol, "scaling_min_freq"))
+                if floor is not None and floor > wanted:
+                    with open(self._path(pol, "scaling_min_freq"), "w",
+                              encoding="utf-8") as fh:
+                        fh.write(f"{wanted}\n")
+                with open(self._path(pol, "scaling_max_freq"), "w",
+                          encoding="utf-8") as fh:
+                    fh.write(f"{wanted}\n")
+                got = core.read_khz(self._path(pol, "scaling_max_freq"))
+                if got != wanted:
+                    stops.append(f"core {pol}: read back "
+                                 f"{core.khz_to_ghz(got)} GHz")
+            if stops:
+                raise BackendError("; ".join(stops))
+            now = core.cpufreq_facts()
+        return {"max_khz": wanted, "policies": len(pols),
+                "max_khz_applied": now.get("max_khz"),
+                "summary": (f"max frequency {core.khz_to_ghz(wanted)} GHz "
+                            f"on {len(pols)} cores")}
+
+
+# --------------------------------------------------------------------------
+# Undervolt backend: the OC mailbox in /dev/cpu/*/msr
+# --------------------------------------------------------------------------
+
+class Undervolt:
+    """ MSR 0x150 on every logical CPU: the ThrottleStop/undervolt protocol.
+
+    The mailbox is per-thread state, so every command goes to every MSR
+    device; georgewhewell/undervolt does the same and it reads back
+    identically from any thread of a core.  A write that does not read
+    back is the *only* signal a machine's BIOS has not unlocked
+    undervolting, so it is reported as such, not as a silent success -
+    the house read-back rule is what makes the "locked" case visible at
+    all.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def _msr_files(self) -> list:
+        root = core.dev_cpu_dir()
+        out = []
+        try:
+            names = sorted(os.listdir(root),
+                           key=lambda n: int(n) if n.isdigit() else 1 << 30)
+        except OSError:
+            return []
+        for n in names:
+            path = os.path.join(root, n, "msr")
+            if os.path.isfile(path):
+                out.append(path)
+        return out
+
+    def available(self) -> bool:
+        return bool(self._msr_files())
+
+    @staticmethod
+    def _wr(path: str, value: int) -> None:
+        # A 64-bit little-endian write; pread/pwrite-style seeks keep the
+        # per-thread offset independent of what anything else did to the fd.
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            os.lseek(fd, core.UV_MSR, os.SEEK_SET)
+            os.write(fd, value.to_bytes(8, "little"))
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _rd(path: str) -> int:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.lseek(fd, core.UV_MSR, os.SEEK_SET)
+            return int.from_bytes(os.read(fd, 8), "little")
+        finally:
+            os.close(fd)
+
+    def read_planes(self) -> dict | None:
+        """Current offsets in mV per plane; None when there is no MSR."""
+        if not self._msr_files():
+            return None
+        with self.lock:
+            out = {}
+            for plane, _idx in core.UV_PLANES:
+                got = self.read_plane(plane)
+                out[plane] = got[0] if got else None
+            return out
+
+    def apply(self, values: dict, fill_missing: bool = True) -> dict:
+        """Write offsets to the voltage planes, and read every one back.
+
+        All five planes by default, zeros included: the mailbox is
+        command-plus-data per plane, so "not mentioned" cannot mean "left
+        alone" here the way it does for nice named settings, and writing
+        0 is also how an earlier offset is cleared.  fill_missing=False is
+        the profile shape: only the planes the caller named are touched, so
+        a profile that caps the core voltage never silently clears a cache
+        offset some other profile set.
+        """
+        clean = core.check_uv_values(values, fill=fill_missing)
+        files = self._msr_files()
+        if not files:
+            raise BackendError("no MSR devices under /dev/cpu/*/msr; "
+                               "load the msr module or use a kernel that "
+                               "creates them")
+        rejected = []
+        with self.lock:
+            for plane, idx in core.UV_PLANES:
+                if plane not in clean:
+                    continue
+                mv = clean[plane]
+                data = core.uv_encode(mv)
+                for path in files:
+                    self._wr(path,
+                             core.UV_CMD_WRITE | (idx << core.UV_PLANE_SHIFT))
+                    self._wr(path, data)
+                got = self.read_plane(plane)
+                if got is None or not got or got[0] != mv:
+                    read = f"{got[0]} mV" if got else "nothing"
+                    rejected.append(f"{plane}: asked {mv} mV, read back "
+                                    f"{read}")
+        if rejected:
+            raise BackendError(
+                "the CPU refused the voltage offset(s) - most firmwares "
+                "ship with undervolting locked: enable it in the BIOS "
+                "(Advanced / OC menu: Overclocking Lock, CFG Lock and "
+                "Undervolt Protection off).  Refused: "
+                + "; ".join(rejected))
+        return clean
+
+    def read_plane(self, plane: str) -> list | None:
+        """Offsets of `plane` as read from every thread, shallow-sorted.
+
+        All threads carry the same offset on any healthy write, so the
+        list is normally one value long; the caller sees the shallowest
+        (closest to 0) when they differ so the UI can never report a
+        deeper undervolt than the machine is really running.  None means
+        no MSR devices; [] means the plane read back nothing usable.
+        """
+        files = self._msr_files()
+        if not files:
+            return None
+        idx = dict(core.UV_PLANES)[plane]
+        vals = []
+        for path in files:
+            self._wr(path, core.UV_CMD_READ | (idx << core.UV_PLANE_SHIFT))
+            vals.append(core.uv_decode(self._rd(path)))
+        return sorted(vals, reverse=True)
 
 
 # --------------------------------------------------------------------------
@@ -534,6 +903,8 @@ class Service:
             os.environ["MSI_STATE"] = args.state
         self.cfg = core.load_config()
         self.ec = MsiEc()
+        self.freq = CpuFreq()
+        self.uv = Undervolt()
         self.profiles = Profiles(os.path.join(core.state_dir(), "profiles"))
         os.makedirs(core.state_dir(), exist_ok=True)
         self._igpu: bool | None = None      # one look per daemon lifetime
@@ -543,7 +914,7 @@ class Service:
     def status(self) -> dict:
         st = core.local_status(mux=False)
         st["partial"] = False
-        debug = os.path.isdir(self.ec._p("debug"))
+        debug = self.ec.debug_present()
         st["driver"]["debug"] = debug
         if debug and core.feature("rpm"):
             for which in ("cpu", "gpu"):
@@ -560,15 +931,33 @@ class Service:
                     st["curve"][which] = None
         st["profiles"] = self.profiles.list()
         st["graphics"] = self.graphics()
+        st["freq"] = self.freq.facts()
+        st["overdrive"] = self.overdrive_status()
+        try:
+            st["undervolt"] = {"planes": self.uv.read_planes(),
+                               "msr_present": self.uv.available()}
+        except BackendError:
+            st["undervolt"] = {"planes": None, "msr_present": False}
         st["config"] = {
             "RestoreLast": bool(self.cfg.get("RestoreLast")),
             "DefaultProfile": self.cfg.get("DefaultProfile"),
             "AllowRaw": bool(self.cfg.get("AllowRaw")),
             "AllowMuxSwitch": bool(self.cfg.get("AllowMuxSwitch")),
+            "AllowUndervolt": bool(self.cfg.get("AllowUndervolt")),
             "SocketGroup": str(self.cfg.get("SocketGroup", "wheel")),
             "ReapplyOnResume": bool(self.cfg.get("ReapplyOnResume")),
         }
         return st
+
+    def overdrive_status(self) -> dict:
+        """What the panel/overdrive card needs: support first, then value."""
+        out = {"supported": bool(core.OVERDRIVE_REGS), "on": None}
+        if out["supported"]:
+            try:
+                out["on"] = bool(self.ec.overdrive())
+            except (BackendError, ValidationError):
+                out["on"] = None
+        return out
 
     def snapshot(self) -> dict:
         """What we would restore at next boot: only keys that exist here.
@@ -629,7 +1018,13 @@ class Service:
         effective = None
         if igpu is not None:
             effective = core.MUX_HYBRID if igpu else core.MUX_DISCRETE
-        requested = var_mode if var_mode is not None else ec_mode
+        # The request comes from whichever source can name one: the variable
+        # only when the firmware speaks three-mode, else the EC bit, else (and
+        # only then) what the running machine is doing.  On a firmware where
+        # the variable names nothing, the honest "next boot at all" is the
+        # machine's own current state, never a phantom pending switch.
+        requested = (var_mode if var_mode is not None
+                     else ec_mode if ec_mode is not None else effective)
         return {
             "supported": ec_bit is not None or raw is not None,
             "enabled": bool(self.cfg.get("AllowMuxSwitch")),
@@ -640,6 +1035,9 @@ class Service:
             "ec_bit": ec_bit,
             "ec_mode": ec_mode,
             "var_mode": var_mode,
+            "var_three_mode": core.mux_var_three_mode(raw),
+            "var_applied": core.mux_applied_from_var(raw),
+            "caps": core.mux_caps_from_var(raw),
             "var_present": raw is not None,
             "var_path": core.mux_var_path(),
             "igpu_present": igpu,
@@ -841,6 +1239,42 @@ class Service:
                 # e.g. no battery currently present; profile is otherwise live
                 warnings.append(str(e))
 
+        # The two CPU-side keys follow the same optional rule as charge_end:
+        # absent means leave it alone.  A *named* cap/offset is the profile
+        # doing its job, and unlike the re-apply snapshot (which must never
+        # resurrect caps the kernel reset at boot) it is applied here.
+        if prof.get("freq_khz") is not None:
+            before_hz = core.cpufreq_facts().get("max_khz")
+            try:
+                self.freq.set_all_max(prof["freq_khz"])
+                after_hz = core.cpufreq_facts().get("max_khz")
+                if before_hz != after_hz:
+                    curve_notes.append(
+                        f"max frequency {core.khz_to_ghz(before_hz)} -> "
+                        f"{core.khz_to_ghz(after_hz)} GHz")
+                    curve_acts.append(f"Set CPU max frequency to "
+                                       f"{core.khz_to_ghz(after_hz)} GHz")
+            except (BackendError, ValidationError) as e:
+                warnings.append(f"frequency cap skipped: {e}")
+        if prof.get("undervolt") is not None:
+            if not self.cfg.get("AllowUndervolt"):
+                warnings.append("voltage offsets skipped: undervolting is "
+                                "off in the config (set AllowUndervolt)")
+            else:
+                before_uv = self.uv.read_planes()
+                try:
+                    self.uv.apply(prof["undervolt"], fill_missing=False)
+                    after_uv = self.uv.read_planes() or {}
+                    base = before_uv or {}
+                    moved = sum(1 for p, v in after_uv.items()
+                                if base.get(p) != v)
+                    if moved:
+                        curve_notes.append(f"voltage offsets ({moved} plane"
+                                           f"{'s' if moved != 1 else ''})")
+                        curve_acts.append("Applied voltage offsets")
+                except (BackendError, ValidationError) as e:
+                    warnings.append(f"voltage offsets skipped: {e}")
+
         after = self._read_settings(keys)
         changes = core.diff_settings(before, after) + curve_notes
         acts = [core.describe_activity(k, before.get(k), after.get(k))
@@ -933,6 +1367,234 @@ class Service:
             return warnings, changes, acts
         return [], [], []
 
+    # -- hardware self-test ----------------------------------------------------
+
+    def selftest(self) -> dict:
+        """`verify.sh` as a daemon command: reversible round-trips, restored.
+
+        Every check writes real settings and completes only when they read
+        back, then everything captured at the start is put back whatever
+        happened on the way.  It lives on Service so that every write is one
+        of its own validated, read-back primitives; nothing here touches
+        the EC by a new route.  The report is machine-shaped (a flat list
+        of checks) so the CLI can print it and the GUI can render it, with
+        a paste-ready markdown body for a pull request.
+        """
+        results = []
+
+        def check(section: str, name: str, ok, detail: str = ""):
+            results.append({"section": section, "name": name,
+                            "ok": bool(ok), "detail": str(detail or "")})
+
+        st = self.status()
+
+        # -- reads: which machine, which driver
+        drv = st.get("driver") or {}
+        model = st.get("model") or core.MODEL.summary()
+        check("driver", "msi-ec driver bound", bool(drv.get("present")),
+              drv.get("fw") or "no msi-ec sysfs directory")
+        check("driver", "EC debug interface", bool(drv.get("debug")),
+              "present" if drv.get("debug") else
+              "missing: RPM, curves and register reads need debug=1")
+        check("model", "model file matched", bool(model.get("supported")),
+              f"matched: {model.get('id')}" if model.get("supported")
+              else "no model file matches; register-backed features are off")
+
+        # -- setting round-trips: set-then-verify, restore last
+        def walk(key: str, section: str, modes, orig):
+            for mode in modes:
+                err = ""
+                got = None
+                try:
+                    self.ec.set(key, mode)
+                    got = self.ec.get(key)
+                except (BackendError, ValidationError, NotSupported) as e:
+                    err = str(e)
+                check(section, f"{key} {mode} -> read back "
+                      f"{got if got is not None else 'nothing'}",
+                      got == mode, err)
+            if orig is not None:
+                err = ""
+                got = None
+                try:
+                    self.ec.set(key, orig)
+                    got = self.ec.get(key)
+                except (BackendError, ValidationError, NotSupported) as e:
+                    err = str(e)
+                check(section, f"{key} restored to {orig}", got == orig, err)
+
+        walk("shift", "shift mode", (st.get("shift") or {}).get("available")
+             or [], (st.get("shift") or {}).get("current"))
+        walk("fan", "fan mode", (st.get("fan") or {}).get("available") or [],
+             (st.get("fan") or {}).get("current"))
+
+        boost_orig = st.get("cooler_boost")
+        for want in (True, False):
+            err = ""
+            got = None
+            expect = "on" if want else "off"
+            try:
+                self.ec.set("cooler_boost", want)
+                got = self.ec.get("cooler_boost")
+            except (BackendError, ValidationError, NotSupported) as e:
+                err = str(e)
+            check("cooler boost", f"cooler boost {expect} -> read back "
+                  f"{got if got is not None else 'nothing'}",
+                  got == expect, err)
+        if boost_orig in ("on", "off"):
+            err = ""
+            got = None
+            try:
+                self.ec.set("cooler_boost", boost_orig == "on")
+                got = self.ec.get("cooler_boost")
+            except (BackendError, ValidationError, NotSupported) as e:
+                err = str(e)
+            check("cooler boost", f"cooler boost restored to {boost_orig}",
+                  got == boost_orig, err)
+
+        # -- charge threshold: write two values, verify the pairing rule,
+        # -- restore the original (clean)
+        orig_ce = (st.get("battery") or {}).get("charge_end")
+        if orig_ce is None:
+            check("charge limit", "battery charge threshold", False,
+                  "no battery exposing charge_control_end_threshold")
+        else:
+            def read_start() -> "int | None":
+                try:
+                    # battery_dir charges BackendError; the walk is
+                    # allowed to run a battery-less leg (a laptop on the
+                    # dock with the battery out) without crashing
+                    path = os.path.join(self.ec.battery_dir(),
+                                        "charge_control_start_threshold")
+                except BackendError:
+                    return None
+                return core._read_int(path)
+
+            for pct in (80, 60):
+                err = ""
+                end = start = None
+                pre_start = read_start()
+                try:
+                    self.ec.set("charge_end", pct)
+                    end = self.ec.charge_end()
+                    start = read_start()
+                except (BackendError, ValidationError) as e:
+                    err = str(e)
+                good = end == pct
+                check("charge limit", f"charge limit {pct} -> EC says {end}",
+                      good, err)
+                if not good:
+                    continue
+                # The start threshold is the driver's doing, not ours: msi-ec
+                # normally keeps it 10 under the limit, but a firmware that
+                # pins it (or a plain test fixture) is not a failed write, so
+                # a start holding its own value passes with a note instead of
+                # a false red on hardware we cannot influence.
+                if start == pct - 10:
+                    check("charge limit",
+                          f"start threshold tracks the limit ({pct - 10})",
+                          True, "")
+                elif pre_start is None or start == pre_start:
+                    check("charge limit",
+                          f"start threshold held at {start}, not paired "
+                          "to the limit by this driver", True, "")
+                else:
+                    check("charge limit",
+                          f"start threshold is {start}, expected "
+                          f"{pct - 10} or {pre_start}", False, "")
+            err = ""
+            got = None
+            try:
+                self.ec.set("charge_end", orig_ce)
+                got = self.ec.charge_end()
+            except (BackendError, ValidationError) as e:
+                err = str(e)
+            check("charge limit", f"charge limit restored to {orig_ce}",
+                  got == orig_ce, err)
+
+        # -- fan curve write-back (re-writing what is already there)
+        if not core.feature("fan_curve"):
+            check("fan curves", "curve write-back", True,
+                  "skipped: no proven curve registers for this model")
+        else:
+            try:
+                cur = self.ec.curve("cpu")
+                self.ec.set_curve("cpu", cur["temps"], cur["speeds"])
+                back = self.ec.curve("cpu")
+                same = back == cur
+                check("fan curves", "cpu curve re-written unchanged", same,
+                      f"{cur['temps']} / {cur['speeds']}" if same else
+                      "the write-back did not stick")
+            except (BackendError, ValidationError, NotSupported) as e:
+                check("fan curves", "cpu curve write-back", False, str(e))
+
+        # -- cpufreq write-back (re-capping every core where it already is)
+        freq = st.get("freq") or {}
+        if not freq.get("present"):
+            check("cpu frequency", "cpufreq write-back", True,
+                  "skipped: no cpufreq on this machine")
+        elif freq.get("max_khz") is None:
+            check("cpu frequency", "cpufreq write-back", True,
+                  "skipped: the cores currently disagree on their caps")
+        else:
+            try:
+                self.freq.set_all_max(freq["max_khz"])
+                check("cpu frequency", "cpufreq write-back", True,
+                      f"every core re-capped at "
+                      f"{core.khz_to_ghz(freq['max_khz'])} GHz")
+            except (BackendError, ValidationError) as e:
+                check("cpu frequency", "cpufreq write-back", False, str(e))
+
+        # -- sanity: what the sensors say must be plausible
+        for which in ("cpu", "gpu"):
+            d = st.get(which) or {}
+            r = d.get("rpm")
+            if not core.feature("rpm"):
+                check("sanity", f"{which} RPM", True,
+                      "skipped: no proven tachometer registers")
+            else:
+                check("sanity", f"{which} RPM plausible at {r}",
+                      r is None or 0 <= r < 10000,
+                      "" if r is None or 0 <= r < 10000 else
+                      "implausible tachometer count")
+            t = d.get("temp")
+            check("sanity", f"{which} temperature plausible at {t}",
+                  t is None or 0 <= t <= 110,
+                  "" if t is None or 0 <= t <= 110 else
+                  "implausible temperature")
+
+        # -- informational: the MUX agrees with itself unless a switch is
+        # -- pending; the OC mailbox, if this kernel exposes one
+        if core.feature("mux") and st.get("graphics"):
+            g = st["graphics"]
+            if g.get("reboot_required"):
+                check("graphics mode", "running vs requested mode", True,
+                      "a switch is pending; the reboot applies it")
+            else:
+                check("graphics mode", "running vs requested mode", True,
+                      f"both sources say {g.get('effective')}")
+        uv = st.get("undervolt") or {}
+        if uv.get("msr_present"):
+            planes = uv.get("planes") or {}
+            active = sum(1 for v in planes.values() if v)
+            check("undervolting", "OC mailbox reads", True,
+                  f"{active} active offset"
+                  f"{'s' if active != 1 else ''}")
+        else:
+            check("undervolting", "OC mailbox reads", True,
+                  "skipped: no MSR devices (is the msr module loaded?)")
+
+        passed = sum(1 for r in results if r["ok"])
+        ok_all = passed == len(results)
+        log.info("self-test: %d/%d checks passed", passed, len(results))
+        return {"ok": ok_all, "results": results,
+                "summary": (f"self-test: {passed}/{len(results)} checks "
+                            "passed" if ok_all else
+                            f"self-test: {len(results) - passed} check"
+                            f"{'s' if len(results) - passed != 1 else ''} "
+                            f"failed of {len(results)}"),
+                "markdown": core.selftest_markdown(st, results)}
+
     # -- command dispatch -----------------------------------------------------
 
     def handle(self, cmd: dict) -> dict:
@@ -1006,12 +1668,70 @@ class Service:
                     data["curve"] = st["curve"]
                 if st["battery"] and st["battery"]["charge_end"] is not None:
                     data["charge_end"] = st["battery"]["charge_end"]
+                # The CPU-side state is saved the same way: a named, saved
+                # bundle may carry it; the built-ins and the re-apply
+                # snapshot still do not.
+                if (st.get("freq") or {}).get("max_khz") is not None:
+                    data["freq_khz"] = st["freq"]["max_khz"]
+                planes = (st.get("undervolt") or {}).get("planes") or {}
+                live = {p: mv for p, mv in planes.items() if mv}
+                if live:
+                    data["undervolt"] = live
                 self.profiles.save(name_, data)
                 return {"saved": core.check_profile_name(name_)}
             raise ValidationError(f"unknown profile action {action!r}")
         if name == "capture-factory":
             result = self.capture_factory()
             return {"captured": "factory", "result": result}
+        if name == "freq":
+            action = cmd.get("action", "show")
+            if action == "show":
+                return self.freq.facts()
+            if action == "set":
+                # Not folded into the re-apply snapshot deliberately: the
+                # kernel resets scaling_max_freq at boot anyway, and a
+                # frequency cap is a live decision (plugged in vs battery),
+                # not a machine state like the shift mode is.
+                return self.freq.set_all_max(cmd.get("max_khz"))
+            raise ValidationError(f"unknown freq action {action!r}")
+        if name == "undervolt":
+            action = cmd.get("action", "show")
+            if action == "show":
+                return {"planes": self.uv.read_planes(),
+                        "msr_present": self.uv.available(),
+                        "allowed": bool(self.cfg.get("AllowUndervolt"))}
+            # The write is deliberately gated: an offset that is too deep
+            # freezes the machine with the fans spinning, and the BIOS
+            # unlock it rests on is a conscious act.  Nothing about it
+            # persists on the daemon side; the GUI re-applies a saved set
+            # when the *app* starts, which is the whole stability design.
+            if not self.cfg.get("AllowUndervolt"):
+                raise ValidationError(
+                    "undervolting is disabled (set AllowUndervolt in "
+                    f"{core.config_path()})")
+            if action == "apply":
+                clean = self.uv.apply(cmd.get("values") or {})
+                return {"applied": clean,
+                        "summary": "; ".join(
+                            f"{p} {clean[p]} mV" for p, _ in core.UV_PLANES),
+                        "volatile": "the offsets clear at reboot and sleep"}
+            if action == "reset":
+                clean = self.uv.apply({p: 0 for p, _ in core.UV_PLANES})
+                return {"applied": clean, "summary": "all offsets back to 0",
+                        "volatile": "the offsets clear at reboot and sleep"}
+            raise ValidationError(f"unknown undervolt action {action!r}")
+        if name == "overdrive":
+            action = cmd.get("action", "show")
+            if action == "show":
+                return self.overdrive_status()
+            if action == "set":
+                out = self.ec.set_overdrive(cmd.get("on") is True)
+                out.update({"supported": True,
+                            "summary": ("display overdrive on"
+                                        if out["now"] else
+                                        "display overdrive off")})
+                return out
+            raise ValidationError(f"unknown overdrive action {action!r}")
         if name == "graphics":
             action = cmd.get("action", "show")
             if action == "show":
@@ -1029,6 +1749,13 @@ class Service:
                     if changes else "re-applied: nothing to change",
                     "activity": ("Re-applied settings: " + "; ".join(acts))
                     if acts else "Re-applied settings: nothing to change"}
+        if name == "selftest":
+            # The same reversible round-trip verify.sh performs, inside the
+            # daemon where the writes already live: every mode walked, every
+            # value read back, everything restored.  The client gates it
+            # deliberately (--yes / a dialog), exactly like the graphics
+            # switch.
+            return self.selftest()
         if name == "raw":
             if not self.cfg.get("AllowRaw"):
                 raise ValidationError(

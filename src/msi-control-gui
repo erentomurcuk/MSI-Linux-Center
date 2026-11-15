@@ -8,10 +8,19 @@ worker thread so a slow EC transfer can never freeze the UI.
 Sections (sidebar):
   Dashboard    live temps / fan speeds / RPM / battery
   Performance  shift mode (eco/comfort/sport/turbo) + cooler boost + MUX
+               + panel overdrive (when the model file proves the register)
+  Frequency    all-core CPU max frequency, with four save slots
+  Undervolt    Intel voltage offsets (OC mailbox; BIOS unlock required;
+               volatile by design, re-applied at app start when saved)
   Fans         fan mode + draggable CPU/GPU fan curves (with factory ghost)
   Battery      charge limit (the "stop charging at N%" setting)
   Profiles     built-in + saved setting bundles
-  Settings     daemon state, re-apply, factory capture, raw EC console
+  Settings     daemon state, re-apply, factory capture, sections, raw console
+
+Frequency and Undervolt are per-user pages (they tune the CPU, not the MSI
+EC), so they can be hidden from the Settings tab and everything they need -
+slots, the startup undervolt set, visibility - is personal state in
+QSettings, never the daemon's config.
 
 Design rules (same ones the daemon enforces; the GUI is just a client):
   * every value is validated by msi_control before it is sent;
@@ -25,12 +34,17 @@ one place and the two themes cannot drift apart.  `MSI_THEME=light|dark`
 forces one; otherwise the desktop's own colour scheme decides, defaulting to
 dark when the platform does not report one (as offscreen does not).
 
-The look is MSI's: the accent is MSI red, and the app mark is a red shield
-carrying the model name: the badge language a gaming laptop is expected to
-have.  The temperature bands stay green→amber→orange→red, because those are
-*status* rather than chrome, so the red accent never has to double as
-"critical": an interactive control is red because it is the brand, a hot
-reading is red because it is hot, and the two never mean the same thing.
+The look is deliberately quiet, in the direction of a modern settings app
+rather than a gaming dashboard: a near-flat background, cards that float on
+it separated by hairlines instead of boxes-in-boxes, pill-shaped buttons,
+rounded selection pills in the sidebar, and one saturated colour.  That one
+colour is MSI red: the accent is the *only* "selected / this is your value"
+colour, and the red shield with Tux on it is the app mark, in the window, the
+menu and the tray.  The temperature bands stay green→amber→orange→red,
+because those are *status* rather than chrome, so the red accent never has
+to double as "critical": an interactive control is red because it is the
+brand, a hot reading is red because it is hot, and the two never mean the
+same thing.
 
 Shape, spacing and type each come from one scale (`SPACE`, `R_CARD`/`R_CTRL`/
 `R_INNER`, `TYPE_*`).  They used to be chosen per widget: six different corner
@@ -121,14 +135,15 @@ def temp_color(temp):
 # --------------------------------------------------------------------------
 
 SPACE = 8             # one spacing unit; margins and gaps are multiples of it
-R_CARD = 16           # cards and dialogs
-R_CTRL = 10           # buttons, inputs, list rows
-R_INNER = 12          # an inset panel inside a card (the curve plot)
-PAGE_PAD = 20         # a page's outer margin, left and right
-PAGE_PAD_V = 18       # ... and top / bottom
-PAGE_GAP = 14         # the gap between a page's cards
-R_PILL = 8            # chips, badges, menu rows, tooltips
-R_BAR = 5             # progress bars and the slider groove
+R_CARD = 20           # cards and dialogs
+R_BTN = 18            # buttons are full pills: half of the 36 px control rung
+R_CTRL = 10           # inputs, list rows
+R_INNER = 14          # an inset panel inside a card (the curve plot)
+PAGE_PAD = 24         # a page's outer margin, left and right
+PAGE_PAD_V = 20      # ... and top / bottom
+PAGE_GAP = 16         # the gap between a page's cards
+R_PILL = 9            # chips, badges, menu rows, tooltips: half a row tall
+R_BAR = 3             # progress bars and the slider groove
 
 # Control geometry.  One rung for every button, single-line field, spin box
 # and sidebar row, so they are the same height by construction rather than by
@@ -142,7 +157,7 @@ H_CTRL = 22           # → a 36 px rendered control
 H_SPIN = 19           # → also 36 px: a spin box adds 3 px of its own
 H_SLIDER = 28         # the charge slider's touch target (a slider, not a
                       # button; the handle needs room the text does not)
-H_BAR = 8             # the stat tiles' progress bar
+H_BAR = 6             # the stat tiles' progress bar
 ICON_SM = 16          # every icon drawn in a row of text, so none of them
                       # can make its own row taller than the text beside it
 
@@ -186,16 +201,35 @@ def _srgb(v: float) -> float:
     return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
 
 
+def _lum(hex_color: str) -> float:
+    c = QColor(hex_color)
+    return (0.2126 * _srgb(c.redF()) + 0.7152 * _srgb(c.greenF())
+            + 0.0722 * _srgb(c.blueF()))
+
+
+def _contrast_ratio(a: str, b: str) -> float:
+    """WCAG contrast of two colours, the way the smoke test measures it."""
+    la, lb = _lum(a), _lum(b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _blend_hex(a: str, b: str, f: float) -> str:
+    """`f` of the way from colour a to colour b, in sRGB space."""
+    ca, cb = QColor(a), QColor(b)
+    mixed = [round(x * (1 - f) + y * f)
+              for x, y in ((ca.red(), cb.red()), (ca.green(), cb.green()),
+                           (ca.blue(), cb.blue()))]
+    return QColor(*mixed).name()
+
+
 def text_on(background: str) -> str:
     """Black or white text, whichever is readable on `background`.
 
     White on the amber "hot" colour measures ~2.9:1; it looks fine in a
     mockup and fails WCAG AA in use.  Luminance decides, not habit.
     """
-    c = QColor(background)
-    lum = (0.2126 * _srgb(c.redF()) + 0.7152 * _srgb(c.greenF())
-           + 0.0722 * _srgb(c.blueF()))
-    return "#000000" if lum > 0.18 else "#ffffff"
+    return "#000000" if _lum(background) > 0.18 else "#ffffff"
 
 
 def _rgba(hex_color: str, alpha: float) -> str:
@@ -224,31 +258,94 @@ def muted_color(widget) -> str:
 # Theme: one token set per theme, one stylesheet, so nothing drifts.
 # --------------------------------------------------------------------------
 
+# The surface language is deliberately quiet: one background, one card
+# colour, one fill for nested controls, with only a hairline between them.
+# A tab of cards is read as a set of surfaces floating on the background
+# (the slab-of-glass look of a settings window on a modern desktop), so the
+# separation has to come from the colours themselves rather than from
+# borders the eye trips over.
 _DARK = {
     "name": "dark",
-    "bg": "#0b0c0f", "surface": "#131519", "surface2": "#1a1d23",
-    "surface3": "#23272f", "border": "#282d36", "border_strong": "#3b414d",
-    "text": "#eceef3", "text_dim": "#b4bbc7", "muted": "#7f8794",
+    "bg": "#0a0a0c", "surface": "#151518", "surface2": "#1d1d21",
+    "surface3": "#26262b", "border": "#232328", "border_strong": "#333339",
+    "text": "#f5f5f7", "text_dim": "#c7c7cc", "muted": "#8e8e95",
     "accent": "#e2231a", "accent_hover": "#ff4a3d",
 }
 
 _LIGHT = {
     "name": "light",
-    "bg": "#eef0f4", "surface": "#ffffff", "surface2": "#f5f6fa",
-    "surface3": "#eaedf3", "border": "#e2e5ec", "border_strong": "#cad0dc",
-    "text": "#15171c", "text_dim": "#4a5160", "muted": "#6b7383",
+    "bg": "#f5f5f7", "surface": "#ffffff", "surface2": "#f2f2f7",
+    "surface3": "#e8e8ed", "border": "#ececf1", "border_strong": "#d6d6de",
+    "text": "#1d1d1f", "text_dim": "#48484d", "muted": "#86868b",
     "accent": "#c8102e", "accent_hover": "#a30d25",
 }
 
 
-def _theme(base: dict) -> dict:
+# The accent presets.  The accent is the one "this is your selection"
+# colour (checked chips, sliders, the selected row, the curve you own), so
+# it is a preference, not the brand: the shield mark stays MSI red whatever
+# is picked here.  Each preset carries one pair per theme, because the
+# same swatch that reads well on near-black turns to mud on white: the dark
+# side is lifted brighter than the light side is deep.  The set stops where
+# the temperature bands already live: green, amber and hot red are what the
+# dashboard's readings mean, and borrowing one for chrome would make a
+# selected chip read as a temperature.
+ACCENTS = {
+    "msi-red": {"label": "MSI red",
+                "dark": {"accent": "#e2231a", "accent_hover": "#ff4a3d"},
+                "light": {"accent": "#c8102e", "accent_hover": "#a30d25"}},
+    "blue": {"label": "Blue",
+             "dark": {"accent": "#3b82f6", "accent_hover": "#60a5fa"},
+             "light": {"accent": "#2563eb", "accent_hover": "#1d4ed8"}},
+    "purple": {"label": "Purple",
+               "dark": {"accent": "#a78bfa", "accent_hover": "#c4b5fd"},
+               "light": {"accent": "#7c3aed", "accent_hover": "#6d28d9"}},
+    "teal": {"label": "Teal",
+             "dark": {"accent": "#14b8a6", "accent_hover": "#2dd4bf"},
+             "light": {"accent": "#0f766e", "accent_hover": "#0d5d57"}},
+    "orange": {"label": "Orange",
+               "dark": {"accent": "#fb923c", "accent_hover": "#fdba74"},
+               "light": {"accent": "#ea580c", "accent_hover": "#c2410c"}},
+    "pink": {"label": "Pink",
+             "dark": {"accent": "#ec4899", "accent_hover": "#f472b6"},
+             "light": {"accent": "#db2777", "accent_hover": "#be185d"}},
+}
+ACCENT_DEFAULT = "msi-red"
+
+
+def _accent_ink(accent: str, surface: str, dark: bool) -> str:
+    """Text colour for rows the accent softly tints as selected.
+
+    The selected row's background is the accent at `accent_soft`'s alpha
+    blended over the surface, and the ink has to read on *that* blend, on
+    the bare surface it is measured against in tests: the bare accent is
+    only ~2.6:1 on its own tint, which would put illegible text exactly
+    where every selected row lives.  Fixed lighten (dark) or deepen
+    (light) steps until the blend clears AA, so every preset gets a
+    measured ink rather than the hand-tuned value that only suited MSI red.
+    """
+    soft_alpha = 0.18 if dark else 0.12
+    row = _blend_hex(accent, surface, soft_alpha)
+    toward = "#ffffff" if dark else "#000000"
+    for f in (0.0, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9):
+        cand = _blend_hex(accent, toward, f)
+        if _contrast_ratio(cand, row) >= 4.5:
+            return cand
+    return toward          # unreachable in practice; readable regardless
+
+
+def _theme(base: dict, accent_id: str = ACCENT_DEFAULT) -> dict:
     """Add the derived tokens a theme needs on top of its base colours."""
     t = dict(base)
     dark = t["name"] == "dark"
+    preset = ACCENTS.get(accent_id, ACCENTS[ACCENT_DEFAULT])
+    t.update(preset["dark" if dark else "light"])
+    if accent_id not in ACCENTS:
+        accent_id = ACCENT_DEFAULT
+    t["accent_id"] = accent_id
     t["on_accent"] = text_on(t["accent"])
     t["accent_soft"] = _rgba(t["accent"], 0.18 if dark else 0.12)
-    t["accent_ink"] = ("#ffb0aa" if dark else "#a30d25")
-    t["accent_line"] = t["accent"]
+    t["accent_ink"] = _accent_ink(t["accent"], t["surface"], dark)
     t["bar_bg"] = ("rgba(255,255,255,0.10)" if dark else "rgba(0,0,0,0.09)")
     t["scroll"] = ("rgba(255,255,255,0.16)" if dark else "rgba(0,0,0,0.16)")
     t["scroll_hover"] = ("rgba(255,255,255,0.30)" if dark else "rgba(0,0,0,0.30)")
@@ -258,15 +355,29 @@ def _theme(base: dict) -> dict:
     # them the same way it interpolates colour.
     t["r_card"], t["r_ctrl"], t["r_inner"] = (f"{R_CARD}px", f"{R_CTRL}px",
                                               f"{R_INNER}px")
-    t["r_pill"], t["r_bar"] = f"{R_PILL}px", f"{R_BAR}px"
+    t["r_pill"], t["r_bar"], t["r_btn"] = (f"{R_PILL}px", f"{R_BAR}px",
+                                           f"{R_BTN}px")
     t["pad_ctrl_v"] = f"{PAD_CTRL_V}px"
     t["pad_hero_v"] = f"{PAD_HERO_V}px"
     t["h_ctrl"], t["h_spin"] = f"{H_CTRL}px", f"{H_SPIN}px"
     return t
 
 
-THEMES = {"dark": _theme(_DARK), "light": _theme(_LIGHT)}
+THEME_BASES = {"dark": _DARK, "light": _LIGHT}
+
+
+def build_theme(name: str, accent_id: str = ACCENT_DEFAULT) -> dict:
+    """One theme's tokens with one accent laid over them.
+
+    Public for the smoke test: it measures every preset's contrast in both
+    themes, not only the one this process happens to be wearing.
+    """
+    return _theme(THEME_BASES.get(name, _DARK), accent_id)
+
+
+THEMES = {n: build_theme(n) for n in THEME_BASES}
 THEME = THEMES["dark"]                  # replaced by apply_theme()
+ACCENT = ACCENT_DEFAULT                 # replaced by apply_theme()
 
 # The stylesheet is `%`-templated, not an f-string: QSS is full of braces and
 # `%(token)s` leaves every one of them alone.
@@ -279,8 +390,12 @@ QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 #Page { background: transparent; }
 
-#Header { background: %(surface)s; border-bottom: 1px solid %(border)s; }
-#Sidebar { background: %(surface)s; border-right: 1px solid %(border)s; }
+/* Header and sidebar share the window background, with no separator: the
+   page's cards float on it and their own edges are the only lines.  A header
+   rule or a sidebar border is chrome that says "these are panels", which
+   is the opposite of the quiet slab this UI is going for. */
+#Header { background: %(bg)s; }
+#Sidebar { background: %(bg)s; }
 
 #Card { background: %(surface)s; border: 1px solid %(border)s;
         border-radius: %(r_card)s; }
@@ -305,7 +420,7 @@ QSpinBox { min-height: %(h_spin)s; }
 
 QPushButton {
     background: %(surface2)s; border: 1px solid %(border_strong)s;
-    border-radius: %(r_ctrl)s; padding: %(pad_ctrl_v)s 14px; color: %(text)s;
+    border-radius: %(r_btn)s; padding: %(pad_ctrl_v)s 14px; color: %(text)s;
 }
 QPushButton:hover { background: %(surface3)s; border-color: %(muted)s; }
 QPushButton:pressed { background: %(border)s; }
@@ -345,21 +460,20 @@ QPushButton[ghost="true"] { background: transparent; border-color: transparent;
 QPushButton[ghost="true"]:hover { background: %(surface3)s; color: %(text)s; }
 QPushButton[ghost="true"]:pressed { background: %(border)s; }
 
-/* Nav rows: a squared-off left rule marks the current section while the rest
-   of the row keeps the control radius.  Same vertical padding as a button, so
-   a nav row and a page control are the same height. */
+/* Nav rows: rounded pills on the shared background.  The current section
+   reads from a neutral fill plus the accent-tinted icon, not from a
+   coloured bar: the red stays what it means everywhere else (an interactive
+   value), and the section chrome stays quiet.  Same vertical padding as a
+   button, so a nav row and a page control are the same height. */
 #Sidebar QPushButton[nav="true"] {
     background: transparent; border: 1px solid transparent;
-    border-left: 3px solid transparent;
-    border-top-right-radius: %(r_ctrl)s; border-bottom-right-radius: %(r_ctrl)s;
-    border-top-left-radius: 0; border-bottom-left-radius: 0;
+    border-radius: %(r_ctrl)s;
     padding: %(pad_ctrl_v)s 12px; text-align: left; color: %(text_dim)s;
 }
 #Sidebar QPushButton[nav="true"]:hover { background: %(surface3)s;
                                          color: %(text)s; }
 #Sidebar QPushButton[nav="true"]:checked {
-    background: %(accent_soft)s; color: %(accent_ink)s; font-weight: bold;
-    border-left: 3px solid %(accent_line)s;
+    background: %(surface3)s; color: %(text)s; font-weight: 600;
 }
 
 /* --------------------------------------------------------------- readouts */
@@ -367,11 +481,15 @@ QProgressBar { background: %(bar_bg)s; border: none;
                border-radius: %(r_bar)s; }
 QProgressBar::chunk { background: %(accent)s; border-radius: %(r_bar)s; }
 
+/* The slider is the one control a finger drags rather than clicks, so it
+   gets an iOS-shaped appearance: a thin groove, the filled part in the
+   accent, and a white round handle that grows the accent ring on hover. */
 QSlider::groove:horizontal { height: 6px; background: %(bar_bg)s;
                              border-radius: 3px; }
 QSlider::sub-page:horizontal { background: %(accent)s; border-radius: 3px; }
-QSlider::handle:horizontal { width: 18px; height: 18px; margin: -7px 0;
-    border-radius: 9px; background: %(surface)s; border: 2px solid %(accent)s; }
+QSlider::handle:horizontal { width: 20px; height: 20px; margin: -8px 0;
+    border-radius: 10px; background: %(surface)s; border: 2px solid %(accent)s;
+}
 QSlider::handle:horizontal:hover { background: %(accent)s; }
 QSlider:focus { border: none; }
 QSlider::handle:horizontal:focus { border-color: %(accent_hover)s; }
@@ -396,14 +514,13 @@ QPlainTextEdit, QListWidget {
 }
 QPlainTextEdit:hover, QListWidget:hover { border-color: %(muted)s; }
 QPlainTextEdit:focus, QListWidget:focus { border-color: %(accent)s; }
-QListWidget::item { padding: 7px 9px; border-radius: %(r_ctrl)s; }
+QListWidget::item { padding: 7px 9px; border-radius: %(r_pill)s; }
 QListWidget::item:selected { background: %(accent_soft)s;
                              color: %(accent_ink)s; font-weight: bold; }
 QListWidget::item:hover { background: %(surface3)s; }
 
 /* ------------------------------------------------------------------ chrome */
-QStatusBar { background: %(surface)s; border-top: 1px solid %(border)s;
-             color: %(text_dim)s; }
+QStatusBar { background: %(bg)s; color: %(text_dim)s; }
 QStatusBar::item { border: none; }
 
 QMenu { background: %(surface)s; border: 1px solid %(border)s;
@@ -471,14 +588,17 @@ def resolve_theme(app) -> str:
     return "dark"
 
 
-def apply_theme(app=None, force: str | None = None) -> str:
+def apply_theme(app=None, force: str | None = None,
+                accent: str | None = None) -> str:
     """Install the palette + stylesheet.  Safe to call more than once."""
-    global THEME
+    global THEME, ACCENT
     app = app or QApplication.instance()
     if app is None:
         return "dark"
     name = force or resolve_theme(app)
-    THEME = THEMES.get(name, THEMES["dark"])
+    if accent is not None:
+        ACCENT = accent if accent in ACCENTS else ACCENT_DEFAULT
+    THEME = build_theme(name, ACCENT)
     app.setPalette(_palette(THEME))
     app.setStyleSheet(QSS % THEME)
     app.setProperty("msi_theme", THEME["name"])
@@ -586,6 +706,29 @@ def glyph_pixmap(name: str, size: int = 20, color: str = "#ffffff") -> QPixmap:
         p.setBrush(c)
         p.drawEllipse(QPointF(pad + 0.5 * w, pad + 0.82 * w), 0.06 * w,
                       0.06 * w)
+    elif name == "cpu":                              # chip body with pins
+        p.setBrush(c)
+        p.drawRect(R(0.3, 0.3, 0.4, 0.4))
+        p.setBrush(Qt.NoBrush)
+        for y in (0.28, 0.5, 0.72):
+            for side in (0.14, 0.86):
+                p.drawLine(QPointF(pad + side * w, pad + y * w),
+                           QPointF(pad + (side + (0.02 if side < 0.5
+                                                  else -0.02)) * w,
+                                   pad + y * w))
+    elif name == "volt":                             # arrow down onto a rail
+        p.setBrush(c)
+        p.drawLine(QPointF(pad + 0.5 * w, pad + 0.02 * w),
+                   QPointF(pad + 0.5 * w, pad + 0.58 * w))
+        head = QPainterPath()
+        head.moveTo(pad + 0.26 * w, pad + 0.52 * w)
+        head.lineTo(pad + 0.5 * w, pad + 0.88 * w)
+        head.lineTo(pad + 0.74 * w, pad + 0.52 * w)
+        head.closeSubpath()
+        p.drawPath(head)
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(QPointF(pad + 0.08 * w, pad + w),
+                   QPointF(pad + 0.92 * w, pad + w))
     p.end()
     return pm
 
@@ -900,17 +1043,20 @@ class Client(QObject):
         threading.Thread(target=self._loop, daemon=True,
                          name="msi-control-client").start()
 
-    def submit(self, cmd: dict, tag: str | None = None):
+    def submit(self, cmd: dict, tag: str | None = None,
+               timeout: float = 5.0):
         cmd = dict(cmd)
         cmd["_tag"] = tag or str(cmd.get("cmd", "?"))
+        cmd["_timeout"] = timeout
         self._q.put(cmd)
 
     def _loop(self):
         while True:
             cmd = self._q.get()
             tag = cmd.pop("_tag")
+            timeout = cmd.pop("_timeout", 5.0)
             try:
-                data = core.call(cmd, timeout=5.0)
+                data = core.call(cmd, timeout=timeout)
                 self.reply.emit({"tag": tag, "cmd": cmd, "data": data})
             except Exception as e:                          # noqa: BLE001
                 self.reply.emit({"tag": tag, "cmd": cmd, "error": str(e)})
@@ -936,9 +1082,12 @@ class QSignalBlockerSafe:
 class Card(QFrame):
     """A titled surface with a tidy vertical layout, the GUI's layout atom.
 
-    A plain QFrame + an uppercase caption rather than a QGroupBox: the
+    A plain QFrame + a small bold caption rather than a QGroupBox: the
     groupbox title is drawn by the style at a size and colour we cannot
-    control, which is what made the old tabs read as unstyled."""
+    control, which is what made the old tabs read as unstyled.  The caption
+    keeps the caller's own case: lowercase words set in small bold read as
+    a quiet label, and uppercase words would shout against a surface this
+    plain."""
     def __init__(self, title: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("Card")
@@ -947,13 +1096,9 @@ class Card(QFrame):
         self.box.setSpacing(SPACE + 2)
         self.header = QHBoxLayout()
         self.header.setSpacing(SPACE)
-        self.title = QLabel(title.upper())
+        self.title = QLabel(title)
         self.title.setObjectName("CardTitle")
-        f = ui_font(TYPE_CAPTION, bold=True)
-        # A little tracking on the uppercase captions, so a row of card titles
-        # reads as a set of labels rather than as small shouting body text.
-        f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108.0)
-        self.title.setFont(f)
+        self.title.setFont(ui_font(TYPE_CAPTION, bold=True))
         self.header.addWidget(self.title)
         self.header.addStretch(1)
         if title:
@@ -1098,7 +1243,7 @@ def scrolled(page: QWidget) -> QScrollArea:
 
 
 def page_layout(widget: QWidget) -> QVBoxLayout:
-    """The standard page frame: one margin and one gap for all six sections.
+    """The standard page frame: one margin and one gap for all eight sections.
 
     Every tab used to repeat the same three lines; centralising them is what
     keeps a card on the Dashboard aligned with a card on Settings."""
@@ -1492,7 +1637,7 @@ class DashboardTab(QWidget):
                       (t / 100.0) if t is not None else None,
                       "",
                       temp_color(t),
-                      chip=(band or "").upper(),
+                      chip=(band or "").capitalize(),
                       chip_colour=temp_color(t))
         for card, d in ((self.cpu_rpm, cpu), (self.gpu_rpm, gpu)):
             rpm = d.get("rpm")
@@ -1549,7 +1694,7 @@ class DashboardTab(QWidget):
                 f"limit {limit}%" if limit is not None else "",
             ] if x),
             THEME["accent"],
-            chip=(status.upper() if status else ""),
+            chip=(status or ""),
             chip_colour=chip_col)
 
         rows = {
@@ -1675,17 +1820,67 @@ class PerformanceTab(QWidget):
         self.gfx_warn.setVisible(False)
         gfx.box.addWidget(self.gfx_warn)
         gfx.box.addWidget(hint_label(
-            "⚠ A switch rewrites EC 0x2e and the UEFI variable "
-            f"{core.MUX_VAR_NAME}.  It is off unless “AllowMuxSwitch” is set "
-            "in the config, it always needs a reboot, and on a laptop whose "
-            "MUX was never reverse engineered it can leave the machine with "
-            "no display; recovery would then mean resetting the firmware.  "
-            "The previous value is backed up first.", gfx))
+            "⚠ A switch rewrites the UEFI variable "
+            f"{core.MUX_VAR_NAME}; on firmware with its three-mode marker "
+            "set it writes byte 5, arms EC 0xd1 and waits for the firmware "
+            "to acknowledge.  Other firmware also gets the legacy bytes: "
+            "EC 0x2e bit 6 and the request in variable byte 1.  The switch "
+            "is off unless “AllowMuxSwitch” is set in the config, it always "
+            "needs a reboot, and on a laptop whose MUX was never reverse "
+            "engineered it can leave the machine with no display; recovery "
+            "would then mean resetting the firmware.  The previous value is "
+            "backed up first.", gfx))
         lay.addWidget(gfx)
+
+        # ---- display overdrive --------------------------------------------
+        # Dragon Center's other panel toggle.  On the machines it was
+        # measured on it is one bit of a register the model already knows
+        # (on this project's GS66, the same byte as the webcam and the MUX
+        # state), so it appears only when a model file proves the bit and
+        # toggles instantly; there is no reboot wait like the MUX has.
+        panel = Card("Panel")
+        panel.box.addWidget(hint_label(
+            "Display overdrive drives the panel's pixels harder for faster "
+            "transitions.  Without it a fast panel shows motion ghosting; "
+            "with it, an overshoot can add inverse-ghosting artefacts "
+            "instead, so it is a taste-and-panel setting: Dragon Center's "
+            "own toggle, written to one EC bit the model file names.",
+            panel))
+        prow = QHBoxLayout()
+        prow.setSpacing(SPACE)
+        row, self.od_val = kv_row("display overdrive", panel)
+        prow.addLayout(row)
+        self.od_btns = QButtonGroup(self)
+        self.od_btns.setExclusive(True)
+        self.od_buttons = {}
+        for key, label in (("on", "On"), ("off", "Off")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            mark_checked(b)
+            b.clicked.connect(lambda _=False, k=key: self._overdrive(k))
+            self.od_btns.addButton(b)
+            self.od_buttons[key] = b
+            prow.addWidget(b)
+        prow.addStretch(1)
+        panel.box.addLayout(prow)
+        self.od_note = QLabel("")
+        self.od_note.setWordWrap(True)
+        self.od_note.setVisible(False)
+        panel.box.addWidget(self.od_note)
+        lay.addWidget(panel)
         lay.addStretch(1)
 
         self._avail = []
         self._gfx: dict = {}
+        self._od: dict = {}
+
+    def _overdrive(self, key: str):
+        # One honest rule: same-value clicks are the same no-op everywhere,
+        # so the write never happens when the EC already agrees.
+        if self._od.get("on") == (key == "on"):
+            return
+        self.win.send({"cmd": "overdrive", "action": "set",
+                       "on": key == "on"}, tag="overdrive")
 
     def _boost(self):
         self.win.set_key("cooler_boost", self.boost_btn.isChecked())
@@ -1698,9 +1893,12 @@ class PerformanceTab(QWidget):
         answer = QMessageBox.warning(
             self, "Switch graphics mode",
             f"Switch the graphics mode to {core.MUX_LABELS[mode]}?\n\n"
-            "This writes EC register 0x2e, the EC switch trigger and the "
-            f"UEFI variable {core.MUX_VAR_NAME}.  It takes effect at the "
-            "NEXT REBOOT: nothing changes in this session.\n\n"
+            "This writes the graphics request into the UEFI variable "
+            f"{core.MUX_VAR_NAME} (byte 5 when the firmware speaks the "
+            "three-mode protocol, byte 1 otherwise) and arms the EC switch "
+            "trigger, EC 0x2e bit 6 on firmware without the marker.  It "
+            "takes effect at the NEXT REBOOT: nothing changes in this "
+            "session.\n\n"
             "On a laptop whose MUX was never reverse engineered this can "
             "leave the machine without a display, and recovery would then "
             "mean resetting the firmware.  The current value is saved to a "
@@ -1735,17 +1933,31 @@ class PerformanceTab(QWidget):
 
         online = self.win.online
         model_mux = core.feature("mux")
+        # The variable's own capability bits, when the firmware states them:
+        # a machine whose firmware says "no discrete" must refuse that one
+        # mode with the reason, not offer a button that can only fail.
+        caps = g.get("caps") or {}
+        discrete_banned = caps.get("discrete") is False
         enabled = bool(g.get("enabled")) and bool(online) and model_mux
         for mode, b in self.gfx_buttons.items():
             with QSignalBlockerSafe(b):
                 b.setChecked(mode == g.get("requested"))
-            b.setEnabled(enabled)
-            b.setToolTip("" if enabled else
-                         "no model definition for this laptop enables the "
-                         "graphics switch" if not model_mux else
-                         "the daemon is offline" if not online else
-                         "set “AllowMuxSwitch”: true in the config to enable "
-                         "this")
+            banned = mode == core.MUX_DISCRETE and discrete_banned
+            b.setEnabled(enabled and not banned)
+            if banned:
+                tip = ("the variable says this firmware does not offer "
+                       "discrete mode")
+            elif not model_mux:
+                tip = ("no model definition for this laptop enables the "
+                       "graphics switch")
+            elif not online:
+                tip = "the daemon is offline"
+            elif not enabled:
+                tip = ("set “AllowMuxSwitch”: true in the config to enable "
+                       "this")
+            else:
+                tip = ""
+            b.setToolTip(tip)
         has_backup = bool(g.get("backup"))
         self.gfx_revert.setEnabled(enabled and has_backup)
         self.gfx_revert.setToolTip(
@@ -1770,6 +1982,10 @@ class PerformanceTab(QWidget):
         elif not online:
             note = "the daemon is offline, so nothing can be written"
             style = notice_style(muted_color(self))
+        elif discrete_banned:
+            note = ("⚠ the variable says this firmware does not offer "
+                    "discrete mode; hybrid remains available")
+            style = notice_style(COL_WARM, COL_WARM)
         elif pending:
             note = "⚠ a reboot is required for the requested mode to apply"
             style = notice_style(COL_HOT, COL_HOT)
@@ -1779,6 +1995,37 @@ class PerformanceTab(QWidget):
         self.gfx_warn.setText(note)
         self.gfx_warn.setStyleSheet(style)
         self.gfx_warn.setVisible(bool(note))
+
+    def refresh_overdrive(self, st: dict):
+        od = st.get("overdrive") or {}
+        self._od = od
+        supported = bool(od.get("supported"))
+        on = od.get("on")
+        online = bool(self.win.online)
+        self.od_val.setText("on" if on else ("off" if on is not None else "?"))
+        enabled = supported and on is not None and online
+        for key, b in self.od_buttons.items():
+            with QSignalBlockerSafe(b):
+                b.setChecked(on is not None and (key == "on") == bool(on))
+            b.setEnabled(enabled)
+        if not supported:
+            note = ("no proven register in this laptop's model file, so the "
+                    "toggle stays off; an unproven EC bit is exactly the "
+                    "kind of write this app refuses")
+            style = notice_style(muted_color(self))
+        elif on is None:
+            note = ("the register is unreachable right now (daemon offline "
+                    "or the debug interface down)")
+            style = notice_style(muted_color(self))
+        elif not online:
+            note = "the daemon is offline, so nothing can be written"
+            style = notice_style(muted_color(self))
+        else:
+            note = ""
+            style = ""
+        self.od_note.setText(note)
+        self.od_note.setStyleSheet(style)
+        self.od_note.setVisible(bool(note))
 
     def refresh(self, st: dict):
         cur = st.get("shift", {}).get("current")
@@ -1810,6 +2057,534 @@ class PerformanceTab(QWidget):
         else:
             self.boost_btn.setStyleSheet("")
         self.refresh_graphics(st)
+        self.refresh_overdrive(st)
+        self.refresh_overdrive(st)
+
+
+FREQ_STEP_KHZ = 100_000            # one slider notch is 100 MHz
+FREQ_SLOTS = 4
+
+PLANE_NOTES = {
+    "core": "the CPU cores",
+    "cache": "the ring bus; core and cache share a rail on this "
+             "generation, so the shallower of the two wins",
+    "gpu": "the integrated GPU (the discrete card has its own voltage)",
+    "uncore": "the system agent; usually left at 0",
+    "analogio": "the analog I/O domain; usually has no effect",
+}
+
+
+class CpuFreqTab(QWidget):
+    """The all-cores max frequency knob, plus the user's four quick slots.
+
+    Reads are world-readable sysfs, so the page works with the daemon down
+    (degraded: the numbers stay live, Apply refuses).  The quick slots hold
+    whole-GHz-setpoints the user chose once, like the four setfreq scripts
+    this replaces; they are per-user preferences in QSettings, because they
+    tune this user's laptop, not the machine's EC.
+    """
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        self._applied: int | None = None     # the hardware's own max, kHz
+        self._loaded = False
+        self._scale_range = None             # endpoints, rebuilt on change
+        lay = page_layout(self)
+
+        card = Card("Maximum frequency")
+        self.rows = {}
+        for label in ("all cores at", "hardware range"):
+            row, v = kv_row(label, card)
+            card.box.addLayout(row)
+            self.rows[label] = v
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setSingleStep(1)
+        self.slider.setPageStep(5)               # 500 MHz per drag notch
+        self.slider.setMinimumHeight(H_SLIDER)
+        self.slider.setAccessibleName("Maximum frequency")
+        self.slider.setToolTip(
+            "Where every core's ceiling goes.  Nothing is written until "
+            "you press Apply.")
+        self.slider.valueChanged.connect(self._pending_changed)
+        self._scale = QHBoxLayout()
+        card.box.addWidget(self.slider)
+        card.box.addLayout(self._scale)
+
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.setProperty("primary", True)
+        self.apply_btn.setToolTip("Write the chosen maximum to every core")
+        self.apply_btn.clicked.connect(self._apply)
+        self.revert_btn = QPushButton("Revert")
+        self.revert_btn.setToolTip("Discard the pending change")
+        self.revert_btn.clicked.connect(self._revert)
+        row.addStretch(1)
+        row.addWidget(self.revert_btn)
+        row.addWidget(self.apply_btn)
+        card.box.addLayout(row)
+
+        self.pending_label = QLabel("")
+        self.pending_label.setWordWrap(True)
+        self.pending_label.setFont(ui_font(TYPE_BODY, bold=True))
+        self.pending_label.setVisible(False)
+        card.box.addWidget(self.pending_label)
+
+        card.box.addWidget(hint_label(
+            "Caps how fast every core may run, on top of the shift mode.  "
+            "Lower it when plugged into a hot charger or on battery to "
+            "trade peak speed for a lot of heat and noise.  It resets at "
+            "reboot and never touches the EC: this is the kernel's own "
+            "cpufreq, written by the daemon.", card))
+        lay.addWidget(card)
+
+        slots = Card("Quick slots")
+        slots.box.addWidget(hint_label(
+            "Four set-and-forget ceilings, like the setfreq scripts this "
+            "replaces.  Click a value to select it (still needs Apply to "
+            "write); Store keeps the slider's current choice there.",
+            slots))
+        self.slot_btns = {}
+        self.slot_store_btns = {}
+        self.slot_clear_btns = {}
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(SPACE)
+        grid.setVerticalSpacing(SPACE)
+        for i in range(FREQ_SLOTS):
+            name = f"Slot {i + 1}"
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, n=i: self._slot_pick(n))
+            store = QPushButton("Store")
+            store.setToolTip("Save the slider's current value here")
+            store.setCursor(Qt.PointingHandCursor)
+            store.clicked.connect(lambda _=False, n=i: self._slot_store(n))
+            clear = QPushButton("Clear")
+            clear.setToolTip("Empty this slot")
+            clear.setCursor(Qt.PointingHandCursor)
+            clear.clicked.connect(lambda _=False, n=i: self._slot_clear(n))
+            grid.addWidget(b, i, 0)
+            grid.addWidget(store, i, 1)
+            grid.addWidget(clear, i, 2)
+            self.slot_btns[i] = b
+            self.slot_store_btns[i] = store
+            self.slot_clear_btns[i] = clear
+        slots.box.addLayout(grid)
+        slots.box.addWidget(hint_label(
+            "The slots live in this desktop's own settings, not the "
+            "daemon's config; they are your shortcuts, not machine state.",
+            slots))
+        lay.addWidget(slots)
+        lay.addStretch(1)
+        self._sync_slots()
+        self._sync_pending()
+
+    # -- facts ---------------------------------------------------------------
+
+    def _facts(self, st: dict) -> dict:
+        # The status payload has it when the daemon is up, and the exact same
+        # numbers are world-readable, so offline still shows them.
+        f = st.get("freq") if st and isinstance(st, dict) else None
+        if f:
+            return f
+        return core.cpufreq_facts()
+
+    # -- pending vs applied (the same state machine the battery uses) ------
+
+    def _dirty(self) -> bool:
+        if not self._loaded:
+            return False
+        if self._applied is None:
+            return True
+        return self.slider.value() * FREQ_STEP_KHZ != self._applied
+
+    def _pending_changed(self, _value: int):
+        self._sync_pending()
+
+    def _revert(self):
+        if self._applied is not None:
+            with QSignalBlockerSafe(self.slider):
+                self.slider.setValue(self._applied // FREQ_STEP_KHZ)
+        self._sync_pending()
+
+    def _apply(self):
+        khz = self.slider.value() * FREQ_STEP_KHZ
+        self.win.send({"cmd": "freq", "action": "set", "max_khz": khz},
+                      tag="freq")
+
+    def _sync_pending(self):
+        dirty = self._dirty()
+        online = bool(self.win.online)
+        self.apply_btn.setEnabled(online and dirty)
+        self.revert_btn.setEnabled(online and dirty)
+        self.apply_btn.setText(
+            f"Apply {core.khz_to_ghz(self.slider.value() * FREQ_STEP_KHZ)}"
+            " GHz" if dirty else "Apply")
+        self.apply_btn.setToolTip(
+            "Write the maximum to every core" if (online and dirty)
+            else "Nothing pending" if online
+            else "The daemon is not running, so nothing can be written")
+        if dirty:
+            now = (f"{core.khz_to_ghz(self._applied)} GHz applied"
+                   if self._applied is not None else "no reading yet")
+            self.pending_label.setText(
+                f"{now} · "
+                f"{core.khz_to_ghz(self.slider.value() * FREQ_STEP_KHZ)} GHz "
+                "pending")
+            self.pending_label.setVisible(True)
+        else:
+            self.pending_label.setVisible(False)
+
+    # -- the four slots ------------------------------------------------------
+
+    def _slot_khz(self, i: int) -> int | None:
+        v = self.win._qs.value(f"freq/slot{i + 1}", type=int)
+        # QSettings returns 0 for a missing key with type=int; 0 is not a
+        # frequency anyone would store, so it means "empty".
+        return v if v else None
+
+    def _sync_slots(self):
+        cur = self._applied
+        dirty_val = self.slider.value() * FREQ_STEP_KHZ if self._loaded \
+            else None
+        for i in range(FREQ_SLOTS):
+            khz = self._slot_khz(i)
+            b = self.slot_btns[i]
+            if khz:
+                b.setText(f"{i + 1} · {core.khz_to_ghz(khz)} GHz")
+                b.setEnabled(True)
+            else:
+                b.setText(f"{i + 1} · empty")
+                b.setEnabled(False)
+            with QSignalBlockerSafe(b):
+                b.setChecked(bool(khz) and (khz == dirty_val))
+            self.slot_clear_btns[i].setEnabled(bool(khz))
+            # Store fills a slot, so it works for an empty slot too: an
+            # empty slot is precisely where a new value goes.
+            self.slot_store_btns[i].setEnabled(
+                bool(self._loaded) and dirty_val is not None)
+
+    def _slot_pick(self, i: int):
+        khz = self._slot_khz(i)
+        if khz is None:
+            return
+        with QSignalBlockerSafe(self.slider):
+            self.slider.setValue(khz // FREQ_STEP_KHZ)
+        self._sync_pending()
+        self._sync_slots()
+        self.win.flash(f"slot {i + 1}: {core.khz_to_ghz(khz)} GHz selected, "
+                       "press Apply to write it")
+
+    def _slot_store(self, i: int):
+        khz = self.slider.value() * FREQ_STEP_KHZ
+        if not self._loaded or khz is None:
+            return
+        self.win._qs.setValue(f"freq/slot{i + 1}", khz)
+        self._sync_slots()
+        self.win.flash(f"slot {i + 1} now stores "
+                       f"{core.khz_to_ghz(khz)} GHz", ok=True)
+
+    def _slot_clear(self, i: int):
+        self.win._qs.remove(f"freq/slot{i + 1}")
+        self._sync_slots()
+        self.win.flash(f"slot {i + 1} cleared")
+
+    def refresh(self, st: dict):
+        online = bool(self.win.online)
+        f = self._facts(st)
+        if not f.get("present"):
+            self.rows["all cores at"].setText("unavailable")
+            self.rows["hardware range"].setText("-")
+            self.slider.setEnabled(False)
+            self.apply_btn.setEnabled(False)
+            self.revert_btn.setEnabled(False)
+            return
+        lo = f.get("cpuinfo_min_khz") or 0
+        hi = f.get("cpuinfo_max_khz") or 0
+        # Only adopt the hardware's own values when the user has nothing
+        # pending, exactly like the battery slider: the poll must never
+        # fight the person holding the mouse.
+        if not self._dirty():
+            cur = f.get("max_khz")
+            with QSignalBlockerSafe(self.slider):
+                self.slider.setRange(max(lo // FREQ_STEP_KHZ, 4),
+                                      hi // FREQ_STEP_KHZ)
+                if cur:
+                    self.slider.setValue(cur // FREQ_STEP_KHZ)
+            self._applied = cur
+            self._loaded = True
+        self.rows["all cores at"].setText(
+            f"{core.khz_to_ghz(f.get('max_khz'))} GHz"
+            if f.get("max_khz") else
+            ("differs per core" if f.get("max_khz_list") else "?"))
+        self.rows["hardware range"].setText(
+            f"{core.khz_to_ghz(lo)}..{core.khz_to_ghz(hi)} GHz "
+            f"({f.get('policies')} cores)")
+        # Endpoints are rebuilt only when the range actually moved: the
+        # poll runs every 1.5 s, and a needless deleteLater-churn on the
+        # scale labels is visible as a flicker with nothing to say.
+        if (lo, hi) != self._scale_range:
+            self._scale_range = (lo, hi)
+            while self._scale.count():
+                self._scale.takeAt(0).widget().deleteLater()
+            for text, align in (
+                    (f"{core.khz_to_ghz(lo)} GHz", Qt.AlignLeft),
+                    (f"{core.khz_to_ghz(hi)} GHz", Qt.AlignRight)):
+                s = QLabel(text)
+                s.setFont(ui_font(TYPE_MICRO))
+                s.setStyleSheet(f"color:{muted_color(self)}")
+                s.setAlignment(align | Qt.AlignVCenter)
+                self._scale.addWidget(s, 1)
+        self.slider.setEnabled(True)
+        self._sync_pending()
+        self._sync_slots()
+
+
+class UndervoltTab(QWidget):
+    """Intel voltage offsets: the OC mailbox, with every guard the page can hold.
+
+    The design rule is volatility.  The offsets vanish at reboot and suspend
+    (that is the CPU, not us), so the *only* persistence is the optional
+    "startup set", and the page says in plain words that a freeze is
+    recovered by a reboot.  All five planes are shown because that is what
+    ThrottleStop shows, with the two that matter front and centre.
+    """
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.win = win
+        self._applied: dict = {}          # what the CPU holds, from the MSR
+        self._allowed = None              # config AllowUndervolt, from status
+        lay = page_layout(self)
+
+        self.notice = QLabel()
+        self.notice.setWordWrap(True)
+        self.notice.setStyleSheet(notice_style(COL_WARM, COL_WARM))
+        self._base_notice = (
+            "⚠ Lowering the CPU's voltage makes it run cooler at the same "
+            "speed, but too deep an offset freezes the machine.  Your BIOS "
+            "must unlock it first: in the Advanced / OC menu disable "
+            "Overclocking Lock, CFG Lock and Undervolt Protection, or the "
+            "CPU silently ignores every offset.  The offsets are volatile: "
+            "a reboot or suspend clears them, which is the built-in "
+            "recovery.  Start shallow (about -50 mV) and step down while "
+            "the machine is under load.")
+        self.notice.setText(self._base_notice)
+        lay.addWidget(self.notice)
+
+        card = Card("Voltage offsets")
+        self.planes = {}
+        for plane, _i in core.UV_PLANES:
+            row = QHBoxLayout()
+            row.setSpacing(SPACE)
+            name = QLabel(plane.capitalize())
+            name.setFont(ui_font(TYPE_BODY, bold=True))
+            name.setMinimumWidth(84)
+            spin = QSpinBox()
+            spin.setRange(core.UV_MIN_MV, core.UV_MAX_MV)
+            spin.setSuffix(" mV")
+            spin.setSingleStep(5)
+            spin.setFixedWidth(96)
+            spin.setAccessibleName(f"{plane} voltage offset")
+            row.addWidget(name)
+            row.addWidget(spin)
+            note = QLabel(PLANE_NOTES[plane])
+            note.setWordWrap(True)
+            note.setFont(ui_font(TYPE_MICRO))
+            note.setStyleSheet(f"color:{muted_color(self)}")
+            row.addWidget(note, 1)
+            card.box.addLayout(row)
+            self.planes[plane] = spin
+
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        row.addStretch(1)
+        self.reset_btn = QPushButton("Reset all to 0")
+        self.reset_btn.setToolTip("Clear every offset (the same as a reboot "
+                                   "does)")
+        self.reset_btn.clicked.connect(self._reset)
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.setProperty("primary", True)
+        self.apply_btn.setToolTip("Write the offsets to every voltage plane")
+        self.apply_btn.clicked.connect(self._apply)
+        row.addWidget(self.reset_btn)
+        row.addWidget(self.apply_btn)
+        card.box.addLayout(row)
+
+        self.pending_label = QLabel("")
+        self.pending_label.setWordWrap(True)
+        self.pending_label.setFont(ui_font(TYPE_BODY, bold=True))
+        card.box.addWidget(self.pending_label)
+        card.box.addWidget(hint_label(
+            "Offsets hold until reboot or suspend.  Most users only need "
+            "core and cache; watch a stress run's temperature as you step "
+            "down, and back off at the first crash or freeze.", card))
+        lay.addWidget(card)
+
+        start = Card("Apply at app start")
+        self.startup_label = QLabel("")
+        self.startup_label.setWordWrap(True)
+        self.startup_label.setFont(ui_font(TYPE_BODY))
+        start.box.addWidget(self.startup_label)
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        self.startup_save = QPushButton("Save current as the startup set")
+        self.startup_save.setToolTip("Re-apply the current offsets every "
+                                     "time this app starts")
+        self.startup_save.clicked.connect(self._startup_save)
+        self.startup_del = QPushButton("Remove startup set")
+        self.startup_del.clicked.connect(self._startup_del)
+        row.addWidget(self.startup_save)
+        row.addWidget(self.startup_del)
+        row.addStretch(1)
+        start.box.addLayout(row)
+        start.box.addWidget(hint_label(
+            "The startup set applies when this app starts, not at boot: "
+            "the values are never written to any firmware, so an offset "
+            "that turns out unstable cannot survive a reboot and surprise "
+            "you before the app is even open.  This is the one deliberate "
+            "persistence, and removing the set removes it.", start))
+        lay.addWidget(start)
+        lay.addStretch(1)
+        self._sync_startup()
+
+    # -- startup set (QSettings; the daemon never persists offsets) --------
+
+    def startup_values(self) -> dict | None:
+        val = self.win._qs.value("undervolt/startup")
+        if not isinstance(val, dict):
+            return None
+        out = {}
+        for plane, _i in core.UV_PLANES:
+            try:
+                mv = int(val.get(plane, 0))
+            except (TypeError, ValueError):
+                continue
+            if core.UV_MIN_MV <= mv <= core.UV_MAX_MV:
+                out[plane] = mv
+        if any(out.values()):
+            return out
+        return None
+
+    def _sync_startup(self):
+        vals = self.startup_values()
+        if vals:
+            text = "Startup set: " + ", ".join(
+                f"{p} {mv} mV" for p, mv in vals.items() if mv)
+            self.startup_del.setEnabled(True)
+        else:
+            text = "No startup set; offsets live only while the app runs."
+            self.startup_del.setEnabled(False)
+        self.startup_label.setText(text)
+
+    def _startup_save(self):
+        vals = {p: s.value() for p, s in self.planes.items()}
+        if not any(vals.values()):
+            self.win.flash("nothing to save: every offset reads 0 mV")
+            return
+        self.win._qs.setValue("undervolt/startup", vals)
+        self._sync_startup()
+        self.win.flash("startup set saved; it applies when the app starts",
+                       ok=True)
+
+    def _startup_del(self):
+        self.win._qs.remove("undervolt/startup")
+        self._sync_startup()
+        self.win.flash("startup set removed", ok=True)
+
+    # -- apply / reset --------------------------------------------------------
+
+    def _collect(self) -> dict:
+        return {p: s.value() for p, s in self.planes.items()}
+
+    def _apply(self):
+        vals = self._collect()
+        if not any(vals.values()) and not any(self._applied.values()):
+            self.win.flash("nothing to apply: every offset reads 0 mV")
+            return
+        answer = QMessageBox.warning(
+            self, "Apply voltage offsets",
+            "Write these offsets to the CPU?\n\n"
+            + "  ".join(f"{p} {vals[p]} mV\n" for p in core.UV_PLANES
+                         if vals[p]).lstrip().rstrip()
+            + "\n\nA too-deep offset freezes the machine *now*; recovery "
+            "is a reboot (the CPU clears these at restart).  If the BIOS "
+            "has not unlocked undervolting the CPU ignores the write, and "
+            "the daemon reports the refusal instead of pretending.\n\n"
+            "Apply?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.win.send({"cmd": "undervolt", "action": "set",
+                           "values": vals}, tag="undervolt")
+
+    def _reset(self):
+        answer = QMessageBox.question(
+            self, "Clear voltage offsets",
+            "Put every voltage offset back to 0 mV?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.win.send({"cmd": "undervolt", "action": "reset"},
+                          tag="undervolt")
+
+    # -- refresh ---------------------------------------------------------------
+
+    def refresh(self, st: dict):
+        online = bool(self.win.online)
+        uv = st.get("undervolt") or {}
+        cfg = (st.get("config") or {})
+        allowed = bool(cfg.get("AllowUndervolt"))
+        self._allowed = allowed
+        planes = uv.get("planes")
+        if planes is not None:
+            self._applied = dict(planes)
+            for plane, spin in self.planes.items():
+                mv = planes.get(plane)
+                with QSignalBlockerSafe(spin):
+                    if mv is not None:
+                        spin.setValue(max(core.UV_MIN_MV, mv))
+        writable = online and allowed and planes is not None
+        for plane, spin in self.planes.items():
+            spin.setEnabled(writable)
+        self.apply_btn.setEnabled(writable)
+        self.reset_btn.setEnabled(writable)
+        self.startup_save.setEnabled(writable)
+
+        if not online:
+            note = ("the daemon is offline, so nothing can be written; the "
+                    "CPU's own offsets are not readable without root")
+            style = notice_style(muted_color(self))
+        elif uv.get("msr_present") is False:
+            note = ("✗ this kernel has no /dev/cpu/*/msr devices, so the "
+                    "voltage mailbox is unreachable (load the msr module)")
+            style = notice_style(COL_CRIT, COL_CRIT)
+        elif not allowed:
+            note = ("undervolting is disabled in this machine's config; set "
+                    "“AllowUndervolt”: true in "
+                    f"{core.config_path()} and restart msi-controld to "
+                    "write offsets")
+            style = notice_style(muted_color(self))
+        else:
+            note = ""
+            style = ""
+        # The BIOS warning is permanent: it is the page's safety caution, and
+        # the status note below augments it with why a control is dead.
+        self.notice.setText(self._base_notice + ("\n\n" + note if note else ""))
+        self.notice.setStyleSheet(style if note
+                                  else notice_style(COL_WARM, COL_WARM))
+        # pending vs applied, one honest line
+        if self._applied:
+            ap = ", ".join(f"{p} {v} mV"
+                           for p, v in self._applied.items() if v)
+            self.pending_label.setText(
+                "applied: " + (ap or "all 0 mV"))
+        else:
+            self.pending_label.setText("")
+        self._sync_startup()
 
 
 class FansTab(QWidget):
@@ -2414,8 +3189,9 @@ class ProfilesTab(QWidget):
         right.box.addWidget(b2)
         right.box.addStretch(1)
         right.box.addWidget(hint_label(
-            "A profile stores performance mode, fan mode, cooler boost and "
-            "both fan curves.  “factory” is captured from "
+            "A profile stores performance mode, fan mode, cooler boost, "
+            "both fan curves and, when they are set, the CPU frequency "
+            "cap and your voltage offsets.  “factory” is captured from "
             "the EC on first start; apply it to return to exactly what the "
             "laptop shipped with.\n\n"
             "Applying one does not touch your charge limit; that is a "
@@ -2512,6 +3288,11 @@ class SettingsTab(QWidget):
         super().__init__(parent)
         self.setObjectName("Page")
         self.win = win
+        # Broken model files, read once.  The registry cannot change while
+        # this process lives, and modelling a live registry here cost a
+        # re-read and re-parse of every models/*/model.json on every 1.5 s
+        # poll, on the GUI thread.
+        self._reg_errors = core.model_errors()
         lay = page_layout(self)
 
         card = Card("Daemon")
@@ -2537,6 +3318,42 @@ class SettingsTab(QWidget):
             "“Capture factory” snapshots the current EC state as the "
             "“factory” profile, once.", card))
         lay.addWidget(card)
+
+        st_card = Card("Hardware self-test")
+        self.selftest_btn = QPushButton("Run self-test")
+        self.selftest_btn.setToolTip(
+            "Writes real modes briefly and restores them; the report is "
+            "paste-ready for a pull request")
+        self.selftest_btn.clicked.connect(self._selftest)
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        row.addWidget(self.selftest_btn)
+        self.copy_report_btn = QPushButton("Copy report")
+        self.copy_report_btn.setEnabled(False)
+        self.copy_report_btn.setToolTip(
+            "Copy the markdown report (safe to paste into a model PR)")
+        self.copy_report_btn.clicked.connect(self._copy_report)
+        row.addWidget(self.copy_report_btn)
+        row.addStretch(1)
+        st_card.box.addLayout(row)
+        self.selftest_out = QPlainTextEdit()
+        self.selftest_out.setReadOnly(True)
+        self.selftest_out.setFont(mono_font(TYPE_BODY))
+        self.selftest_out.setPlaceholderText(
+            "no self-test has run in this window")
+        self.selftest_out.setMinimumHeight(140)
+        st_card.box.addWidget(self.selftest_out)
+        self._selftest_markdown = ""
+        st_card.box.addWidget(hint_label(
+            "The same reversible round-trips verify.sh performs: every "
+            "shift and fan mode walked, Cooler Boost lit briefly, the "
+            "charge threshold written twice, the fan curve and the "
+            "frequency cap re-written where they already are.  Each is "
+            "verified by reading it back, everything it found is "
+            "restored, and the paste-ready report names exactly what "
+            "passed.  Run it on a machine you are watching, not under "
+            "load.", st_card))
+        lay.addWidget(st_card)
 
         tray = Card("Tray icon")
         self.tray_show = QCheckBox("Show the temperature on the tray icon")
@@ -2571,6 +3388,55 @@ class SettingsTab(QWidget):
             "laptop is shows at a glance.  White and Black draw a flat "
             "monochrome shield for matching a light or a dark panel.", tray))
         lay.addWidget(tray)
+
+        sections = Card("Sections")
+        self.sec_freq = QCheckBox("Show the Frequency page")
+        self.sec_freq.setToolTip("The all-core CPU maximum and its four "
+                                 "quick slots")
+        self.sec_freq.setChecked(win.section_visible("freq"))
+        self.sec_freq.toggled.connect(
+            lambda on: win.set_section_visible("freq", on))
+        sections.box.addWidget(self.sec_freq)
+        self.sec_uv = QCheckBox("Show the Undervolt page")
+        self.sec_uv.setToolTip("Intel voltage offsets; needs a BIOS unlock "
+                               "and AllowUndervolt")
+        self.sec_uv.setChecked(win.section_visible("undervolt"))
+        self.sec_uv.toggled.connect(
+            lambda on: win.set_section_visible("undervolt", on))
+        sections.box.addWidget(self.sec_uv)
+        sections.box.addWidget(hint_label(
+            "Two pages tune the Intel CPU rather than the MSI EC, so they "
+            "are yours to hide: off removes the page from the sidebar until "
+            "it is turned back on here.  The choice is remembered per "
+            "desktop, like the tray icon's.", sections))
+        lay.addWidget(sections)
+
+        acc = Card("Accent colour")
+        row = QHBoxLayout()
+        row.setSpacing(SPACE)
+        self.accent_btns: dict = {}
+        self._accent_group = QButtonGroup(self)
+        self._accent_group.setExclusive(True)
+        # The dict's insertion order is the row's display order, so the
+        # default sits first and a new preset can never be shuffled into a
+        # different place per theme.
+        for key in ACCENTS:
+            b = QPushButton(ACCENTS[key]["label"])
+            b.setCheckable(True)
+            mark_checked(b)
+            b.setChecked(key == ACCENT)
+            b.clicked.connect(lambda _=False, k=key: self.win.set_accent(k))
+            self._accent_group.addButton(b)
+            self.accent_btns[key] = b
+            row.addWidget(b)
+        row.addStretch(1)
+        acc.box.addLayout(row)
+        acc.box.addWidget(hint_label(
+            "The accent colours your selection: the checked chip and row, "
+            "the sliders, the curve you own.  The shield mark stays MSI "
+            "red, because the mark is the brand rather than a setting.  "
+            "A per-desktop choice, like the tray icon's.", acc))
+        lay.addWidget(acc)
 
         cfg = Card("Config")
         self.cfg_text = QPlainTextEdit()
@@ -2622,11 +3488,65 @@ class SettingsTab(QWidget):
         lay.addWidget(raw)
         lay.addStretch(1)
 
+    def sync_accent(self):
+        """Mirror the accent in the buttons; a click would loop otherwise."""
+        for key, b in self.accent_btns.items():
+            with QSignalBlockerSafe(b):
+                b.setChecked(key == ACCENT)
+
     def _reapply(self):
         self.win.send({"cmd": "reapply"})
 
     def _factory(self):
         self.win.send({"cmd": "capture-factory"})
+
+    def _selftest(self):
+        answer = QMessageBox.question(
+            self, "Run the hardware self-test",
+            "The self-test briefly switches every shift and fan mode, "
+            "lights Cooler Boost, writes the charge threshold twice and "
+            "re-writes the fan curve and the frequency cap where they "
+            "already are, verifying each by reading it back.  Everything "
+            "it finds is restored.\n\nIt takes a few seconds.  Run it?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        # The walk over every mode can outlive the terse 5 s command budget;
+        # the self-test is the one long command this app sends.
+        self.selftest_btn.setEnabled(False)
+        self.win.send({"cmd": "selftest"}, tag="selftest", timeout=60.0)
+
+    def selftest_reply(self, msg: dict):
+        """Show the report; the button that started it comes back."""
+        self.selftest_btn.setEnabled(bool(self.win.online))
+        if "error" in msg:
+            self.selftest_out.setPlainText(f"✗ {msg['error']}")
+            self._selftest_markdown = ""
+            self.copy_report_btn.setEnabled(False)
+            self.win.flash(f"✗ {msg['error']}", ok=False)
+            return
+        data = msg.get("data") or {}
+        rows = []
+        section = None
+        for r in data.get("results") or []:
+            if r.get("section") != section:
+                section = r.get("section")
+                rows.append(f"\n{section}")
+            mark = "✓" if r.get("ok") else "✗"
+            detail = f": {r['detail']}" if r.get("detail") else ""
+            rows.append(f"  {mark} {r.get('name', '?')}{detail}")
+        self.selftest_out.setPlainText("\n".join(rows).strip())
+        self._selftest_markdown = data.get("markdown") or ""
+        self.copy_report_btn.setEnabled(bool(self._selftest_markdown))
+        self.win.flash(data.get("summary", "self-test finished"),
+                       ok=bool(data.get("ok")))
+
+    def _copy_report(self):
+        if not self._selftest_markdown:
+            return
+        QApplication.clipboard().setText(self._selftest_markdown)
+        self.win.flash("self-test report copied; paste it into the "
+                       "model's pull request")
 
     def _raw(self, write):
         try:
@@ -2678,7 +3598,7 @@ class SettingsTab(QWidget):
         else:
             self._daemon_rows["Model"].setText(
                 "unrecognised: no model file matches this laptop")
-        errs = core.model_errors()
+        errs = self._reg_errors
         if errs:
             self._daemon_rows["Model file"].setText(
                 f"{core.models_dir()}  ·  ⚠ {len(errs)} broken file(s): "
@@ -2701,6 +3621,7 @@ class SettingsTab(QWidget):
         # the daemon, same as every other writer in the app.
         online = bool(self.win.online)
         self.reapply_btn.setEnabled(online)
+        self.selftest_btn.setEnabled(online)
         curve_ok = core.feature("fan_curve")
         self.factory_btn.setEnabled(online and curve_ok)
         self.factory_btn.setToolTip("" if curve_ok else
@@ -2823,19 +3744,20 @@ class Header(QWidget):
 
     def set_online(self, online):
         if online is None:
-            label, colour = "connecting…", THEME["muted"]
+            label, colour, tip = ("connecting…", THEME["muted"],
+                                  "Waiting for the daemon's first reply")
         elif online:
-            label, colour = "daemon online", COL_OK
+            label, colour, tip = ("daemon online", COL_OK,
+                                  "The msi-controld daemon is answering")
         else:
-            label, colour = "daemon offline", COL_CRIT
+            label, colour, tip = ("daemon offline", COL_CRIT,
+                                 "The daemon is not reachable; the app is "
+                                 "read-only")
         self.pill.setText(f"●  {label}")
         self.pill.setStyleSheet(
             f"color:{text_on(colour)};background:{colour};"
             f"border-radius:{R_PILL}px;padding:4px 11px;")
-        self.pill.setToolTip(
-            "The msi-controld daemon is answering" if online else
-            "Waiting for the daemon's first reply" if online is None else
-            "The daemon is not reachable; the app is read-only")
+        self.pill.setToolTip(tip)
 
 
 class Banner(QFrame):
@@ -2902,22 +3824,38 @@ class ModelBanner(QFrame):
 
 
 class Sidebar(QWidget):
-    """Icon + label navigation.  One entry per section."""
+    """Icon + label navigation, one entry per visible section.
 
-    ITEMS = (("Dashboard", "dashboard"), ("Performance", "bolt"),
-             ("Fans", "fans"), ("Battery", "battery"),
-             ("Profiles", "profiles"), ("Settings", "settings"))
+    The entries are handed over by the window rather than fixed here,
+    because two of the sections (frequency, undervolt) are opt-in per
+    user: the same person may want them on a tuned machine and off on a
+    borrowed one, and the sidebar is where that choice becomes visible.
+    """
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
         self.setObjectName("Sidebar")
         self.setFixedWidth(216)
         self.win = win
+        self._entries: list = []
         lay = QVBoxLayout(self)
         lay.setContentsMargins(SPACE + 4, SPACE * 2, SPACE + 4, SPACE * 2)
         lay.setSpacing(3)
         self.buttons = []
-        for i, (label, glyph) in enumerate(self.ITEMS):
+        self.hint = QLabel("")
+        self.hint.setFont(ui_font(TYPE_MICRO))
+        self.hint.setStyleSheet(f"color:{muted_color(self)}")
+        self._stretch = lay.addStretch(1)
+        lay.addWidget(self.hint)
+
+    def set_entries(self, entries) -> None:
+        """Build one button per (label, glyph, stack index)."""
+        self._entries = list(entries)
+        for b in self.buttons:
+            b.deleteLater()
+        self.buttons = []
+        lay = self.layout()
+        for i, (label, glyph, index) in enumerate(self._entries):
             b = QPushButton(label)
             b.setCheckable(True)
             b.setProperty("nav", True)
@@ -2928,19 +3866,17 @@ class Sidebar(QWidget):
             b.setIcon(nav_icon(glyph, ICON_SM))
             b.setCursor(Qt.PointingHandCursor)
             b.setToolTip(f"{label}  (Ctrl+{i + 1})")
-            b.clicked.connect(lambda _=False, n=i: win.tabs.setCurrentIndex(n))
-            lay.addWidget(b)
+            b.clicked.connect(lambda _=False, n=index:
+                              self.win.tabs.setCurrentIndex(n))
+            lay.insertWidget(lay.indexOf(self._stretch), b)
             self.buttons.append(b)
-        lay.addStretch(1)
-        hint = QLabel("Ctrl+1…6  sections\nCtrl+R  refresh\nCtrl+Q  quit")
-        hint.setFont(ui_font(TYPE_MICRO))
-        hint.setStyleSheet(f"color:{muted_color(self)}")
-        lay.addWidget(hint)
+        self.hint.setText(f"Ctrl+1…{len(self._entries)}  sections\n"
+                          "Ctrl+R  refresh\nCtrl+Q  quit")
 
     def sync(self, index: int):
         for i, b in enumerate(self.buttons):
             with QSignalBlockerSafe(b):
-                b.setChecked(i == index)
+                b.setChecked(self._entries[i][2] == index)
 
 
 # --------------------------------------------------------------------------
@@ -2972,32 +3908,58 @@ class MainWindow(QMainWindow):
         if self.tray_colour not in TRAY_TEMP_MODES:
             self.tray_colour = "colour"
         self._last_status: dict = {}
+        # Which of the opt-in sections this user wants to see.  Frequency
+        # and Undervolt tune the CPU rather than the MSI EC, so they are
+        # personal preference, off the sidebar for whoever does not want
+        # them and back on the moment the checkbox changes.
+        self._section_prefs = {
+            "freq": self._qs.value("sections/freq", True, type=bool),
+            "undervolt": self._qs.value("sections/undervolt", True,
+                                         type=bool),
+        }
+        # The startup undervolt set is applied once, on the first honest
+        # status from a daemon that allows it (see _refresh) - never at
+        # boot and never on resume, because volatility IS the safety net.
+        self._uv_startup_done = False
 
         self.client = Client(self)
         self.client.reply.connect(self._on_reply)
 
         self.dash = DashboardTab(self)
         self.perf = PerformanceTab(self)
+        self.cpu = CpuFreqTab(self)
+        self.uv = UndervoltTab(self)
         self.fans = FansTab(self)
         self.batt = BatteryTab(self)
         self.profs = ProfilesTab(self)
         self.settings = SettingsTab(self)
 
+        # One ordered description of the sections; the sidebar is built
+        # from it and so are the Ctrl+N shortcuts, so a page can never be
+        # reachable by a shortcut but not visible in the nav (or vice
+        # versa).  A `None` key means "always visible".
+        self._sections = (
+            (None, "Dashboard", "dashboard", self.dash),
+            (None, "Performance", "bolt", self.perf),
+            ("freq", "Frequency", "cpu", self.cpu),
+            ("undervolt", "Undervolt", "volt", self.uv),
+            (None, "Fans", "fans", self.fans),
+            (None, "Battery", "battery", self.batt),
+            (None, "Profiles", "profiles", self.profs),
+            (None, "Settings", "settings", self.settings),
+        )
+
         self.tabs = NavStack()
-        for page, label in ((self.dash, "Dashboard"),
-                            (self.perf, "Performance"),
-                            (self.fans, "Fans"),
-                            (self.batt, "Battery"),
-                            (self.profs, "Profiles"),
-                            (self.settings, "Settings")):
+        for _key, label, _glyph, page in self._sections:
             self.tabs.addTab(scrolled(page), label)
 
         self.header = Header(self)
         self.banner = Banner(self)
         self.model_banner = ModelBanner(self)
         self.sidebar = Sidebar(self)
+        self._rebuild_nav()
         self.tabs.currentChanged.connect(self.sidebar.sync)
-        self.sidebar.sync(0)
+        self.sidebar.sync(self.tabs.currentIndex())
 
         root = QWidget()
         root.setObjectName("Root")
@@ -3022,6 +3984,11 @@ class MainWindow(QMainWindow):
         saved_tab = self._qs.value("tab", type=int)
         if isinstance(saved_tab, int) and 0 <= saved_tab < self.tabs.count():
             self.tabs.setCurrentIndex(saved_tab)
+            # A saved page a hidden section owns (Frequency saved on one
+            # desktop, then turned off in Settings here) lands on the
+            # first visible page instead of an unreachable one.
+            if saved_tab not in {e[2] for e in self._nav_entries}:
+                self.tabs.setCurrentIndex(self._nav_entries[0][2])
         geo = self._qs.value("geometry")
         if geo is not None:
             self.restoreGeometry(geo)
@@ -3047,22 +4014,17 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
 
         self.tray = None
+        # The menu is built even when the platform has no system tray:
+        # its quick actions are a state machine (what is checked, what is
+        # enabled) and the smoke suite pins them on platforms with nothing
+        # to attach a menu to.
+        self._tray_menu = self._build_tray_menu()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(self)
             self.tray.setIcon(QIcon(brand_pixmap(64)))
             self.tray.setToolTip("MSI Linux Control")
             self.tray.activated.connect(self._tray_activated)
-            # A context menu is not decoration here: closing the window
-            # only hides it (see closeEvent), so without this a user whose
-            # desktop does not surface the icon has no way back in *and* no
-            # way to quit.  Show and Quit are the two that matter.
-            menu = QMenu()
-            show_act = menu.addAction("Show window")
-            show_act.triggered.connect(self._show_window)
-            menu.addSeparator()
-            quit_act = menu.addAction("Quit")
-            quit_act.triggered.connect(QApplication.quit)
-            self.tray.setContextMenu(menu)
+            self.tray.setContextMenu(self._tray_menu)
             self.tray.show()
             QApplication.setQuitOnLastWindowClosed(False)
 
@@ -3078,9 +4040,32 @@ class MainWindow(QMainWindow):
             return sc
         self._cuts = [cut("Ctrl+Q", self.quit_app),
                       cut("Ctrl+R", self.poll_status)]
-        for i in range(len(Sidebar.ITEMS)):
+        for i, (_label, _glyph, index) in enumerate(self._nav_entries):
             self._cuts.append(cut(
-                f"Ctrl+{i + 1}", lambda i=i: self.tabs.setCurrentIndex(i)))
+                f"Ctrl+{i + 1}", lambda n=index: self.tabs.setCurrentIndex(n)))
+
+    # -- sections ------------------------------------------------------------
+
+    def section_visible(self, key: str) -> bool:
+        return bool(self._section_prefs.get(key, True))
+
+    def set_section_visible(self, key: str, visible: bool):
+        self._section_prefs[key] = bool(visible)
+        self._qs.setValue(f"sections/{key}", bool(visible))
+        self._rebuild_nav()
+
+    def _rebuild_nav(self):
+        """(Re)build the sidebar and the shortcuts from the section table."""
+        self._nav_entries = [
+            (label, glyph, i)
+            for i, (key, label, glyph, _page) in enumerate(self._sections)
+            if key is None or self.section_visible(key)]
+        self.sidebar.set_entries(self._nav_entries)
+        self._install_shortcuts()
+        current = self.tabs.currentIndex()
+        if current not in {e[2] for e in self._nav_entries}:
+            self.tabs.setCurrentIndex(self._nav_entries[0][2])
+        self.sidebar.sync(self.tabs.currentIndex())
 
     # -- plumbing -----------------------------------------------------------
 
@@ -3144,6 +4129,11 @@ class MainWindow(QMainWindow):
             if "data" in msg:
                 self.profile_cache["factory"] = msg["data"]
                 self.fans.refresh_factory()
+            return
+
+        if tag == "selftest":
+            self.settings.selftest_reply(msg)
+            self.poll_status()
             return
 
         # anything else was an action.  The daemon reads every setting back
@@ -3234,12 +4224,26 @@ class MainWindow(QMainWindow):
                                 "name": "factory"}, tag="factory")
         self.dash.refresh(st)
         self.perf.refresh(st)
+        self.cpu.refresh(st)
+        self.uv.refresh(st)
         self.fans.refresh(st)
         self.batt.refresh(st)
         self.profs.refresh(st)
         self.settings.refresh(st)
         self._sync_connection()
         self.update_tray(st)
+        # The startup undervolt set, applied exactly once per app run, on
+        # the first status a daemon that allows it returns.  "When the app
+        # starts", on purpose: not at system boot, not on resume, so the
+        # reboot-recovery story of an unstable offset stays intact.
+        if not self._uv_startup_done and self.online \
+                and isinstance(st.get("undervolt"), dict) \
+                and (st.get("config") or {}).get("AllowUndervolt"):
+            self._uv_startup_done = True
+            vals = self.uv.startup_values()
+            if vals:
+                self.send({"cmd": "undervolt", "action": "set",
+                           "values": vals}, tag="undervolt")
 
     @staticmethod
     def _conn_note_of(st: dict) -> str:
@@ -3261,10 +4265,14 @@ class MainWindow(QMainWindow):
         the next status reply.  With the temperature display off, or before
         any reading has arrived, the plain brand mark is shown.
         """
-        if not self.tray:
-            return
         if st is not None:
             self._last_status = st
+        # The menu state follows the status even when there is no tray:
+        # without a system tray the quick-action state machine would never
+        # sync, and the headless smoke suite pins exactly that.
+        self._update_tray_menu()
+        if not self.tray:
+            return
         st = self._last_status or {}
         t = ((st.get("cpu") or {}).get("temp"),
              (st.get("gpu") or {}).get("temp"))
@@ -3280,6 +4288,49 @@ class MainWindow(QMainWindow):
             f"MSI · CPU {t[0] if t[0] is not None else '?'}°C · "
             f"GPU {t[1] if t[1] is not None else '?'}°C")
 
+    def _update_tray_menu(self):
+        """Check, uncheck and enable the tray's quick actions from the
+        last status, so the menu can never claim a mode the machine is not
+        in.
+
+        setChecked does not emit triggered (that is a user gesture), so
+        this plain-state mirror cannot cause a write loop.  It runs with
+        no tray as well: the smoke suite pins these actions on platforms
+        that have no tray to attach the menu to.
+        """
+        st = self._last_status or {}
+        online = bool(self.online)
+        modes = (st.get("shift") or {}).get("available") or []
+        current = (st.get("shift") or {}).get("current")
+        for mode, act in self._tray_shift.items():
+            act.setVisible(mode in modes)
+            act.setEnabled(online)
+            act.setChecked(current == mode)
+        self._tray_boost.setEnabled(online)
+        self._tray_boost.setChecked(st.get("cooler_boost") == "on")
+        charge_end = (st.get("battery") or {}).get("charge_end")
+        for pct, act in self._tray_charge.items():
+            act.setEnabled(online and charge_end is not None)
+            act.setChecked(charge_end == pct)
+
+    def set_accent(self, accent: str) -> None:
+        """Apply and persist the chrome accent; the repaint is immediate.
+
+        The stylesheet and palette come from `apply_theme`, which repaints
+        every widget the QSS paints.  The nav glyphs do not come along for
+        free: a QIcon bakes its pixmaps when it is built, and setting a
+        stylesheet rebuilds no icons, so the sidebar is rebuilt the moment
+        the accent lands.  The mark stays MSI red either way, because the
+        mark is the brand and the accent is a preference.
+        """
+        if accent not in ACCENTS:
+            return
+        self._qs.setValue("style/accent", accent)
+        self._qs.sync()
+        apply_theme(QApplication.instance(), accent=accent)
+        self._rebuild_nav()
+        self.settings.sync_accent()
+
     def set_tray_options(self, show: bool | None = None,
                          colour: str | None = None):
         """Apply and persist the tray display, and repaint at once."""
@@ -3292,6 +4343,49 @@ class MainWindow(QMainWindow):
             self._qs.setValue("tray/colour", colour)
         self._qs.sync()
         self.update_tray()
+
+    def _build_tray_menu(self) -> QMenu:
+        """The tray's context menu: window, three quick actions, quit.
+
+        A context menu is not decoration: closing the window only hides it
+        (see closeEvent), so without it a user whose desktop does not
+        surface the icon has no way back in *and* no way to quit.  The
+        quick actions between are the things a tray is for: one shift
+        click, Cooler Boost, a charge preset, no window.  They go through
+        the same daemon path the full pages use, so a mode change made
+        here is read back like any other, and Quit saves the window state
+        exactly like the header's and Ctrl+Q's Quit.
+        """
+        menu = QMenu(self)
+        show_act = menu.addAction("Show window")
+        show_act.triggered.connect(self._show_window)
+        menu.addSeparator()
+        self._tray_shift = {}
+        shift_menu = menu.addMenu("Performance mode")
+        for mode in ("eco", "comfort", "sport", "turbo"):
+            act = shift_menu.addAction(mode)
+            act.setCheckable(True)
+            act.triggered.connect(
+                lambda _=False, m=mode: self.set_key("shift", m))
+            self._tray_shift[mode] = act
+        self._tray_boost = menu.addAction("Cooler Boost")
+        self._tray_boost.setCheckable(True)
+        self._tray_boost.triggered.connect(
+            lambda: self.set_key(
+                "cooler_boost",
+                "on" if self._tray_boost.isChecked() else "off"))
+        self._tray_charge = {}
+        charge_menu = menu.addMenu("Charge limit")
+        for pct in (60, 80, 100):
+            act = charge_menu.addAction(f"{pct}%")
+            act.setCheckable(True)
+            act.triggered.connect(
+                lambda _=False, v=pct: self.set_key("charge_end", v))
+            self._tray_charge[pct] = act
+        menu.addSeparator()
+        quit_act = menu.addAction("Quit")
+        quit_act.triggered.connect(self.quit_app)
+        return menu
 
     def _show_window(self):
         self.show()
@@ -3341,7 +4435,10 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("msi-control")
-    apply_theme(app)
+    # The accent is a per-user chrome choice, so it lives in QSettings with
+    # the geometry and is read before the first stylesheet is built.
+    qs = QSettings("msi-control", "msi-control")
+    apply_theme(app, accent=qs.value("style/accent", ACCENT_DEFAULT))
     win = MainWindow()
     win.show()
 

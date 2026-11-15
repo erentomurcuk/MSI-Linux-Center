@@ -37,7 +37,7 @@ import socket
 # MAJOR for a change that breaks an installed config or protocol.
 # --------------------------------------------------------------------------
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # --------------------------------------------------------------------------
 # Paths: every one overridable through the environment so the whole stack
@@ -97,6 +97,20 @@ def models_dir() -> str:
     return os.path.realpath(candidates[1])
 
 
+def cpufreq_dir() -> str:
+    """The kernel's cpufreq policy directory, one sub-directory per core."""
+    return os.path.join(sysfs_root(), "devices", "system", "cpu", "cpufreq")
+
+
+def dev_cpu_dir() -> str:
+    """`/dev/cpu`, which holds one `msr` character device per logical CPU.
+
+    Overridable for the same reason as every other path: the offline test
+    suite replaces it with a RAM-backed fake and runs the real daemon.
+    """
+    return os.environ.get("MSI_CPU_DEV", "/dev/cpu")
+
+
 # --------------------------------------------------------------------------
 # The model registry
 #
@@ -124,12 +138,13 @@ MODEL_SCHEMA = 1
 
 # Feature flags a model may declare.  The first four are driver-provided and
 # are additionally checked at runtime against the attributes that exist; the
-# next three need raw EC knowledge and are refused outright when false; the
+# next four need raw EC knowledge and are refused outright when false; the
 # last five are optional driver features that only some firmwares have.
 MODEL_FEATURES = (
     "shift", "fan", "cooler_boost", "charge_limit",
     "fan_curve", "rpm", "mux",
     "webcam", "webcam_block", "super_battery", "fn_key", "win_key",
+    "display_overdrive",
 )
 
 # What a machine can do when nobody has written a model file for it: exactly
@@ -140,7 +155,7 @@ UNKNOWN_FEATURES = {
     "shift": True, "fan": True, "cooler_boost": True, "charge_limit": True,
     "fan_curve": False, "rpm": False, "mux": False,
     "webcam": False, "webcam_block": False, "super_battery": False,
-    "fn_key": False, "win_key": False,
+    "fn_key": False, "win_key": False, "display_overdrive": False,
 }
 
 UNKNOWN_ID = "unknown"
@@ -247,6 +262,7 @@ class Model:
         self.curve_regs, self._n_temps, self._n_speeds = \
             self._curve(ec.get("curve") or {})
         self.rpm_regs, self.rpm_numerator = self._rpm(ec.get("rpm") or {})
+        self.overdrive_regs = self._overdrive(ec.get("overdrive"))
 
         # `_features` cross-checks the flags against the registers, so it has
         # to run *after* the EC block above.
@@ -314,6 +330,10 @@ class Model:
             raise ModelError(
                 f"{self.where}: \"fan_curve\": true but ec.curve has no "
                 "registers")
+        if self.features["display_overdrive"] and not self.overdrive_regs:
+            raise ModelError(
+                f"{self.where}: \"display_overdrive\": true but ec.overdrive "
+                "names no register")
 
     def _curve(self, curve) -> tuple:
         """`{"cpu": {...}}` from the file; also the curve *shape*."""
@@ -368,6 +388,38 @@ class Model:
             raise ModelError(
                 f"{self.where}: ec.rpm names no fan (want cpu and/or gpu)")
         return regs, numerator
+
+    def _overdrive(self, spec) -> dict | None:
+        """`ec.overdrive`: the register and bit that toggle panel overdrive.
+
+        Dragon Center exposes this as "Display Overdrive"; on the machines it
+        was measured on it is one bit of a register the model already knows
+        (the GS66's webcam and MUX state live in the same byte), so it is a
+        read-modify-write of that bit, never a whole-byte poke.
+        """
+        if spec is None:
+            return None
+        if not isinstance(spec, dict):
+            raise ModelError(f"{self.where}: ec.overdrive must be an object")
+        out = {"address": _as_addr(spec.get("address"),
+                                   "ec.overdrive.address"),
+               "bit": _as_int(spec.get("bit"), "ec.overdrive.bit", 0, 7)}
+        # Optional: the whole byte's neutral value, for firmwares where the
+        # EC rewrites the rest of the byte and "off" is not "clear the bit"
+        # but "this exact value".  Neither field is guessed from a dump; a
+        # model that knows only the bit uses the RMW and nothing else.
+        for key in ("off", "on"):
+            val = spec.get(key)
+            if val is None:
+                out[key] = None
+                continue
+            if isinstance(val, str) and val.strip():
+                out[key] = _as_addr(val, f"ec.overdrive.{key}")
+            else:
+                raise ModelError(
+                    f"ec.overdrive.{key} must be a byte value "
+                    '(hex, like "0x00")')
+        return out
 
     def _profiles(self, given: dict) -> dict:
         if not isinstance(given, dict):
@@ -810,26 +862,64 @@ def write_draft(directory: str, facts: dict | None = None) -> str:
 #     powers the iGPU down in discrete mode, so its absence is the only
 #     observation of what the machine is *actually* doing right now.
 #
-# The mechanism is cross-checked against ElXreno/msi-gpu-switcher, which drives
-# the identical trio on MSI laptops; msi-ec itself has no MUX support at all
-# (its G1_3 config lists webcam/fn_win/cooler_boost/shift/fan/cpu/gpu/leds and
-# nothing else), so these addresses are the only route to it.
+# The mechanism is cross-checked against ElXreno/msi-gpu-switcher, which
+# drives the identical trio on MSI laptops; msi-ec itself has no MUX support
+# at all (its G1_3 config lists webcam/fn_win/cooler_boost/shift/fan/cpu/
+# gpu/leds and nothing else), so these addresses are the only route to it.
 #
-# ⚠️ 0x2e bit 6, 0xd1 and that one UEFI byte are the *only* addresses outside
+# ⚠️ 0x2e bit 6, 0xd1 and the UEFI variable are the *only* addresses outside
 # the documented setting map this program will ever write, and a graphics
 # switch is the only setting here that cannot be taken back without a reboot.
 # Everything else stays behind AllowRaw.  See msi_controld.Service.set_graphics().
+#
+# The UEFI variable carries the request in one of two layouts, and knowing
+# which is which is the difference between reporting a switch and inventing
+# one:
+#
+#   * "three-mode" (the MSI Center era; provenance:
+#     ege-adam/msi-gpu-mode, which first worked out the layout, and
+#     ElXreno/msi-gpu-switcher + Krishna0607/Mystic-Center, which implement
+#     it): data byte 5, bits 0-1 = the requested mode (0 hybrid, 1 discrete,
+#     2 integrated), bits 2-3 = the mode applied at the last boot, bit 4 =
+#     "this firmware speaks three-mode" marker, bit 5 = integrated mode is
+#     supported, bit 6 = discrete mode is NOT supported.  A write is only
+#     complete when the EC has raised the acknowledge bit.
+#
+#   * "legacy" (MSI Alpha 17, EC 17KKIMS1): data byte 1, 1 = discrete
+#     request, 0 = hybrid, plus the EC trio.  Proven on that machine by
+#     ElXreno/msi-gpu-switcher and nowhere else.
+#
+# The 16V1EMS1 (GS66 Stealth 10SE) speaks *neither*: its variable carries no
+# three-mode marker, and the firmware itself rewrites the variable at every
+# POST (its mtime lands one second after boot) with byte 1 = 0x01 while the
+# BIOS is set to hybrid and the machine runs hybrid.  Reading byte 1 as a
+# pending discrete request on this firmware was an import of the Alpha 17
+# semantics onto a machine they do not hold for, and it produced a permanent
+# phantom "next boot: Discrete, reboot required" on the reference laptop
+# (measured 2026-11-15).  So the variable only names a request when the
+# marker is set; otherwise it names nothing, and `requested` falls back to
+# what the EC bit and the running machine say.
 MUX_EC_ADDR = 0x2E
 MUX_EC_MASK = 0x40             # bit 6: 1 = discrete, 0 = hybrid
 MUX_TRIGGER_ADDR = 0xD1
-MUX_TRIGGER_MASK = 0x03        # bit 0 = "apply the requested mode at POST"
-MUX_TRIGGER_ARM = 0x01
+MUX_TRIGGER_MASK = 0x03         # bits 0-1: request (0x01) and ack (0x02)
+MUX_TRIGGER_ARM = 0x01          # bit 0: "apply the requested mode at POST".
+                                # Arming clears the ack bit first, matching
+                                # msi-gpu-switcher's requestECSwitch.
+MUX_TRIGGER_ACK = 0x02          # bit 1: the firmware stored the request
 
 MUX_VAR_NAME = "MsiDCVarData"
 MUX_VAR_GUID = "dd96baaf-145e-4f56-b1cf-193256298e99"
 MUX_VAR_BASENAME = f"{MUX_VAR_NAME}-{MUX_VAR_GUID}"
 MUX_VAR_SKIP = 4               # efivarfs prefixes the payload with 4 attr bytes
-MUX_VAR_MODE_BYTE = 1          # index of the mode byte inside the payload
+MUX_VAR_LEGACY_BYTE = 1        # the legacy (17KK) request byte
+MUX_VAR_GPU_BYTE = 5           # the three-mode request / status byte
+MUX_VAR_REQ_MASK = 0x03         # three-mode: bits 0-1 hold the request
+MUX_VAR_APPLIED_MASK = 0x0C    # three-mode: bits 2-3 hold what last booted
+MUX_VAR_APPLIED_SHIFT = 2
+MUX_VAR_THREE_MODE = 0x10      # three-mode: the marker bit itself
+MUX_VAR_INTEGRATED = 0x20      # three-mode: integrated mode is supported
+MUX_VAR_NO_DISCRETE = 0x40      # three-mode: discrete mode is NOT supported
 
 MUX_HYBRID = "hybrid"
 MUX_DISCRETE = "discrete"
@@ -1030,6 +1120,13 @@ DEFAULT_CONFIG = {
     # reverse engineered that can leave the machine with no display at all.
     # Requiring an edit here makes it a deliberate act, never a stray click.
     "AllowMuxSwitch": False,
+    # Allow Intel voltage offsets (undervolting) through the OC mailbox.
+    # Off by default for a third reason: the offsets are validated and
+    # volatile (a reboot clears them), but too deep an offset freezes the
+    # machine *now*, and the BIOS unlock it depends on (Overclocking Lock /
+    # CFG Lock / Undervolt Protection off) is a setting most owners should
+    # only change on purpose.
+    "AllowUndervolt": False,
     # Group allowed to talk to the daemon socket.  "wheel" = admin group,
     # so socket access grants nothing its holder could not already get.
     "SocketGroup": "wheel",
@@ -1062,9 +1159,11 @@ def check_choice(value, choices, what: str):
 
 
 def check_int(value, lo: int, hi: int, what: str) -> int:
-    # bool is an int in Python, and "true" must never become speed 1.
+    # bool is an int in Python, and "true" must never become speed 1.  The
+    # parenthesised float clause accepts 5.0 (an honest integer that arrived
+    # as a JSON number) but refuses 5.5.
     if isinstance(value, bool) or not isinstance(value, (int, float)) \
-            or isinstance(value, float) and value != int(value):
+            or (isinstance(value, float) and value != int(value)):
         raise ValidationError(f"invalid {what}: not an integer")
     value = int(value)
     if not (lo <= value <= hi):
@@ -1175,9 +1274,66 @@ def clean_profile(data: dict, n_temps: int | None = None,
             t, s = check_curve(spec.get("temps"), spec.get("speeds"),
                                n_temps, n_speeds)
             out["curve"][which] = {"temps": t, "speeds": s}
+    # The two CPU-side optional keys, same rule as charge_end: absent means
+    # "leave it alone".  freq_khz only gets a sanity bound here (the daemon
+    # clamps it to what this CPU reports at apply time); undervolt keeps
+    # only the planes it names, so a profile cannot zero an offset another
+    # profile set.
+    if data.get("freq_khz") is not None:
+        out["freq_khz"] = check_int(data["freq_khz"], 100_000, 20_000_000,
+                                    "frequency cap")
+    if data.get("undervolt") is not None:
+        uv = data["undervolt"]
+        if not isinstance(uv, dict):
+            raise ValidationError("undervolt must be an object "
+                                  '{plane: millivolts}')
+        out["undervolt"] = check_uv_values(uv, fill=False)
     if not out:
         raise ValidationError("profile has no settings")
     return out
+
+
+def selftest_markdown(st: dict, results: list) -> str:
+    """A paste-ready hardware report: what machine, what passed, what not.
+
+    Deliberately markdown (a PR body), deliberately free of anything the
+    user might not want public: no hostname, no serial, no paths that name
+    a home directory.  The results arrive with section/name/ok/detail, and
+    a check detail may be empty, in which case the checkbox is the whole
+    line.
+    """
+    model = st.get("model") or {}
+    driver = st.get("driver") or {}
+    lines = [
+        "## Hardware self-test report",
+        "",
+        f"- Machine: {model.get('name', 'unknown')} "
+        f"(`{model.get('id', 'unknown')}`, status {model.get('status', 'unknown')})",
+        f"- EC firmware: `{driver.get('fw') or 'unreadable'}`",
+    ]
+    features = model.get("features") or {}
+    if features:
+        on = [k for k, v in sorted(features.items()) if v]
+        lines.append(f"- Features on: "
+                     + (", ".join(f"`{k}`" for k in on) if on else "none"))
+    lines.append("")
+    section = None
+    for r in results:
+        if r.get("section") != section:
+            section = r.get("section")
+            lines.append(f"### {section}")
+            lines.append("")
+        mark = "x" if r.get("ok") else " "
+        detail = f": {r['detail']}" if r.get("detail") else ""
+        lines.append(f"- [{mark}] {r.get('name', '?')}{detail}")
+    if results:
+        lines.append("")
+        passed = sum(1 for r in results if r.get("ok"))
+        lines.append(f"**{passed}/{len(results)} checks passed.**")
+    lines.append("")
+    lines.append("Generated by `msi-control selftest`; every check is "
+                 "reversible and the original settings were restored.")
+    return "\n".join(lines)
 
 
 def curve_speed_at(temps, speeds, temp: float) -> int:
@@ -1424,12 +1580,72 @@ def parse_mux_var(raw) -> tuple:
     return int.from_bytes(raw[:MUX_VAR_SKIP], "little"), raw[MUX_VAR_SKIP:]
 
 
-def mux_from_var(raw) -> str | None:
-    """Mode the UEFI variable requests, or None when it is absent/short."""
+def mux_var_gpu_byte(raw) -> int | None:
+    """Data byte 5 of the variable, or None when it is absent or short.
+
+    Byte 5 is the three-mode request/status byte; the name is deliberately
+    neutral so callers that only want to *check* the marker do not have to
+    first pretend a mode lives there.
+    """
     _attrs, data = parse_mux_var(raw)
-    if len(data) <= MUX_VAR_MODE_BYTE:
+    if len(data) <= MUX_VAR_GPU_BYTE:
         return None
-    return MUX_DISCRETE if data[MUX_VAR_MODE_BYTE] else MUX_HYBRID
+    return data[MUX_VAR_GPU_BYTE]
+
+
+def mux_var_three_mode(raw) -> bool:
+    """Does this firmware speak the three-mode (MSI Center) protocol?
+
+    The firmware sets bit 4 of data byte 5 itself, so this is a question the
+    variable answers about its own layout, not a convention we impose.
+    """
+    gpu = mux_var_gpu_byte(raw)
+    return gpu is not None and bool(gpu & MUX_VAR_THREE_MODE)
+
+
+def mux_from_var(raw) -> str | None:
+    """Mode the UEFI variable requests, or None when it names none we can read.
+
+    Only the three-mode layout is readable: data byte 5, bits 0-1, behind
+    the firmware's own marker bit.  Without the marker the variable names no
+    request this program understands.  Byte 1 is *not* read as a mode: it
+    means "discrete requested" on exactly one known firmware family (the
+    MSI Alpha 17's EC 17KKIMS1) and demonstrably means nothing of the sort on
+    the 16V1EMS1, where the firmware itself writes 0x01 there at every POST
+    while the BIOS is set to hybrid.  Guessing it anyway showed this machine
+    a permanent phantom "reboot to go discrete" that no reboot could ever
+    clear.  `requested` falls back to the EC bit and the running mode.
+    """
+    gpu = mux_var_gpu_byte(raw)
+    if gpu is None or not gpu & MUX_VAR_THREE_MODE:
+        return None
+    # Integrated (code 2) is a real third mode this program does not model;
+    # None says "cannot say" rather than silently calling it hybrid.
+    return {0: MUX_HYBRID, 1: MUX_DISCRETE}.get(gpu & MUX_VAR_REQ_MASK)
+
+
+def mux_applied_from_var(raw) -> str | None:
+    """Mode the firmware applied at the last boot (three-mode bits 2-3)."""
+    gpu = mux_var_gpu_byte(raw)
+    if gpu is None or not gpu & MUX_VAR_THREE_MODE:
+        return None
+    applied = (gpu & MUX_VAR_APPLIED_MASK) >> MUX_VAR_APPLIED_SHIFT
+    return {0: MUX_HYBRID, 1: MUX_DISCRETE}.get(applied)
+
+
+def mux_caps_from_var(raw) -> dict:
+    """What the variable says this firmware can do (three-mode only).
+
+    Returns `{"discrete": bool, "integrated": bool}` or Nones when the
+    firmware does not name its caps.  The polarity of bit 6 is inverted on
+    purpose (a SET bit means discrete is NOT supported), matching the
+    variable's own layout rather than the intuition of the reader.
+    """
+    gpu = mux_var_gpu_byte(raw)
+    if gpu is None or not gpu & MUX_VAR_THREE_MODE:
+        return {"discrete": None, "integrated": None}
+    return {"discrete": not (gpu & MUX_VAR_NO_DISCRETE),
+            "integrated": bool(gpu & MUX_VAR_INTEGRATED)}
 
 
 def igpu_present() -> bool | None:
@@ -1487,11 +1703,205 @@ def local_graphics() -> dict:
         "ec_bit": None,
         "ec_mode": None,
         "var_mode": var_mode,
+        "var_three_mode": mux_var_three_mode(raw),
+        "var_applied": mux_applied_from_var(raw),
+        "caps": mux_caps_from_var(raw),
         "var_present": raw is not None,
         "var_path": mux_var_path(),
         "igpu_present": igpu,
         "backup": None,
     }
+
+
+# --------------------------------------------------------------------------
+# CPU frequency: the cpufreq sysfs interface, world-readable, root-writable
+#
+# intel_pstate gives every logical CPU its own policy directory
+# (/sys/devices/system/cpu/cpufreq/policy*), which is why a "set the max
+# speed" toggle is 16 reads and 16 writes on this machine.  The values are
+# kilohertz (4000000 = 4 GHz), and the kernel clamps anything outside
+# cpuinfo_min..cpuinfo_max; changing them is reversible and never survives
+# a reboot, so this needs no config gate: it is a setting, not a risk.
+# --------------------------------------------------------------------------
+
+def cpufreq_policies() -> list:
+    """The policy directories, sorted, [] when cpufreq is absent."""
+    root = cpufreq_dir()
+    try:
+        subs = [d for d in os.listdir(root)
+                if d.startswith("policy")
+                and os.path.isfile(os.path.join(root, d, "scaling_max_freq"))]
+    except OSError:
+        return []
+    def _num(name: str) -> int:
+        try:
+            return int(name[len("policy"):])
+        except ValueError:
+            return 1 << 30
+    return sorted(subs, key=_num)
+
+
+def _khz(path: str) -> int | None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_khz(path: str) -> int | None:
+    """One cpufreq sysfs value in kHz, or None when it cannot be read.
+
+    Public because the daemon writes-and-reads-back every policy file; the
+    write side stays in the daemon, the read side is core so it exactly
+    matches what `cpufreq_facts` does.
+    """
+    return _khz(path)
+
+
+def cpufreq_facts() -> dict:
+    """What the CPU frequency page and `msi-control freq` need.
+
+    Every value comes from the kernel, so nothing here is guessed: with no
+    cpufreq (desktop tuning absent, weird BIOS) `present` is false and the
+    callers refuse rather than invent numbers.
+    """
+    root = cpufreq_dir()
+    pols = cpufreq_policies()
+    if not pols:
+        return {"present": False, "policies": 0}
+    cpuinfo_max = _khz(os.path.join(root, pols[0], "cpuinfo_max_freq"))
+    cpuinfo_min = _khz(os.path.join(root, pols[0], "cpuinfo_min_freq"))
+    maxes, mins, curs = [], [], []
+    for d in pols:
+        maxes.append(_khz(os.path.join(root, d, "scaling_max_freq")))
+        mins.append(_khz(os.path.join(root, d, "scaling_min_freq")))
+        curs.append(_khz(os.path.join(root, d, "scaling_cur_freq")))
+    uniq_max = sorted({v for v in maxes if v is not None})
+    return {
+        "present": True,
+        "policies": len(pols),
+        "cpuinfo_min_khz": cpuinfo_min,
+        "cpuinfo_max_khz": cpuinfo_max,
+        "max_khz": uniq_max[0] if len(uniq_max) == 1 else None,
+        "max_khz_list": maxes,
+        "min_khz": mins[0] if mins and all(v == mins[0] for v in mins)
+                   else None,
+        "min_khz_list": mins,
+        "cur_khz_list": curs,
+    }
+
+
+def check_freq_khz(value, cpuinfo_min: int, cpuinfo_max: int, what: str) -> int:
+    """A frequency in kHz, clamped to what this CPU is capable of."""
+    return check_int(value, cpuinfo_min, cpuinfo_max, what)
+
+
+def khz_to_ghz(khz) -> str:
+    """4100000 -> "4.10"; a display-only formatting, never parsed back."""
+    if khz is None:
+        return "?"
+    return f"{khz / 1_000_000:.2f}"
+
+
+# --------------------------------------------------------------------------
+# Undervolting: Intel's OC mailbox, MSR 0x150 (the ThrottleStop interface)
+#
+# The protocol is the Leoyzen/ThrottleStop one documented end to end in
+# mihic/linux-intel-undervolt (and reimplemented by georgewhewell/undervolt):
+# a command write selects a "voltage plane", the next write carries the
+# offset as an 11-bit two's-complement count of 1/1.024th mV at bits 21-31.
+# Five planes exist: core, gpu (the iGPU), cache (the ring, which on these
+# chips also clamps the core - Intel shares the FIVR rail), uncore and
+# analogio.  Our clamp is 0..-300 mV: the reference tools start warning
+# around -200 and no Comet Lake-H survives much past -300 if it is honest.
+#
+# Everything about this interface is naturally volatile: the firmware
+# clears the offsets at boot AND at suspend, which is exactly the safety
+# property a tester wants (a too-aggressive offset recovers with a reboot),
+# and also why the GUI re-applies a saved set when *it* starts rather than
+# persisting the values anywhere the firmware would keep.
+#
+# Locked machines: after the Plundervolt disclosure (CVE-2019-11157) the
+# microcode ignores these writes, and most OEM BIOSes ship that way.  The
+# MSI route is the Advanced BIOS OC menu: disable "Overclocking Lock",
+# "CFG Lock" and "Undervolt Protection" (confirmed on a same-generation
+# GP65 i7-10750H).  There is no way to read the lock; a write that does not
+# read back is how the program reports it.
+# --------------------------------------------------------------------------
+
+# The mailbox, and the two command words: bits 40-43 carry the plane,
+# bit 35 (0x1000000000) says "the next write is data", bit 63 says "read".
+UV_MSR = 0x150
+UV_CMD_WRITE = 0x8000001000000000
+UV_CMD_READ = 0x8000000000000000
+UV_PLANE_SHIFT = 40
+UV_VALUE_SHIFT = 21
+UV_VALUE_MASK = 0x7FF            # 11 bits, two's complement
+
+# The planes, in the order ThrottleStop shows them.  cache and core share
+# one rail on every FIVR chip this has been tried on, so an app that lets
+# the user set both to different depths silently applies the *higher*
+# voltage of the two; the hint text on the page says so instead of hiding it.
+UV_PLANES = (("core", 0), ("gpu", 1), ("cache", 2),
+             ("uncore", 3), ("analogio", 4))
+UV_MIN_MV = -300
+UV_MAX_MV = 0
+
+
+def uv_encode(mv: int) -> int:
+    """Millivolts (0 or negative) to the mailbox's 11-bit two's complement."""
+    steps = int(round(mv * 1.024))
+    if not -(1 << 10) <= steps <= 0:
+        # check_uv_mv can never get here; the guard catches direct callers.
+        raise ValidationError(
+            f"voltage offset {mv} mV cannot be represented "
+            f"(want {UV_MIN_MV}..{UV_MAX_MV})")
+    # two's complement in 11 bits; Python's & on a negative int does exactly
+    # that, and -175 mV -> 0xE9A00000 matches the values ThrottleStop shows.
+    return (steps & UV_VALUE_MASK) << UV_VALUE_SHIFT
+
+
+def uv_decode(raw: int) -> int:
+    """Bits 21-31 of a mailbox read, back to whole millivolts."""
+    steps = (raw >> UV_VALUE_SHIFT) & UV_VALUE_MASK
+    if steps >= (1 << 10):
+        steps -= 1 << 11                 # sign-extend the 11-bit field
+    return int(round(steps / 1.024))
+
+
+def check_uv_plane(plane) -> str:
+    names = [name for name, _ in UV_PLANES]
+    return check_choice(plane, names, "voltage plane")
+
+
+def check_uv_mv(value) -> int:
+    """One plane's offset in mV: 0, or negative, never below -300."""
+    return check_int(value, UV_MIN_MV, UV_MAX_MV, "voltage offset")
+
+
+def check_uv_values(values, fill: bool = True) -> dict:
+    """A whole apply request: {plane: mV}, every plane optional.
+
+    fill=True (the undervolt command's shape) writes all five planes, zeros
+    included, because the mailbox has no "leave alone": not mentioning a
+    plane is indistinguishable from clearing it, so clearing it is the
+    honest default.  fill=False (a profile's shape) keeps only the planes
+    the caller named, because a profile that sets core must not silently
+    zero a cache offset it never mentioned.
+    """
+    if not isinstance(values, dict):
+        raise ValidationError("voltage offsets must be an object "
+                              '{plane: millivolts}')
+    if not fill:
+        out = {check_uv_plane(p): check_uv_mv(v) for p, v in values.items()}
+        if not out:
+            raise ValidationError("voltage offsets name no plane")
+        return out
+    out = {name: 0 for name, _ in UV_PLANES}
+    for plane, mv in values.items():
+        out[check_uv_plane(plane)] = check_uv_mv(mv)
+    return out
 
 
 def load_config() -> dict:
@@ -1538,6 +1948,9 @@ CURVE_REGS = dict(MODEL.curve_regs)
 N_TEMPS, N_SPEEDS = MODEL.n_temps, MODEL.n_speeds
 RPM_REGS = dict(MODEL.rpm_regs)
 RPM_NUMERATOR = MODEL.rpm_numerator
+
+# Display-overdrive register of the active model, when it has a proven one.
+OVERDRIVE_REGS = dict(MODEL.overdrive_regs) if MODEL.overdrive_regs else None
 
 # Charge-threshold bounds.
 CHARGE_MIN, CHARGE_MAX = MODEL.charge_min, MODEL.charge_max

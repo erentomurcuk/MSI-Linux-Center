@@ -114,6 +114,17 @@ def build_fake_sysfs(root: str):
     write(os.path.join(root, "bus", "pci", "devices", "0000:01:00.0", "class"),
           "0x030000\n")
 
+    # Two cpufreq policies (the GS66's threads group per core; two are
+    # enough to prove "all of them" behaviour), kHz ints exactly as the
+    # kernel writes them, i7-10875H range.
+    for pol in ("policy0", "policy1"):
+        base = os.path.join(root, "devices", "system", "cpu", "cpufreq", pol)
+        write(os.path.join(base, "cpuinfo_min_freq"), "800000\n")
+        write(os.path.join(base, "cpuinfo_max_freq"), "5100000\n")
+        write(os.path.join(base, "scaling_min_freq"), "800000\n")
+        write(os.path.join(base, "scaling_max_freq"), "5100000\n")
+        write(os.path.join(base, "scaling_cur_freq"), "4000000\n")
+
 
 def add_fake_igpu(root: str):
     """Pretend the firmware brought the Intel iGPU up (hybrid mode)."""
@@ -144,11 +155,49 @@ class FakeEc:
         self.mem[addr] = val
 
 
+class FakeMsr:
+    """RAM-backed OC mailbox standing in for /dev/cpu/*/msr.
+
+    The real MSR decodes command words (bit 63 set, plane index at bits
+    40-43, the 1<<36 bit distinguishing "data follows" from "read back")
+    and stores one offset per voltage plane; a plain file cannot, so the
+    daemon's _wr/_rd are patched onto this and every thread gets its own
+    mailbox, which is what makes per-plane read-backs faithful.
+
+    locked=True is the Plundervolt-era firmware: every write succeeds and
+    every value still reads back 0, the only observable a locked BIOS has.
+    """
+
+    def __init__(self, locked: bool = False):
+        self.locked = locked
+        self.boxes: dict[str, dict[int, int]] = {}
+        self.expect_data: dict[str, int] = {}
+        self.pending_read: dict[str, int] = {}
+
+    def write(self, path: str, value: int):
+        if value & (1 << 63):
+            idx = (value >> core.UV_PLANE_SHIFT) & 0xF
+            if value & 0x1000000000:
+                self.expect_data[path] = idx      # command: data follows
+            else:
+                self.pending_read[path] = idx     # command: read me back
+            return
+        if path in self.expect_data:
+            if not self.locked:
+                self.boxes.setdefault(path, {})[self.expect_data.pop(path)] \
+                    = value
+        # a stray data word with no command behind it is noise
+
+    def read(self, path: str) -> int:
+        idx = self.pending_read.pop(path, 0)
+        return self.boxes.get(path, {}).get(idx, 0)
+
+
 # --------------------------------------------------------------------------
 # base fixture: fake sysfs + fake EC + live daemon in-process
 # --------------------------------------------------------------------------
 
-ENV_VARS = ("MSI_SYSFS", "MSI_SOCK", "MSI_CONFIG", "MSI_STATE")
+ENV_VARS = ("MSI_SYSFS", "MSI_SOCK", "MSI_CONFIG", "MSI_STATE", "MSI_CPU_DEV")
 
 
 class DaemonTest(unittest.TestCase):
@@ -165,6 +214,12 @@ class DaemonTest(unittest.TestCase):
         os.environ["MSI_SOCK"] = self.sock
         os.environ["MSI_CONFIG"] = self.cfg
         os.environ["MSI_STATE"] = self.state
+        # Two thread dirs with no msr file: the machine a test sees unless
+        # it creates them, so undervolting is honestly absent by default.
+        self.cpudev = os.path.join(self.tmp, "devcpu")
+        for n in ("cpu0", "cpu1"):
+            os.makedirs(os.path.join(self.cpudev, n), exist_ok=True)
+        os.environ["MSI_CPU_DEV"] = self.cpudev
 
         self.ec = FakeEc()
         self._orig = (MsiEc._xfer_read, MsiEc._xfer_write)
@@ -287,6 +342,101 @@ class TestValidation(unittest.TestCase):
         self.assertEqual(core.curve_speed_at(temps, speeds, 50), 0)  # not > yet
         self.assertEqual(core.curve_speed_at(temps, speeds, 51), 40)
         self.assertEqual(core.curve_speed_at(temps, speeds, 71), 90)
+
+    def test_frequency_khz_clamped_to_the_cpu(self):
+        self.assertEqual(core.check_freq_khz(3500000, 800000, 5100000,
+                                             "max frequency"), 3500000)
+        for bad in (799999, 5100001, "3500", None, True, 3.5):
+            with self.assertRaises(ValidationError):
+                core.check_freq_khz(bad, 800000, 5100000, "max frequency")
+
+    def test_ghz_formatting_is_display_only(self):
+        self.assertEqual(core.khz_to_ghz(3500000), "3.50")
+        self.assertEqual(core.khz_to_ghz(None), "?")
+
+    def test_uv_encode_matches_throttlestop(self):
+        # -175 mV is the value ThrottleStop shows as 0xE9A00000; matching
+        # it byte for byte is the whole point of the encoding.
+        self.assertEqual(core.uv_encode(-175), 0xE9A00000)
+        self.assertEqual(core.uv_encode(0), 0)
+        for mv in (0, -5, -80, -175, -300):
+            self.assertEqual(core.uv_decode(core.uv_encode(mv)), mv)
+
+    def test_uv_bounds(self):
+        self.assertEqual(core.check_uv_mv(-300), -300)
+        for bad in (-301, 1, "80", None, True, -80.5):
+            with self.assertRaises(ValidationError):
+                core.check_uv_mv(bad)
+
+    def test_uv_values_fill_every_plane(self):
+        clean = core.check_uv_values({"core": -80, "cache": -60})
+        self.assertEqual(clean, {"core": -80, "gpu": 0, "cache": -60,
+                                 "uncore": 0, "analogio": 0})
+        with self.assertRaises(ValidationError):
+            core.check_uv_values({"ring": -10})   # no such plane
+        with self.assertRaises(ValidationError):
+            core.check_uv_values("core=-80")      # not an object
+
+    def test_uv_values_without_fill_keep_only_named_planes(self):
+        # fill=False is a profile's shape: naming core must not zero a
+        # cache offset the profile never mentioned.
+        self.assertEqual(core.check_uv_values({"core": -80}, fill=False),
+                         {"core": -80})
+        with self.assertRaises(ValidationError):
+            core.check_uv_values({}, fill=False)   # names no plane
+
+    def test_profile_owns_a_frequency_cap(self):
+        out = core.clean_profile({"shift": "sport", "freq_khz": 3500000})
+        self.assertEqual(out["freq_khz"], 3500000)
+        # absent still means "leave the cap alone", like charge_end
+        self.assertNotIn("freq_khz", core.clean_profile({"shift": "sport"}))
+        # the sanity bound here is wider than any real CPU; the daemon
+        # clamps to what the machine reports when the profile is applied
+        with self.assertRaises(ValidationError):
+            core.clean_profile({"shift": "sport", "freq_khz": 40000000})
+        with self.assertRaises(ValidationError):
+            core.clean_profile({"shift": "sport", "freq_khz": 100})
+
+    def test_profile_owns_named_undervolt_planes(self):
+        out = core.clean_profile({"shift": "sport",
+                                  "undervolt": {"core": -80, "cache": -60}})
+        self.assertEqual(out["undervolt"], {"core": -80, "cache": -60})
+        with self.assertRaises(ValidationError):
+            # no such plane: a typo must die, not undervolt something
+            core.clean_profile({"shift": "sport",
+                                "undervolt": {"ring": -10}})
+        with self.assertRaises(ValidationError):
+            core.clean_profile({"shift": "sport", "undervolt": -80})
+        with self.assertRaises(ValidationError):
+            core.clean_profile({"shift": "sport", "undervolt": {}})
+        with self.assertRaises(ValidationError):
+            core.clean_profile({"shift": "sport",
+                                "undervolt": {"core": -500}})  # past the bound
+
+    def test_selftest_markdown_is_a_pr_body(self):
+        st = {"model": {"name": "MSI GS66 Stealth 10SE",
+                        "id": "gs66-stealth-10se", "status": "stable",
+                        "features": {"fan_curve": True, "mux": True}},
+              "driver": {"fw": "16V1EMS1.118"}}
+        results = [
+            {"section": "shift mode", "name": "shift eco -> read back eco",
+             "ok": True, "detail": ""},
+            {"section": "shift mode", "name": "shift restored to comfort",
+             "ok": False, "detail": "the write did not stick"},
+            {"section": "charge limit", "name": "charge limit 80",
+             "ok": True, "detail": "start threshold tracks the limit (70)"},
+        ]
+        md = core.selftest_markdown(st, results)
+        self.assertTrue(md.startswith("## Hardware self-test report\n"))
+        self.assertIn("MSI GS66 Stealth 10SE", md)
+        self.assertIn("`16V1EMS1.118`", md)
+        self.assertIn("### shift mode", md)
+        self.assertIn("### charge limit", md)
+        self.assertIn("- [x] shift eco -> read back eco", md)
+        self.assertIn("- [ ] shift restored to comfort:"
+                      " the write did not stick", md)
+        self.assertIn("**2/3 checks passed.**", md)
+        self.assertIn("reversible", md)
 
 
 # --------------------------------------------------------------------------
@@ -740,6 +890,93 @@ class TestProfiles(DaemonTest):
         self.assertEqual(self.call({"cmd": "capture-factory"})["result"],
                          "exists")
 
+    def test_save_current_carries_the_frequency_cap(self):
+        self.call({"cmd": "freq", "action": "set", "max_khz": 3500000})
+        self.call({"cmd": "profile", "action": "save-current", "name": "capped"})
+        out = self.call({"cmd": "profile", "action": "show", "name": "capped"})
+        self.assertEqual(out.get("freq_khz"), 3500000)
+
+    def test_profile_applies_the_frequency_cap(self):
+        self.call({"cmd": "freq", "action": "set", "max_khz": 3500000})
+        self.call({"cmd": "profile", "action": "save-current", "name": "capped"})
+        self.call({"cmd": "freq", "action": "set", "max_khz": 4800000})
+        out = self.call({"cmd": "profile", "action": "apply", "name": "capped"})
+        for pol in ("policy0", "policy1"):
+            path = os.path.join(self.sysfs, "devices", "system", "cpu",
+                                "cpufreq", pol, "scaling_max_freq")
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(int(fh.read()), 3500000)
+        self.assertTrue([c for c in out["changes"] if "max frequency" in c],
+                        out["changes"])
+        self.assertIn("Set CPU max frequency to 3.50 GHz", out["activities"])
+
+    def test_a_profile_without_a_cap_leaves_the_core_speed_alone(self):
+        # Absent means untouched, the same rule as charge_end.
+        self.call({"cmd": "freq", "action": "set", "max_khz": 3500000})
+        out = self.call({"cmd": "profile", "action": "apply", "name": "silent"})
+        path = os.path.join(self.sysfs, "devices", "system", "cpu",
+                            "cpufreq", "policy0", "scaling_max_freq")
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(int(fh.read()), 3500000)
+        self.assertFalse([c for c in (out["changes"] or [])
+                          if "max frequency" in c], out["changes"])
+
+    def fake_mailbox(self) -> FakeMsr:
+        """Give the fixture an OC mailbox, the way TestUndervolt does."""
+        for n in ("cpu0", "cpu1"):
+            open(os.path.join(self.cpudev, n, "msr"), "w").close()
+        msr = FakeMsr()
+        self._uv_orig = (msi_controld.Undervolt._wr,
+                         msi_controld.Undervolt._rd)
+        msi_controld.Undervolt._wr = staticmethod(
+            lambda path, value: msr.write(path, value))
+        msi_controld.Undervolt._rd = staticmethod(
+            lambda path: msr.read(path))
+        self.addCleanup(self._restore_mailbox)
+        return msr
+
+    def _restore_mailbox(self):
+        msi_controld.Undervolt._wr, msi_controld.Undervolt._rd = self._uv_orig
+
+    def test_save_current_carries_live_voltage_offsets(self):
+        self.fake_mailbox()
+        svc = self.make_service(config={"AllowUndervolt": True})
+        svc.handle({"cmd": "undervolt", "action": "apply",
+                    "values": {"core": -80, "cache": -60}})
+        self.call({"cmd": "profile", "action": "save-current", "name": "mine"})
+        out = self.call({"cmd": "profile", "action": "show", "name": "mine"})
+        self.assertEqual(out.get("undervolt"), {"core": -80, "cache": -60})
+
+    def test_profile_applies_only_the_offsets_it_names(self):
+        msr = self.fake_mailbox()
+        svc = self.make_service(config={"AllowUndervolt": True})
+        svc.handle({"cmd": "undervolt", "action": "apply",
+                    "values": {"core": -80}})
+        self.call({"cmd": "profile", "action": "save-current", "name": "mine"})
+        # scramble: core cleared, cache undervolted by hand
+        svc.handle({"cmd": "undervolt", "action": "apply",
+                    "values": {"core": 0, "cache": -60}})
+        out = svc.handle({"cmd": "profile", "action": "apply", "name": "mine"})
+        planes = svc.handle({"cmd": "undervolt"})["planes"]
+        self.assertEqual(planes["core"], -80)
+        # cache was never named by the profile, so it must still be -60:
+        # a profile cannot zero an offset it did not mention
+        self.assertEqual(planes["cache"], -60)
+        self.assertIn("Applied voltage offsets", out["activities"])
+
+    def test_profile_undervolt_warns_when_the_gate_is_off(self):
+        self.fake_mailbox()
+        svc = self.make_service(config={"AllowUndervolt": True})
+        svc.handle({"cmd": "undervolt", "action": "apply",
+                    "values": {"core": -80}})
+        self.call({"cmd": "profile", "action": "save-current", "name": "mine"})
+        # the socket's service has the default (gated) config
+        out = self.call({"cmd": "profile", "action": "apply", "name": "mine"})
+        self.assertTrue([w for w in out["warnings"]
+                         if "AllowUndervolt" in w], out["warnings"])
+        self.assertFalse([c for c in (out["changes"] or [])
+                          if "voltage" in c], out["changes"])
+
 
 class TestRestore(DaemonTest):
     def test_last_state_survives_restart(self):
@@ -936,18 +1173,67 @@ class TestMuxParsing(unittest.TestCase):
         self.assertEqual(core.mux_from_ec_byte(0x02), core.MUX_HYBRID)
         self.assertIsNone(core.mux_from_ec_byte(None))
 
-    def test_var_split_and_polarity(self):
+    def test_var_split_and_request(self):
+        # Legacy-size variable: 4 attribute bytes then the payload.  It only
+        # names a request when the three-mode marker is set, so on this
+        # machine-shaped one (the GS66's BIOS writes byte 1 = 0x01 at POST
+        # while set to hybrid) the answer is None, never "discrete".
         raw = b"\x07\x00\x00\x00" + bytes([0x01, 0x01]) + bytes(20)
         attrs, data = core.parse_mux_var(raw)
         self.assertEqual(attrs, 0x07)
         self.assertEqual(len(data), 22)
-        self.assertEqual(core.mux_from_var(raw), core.MUX_DISCRETE)
-        self.assertEqual(core.mux_from_var(b"\x07\x00\x00\x00\x01\x00"),
-                         core.MUX_HYBRID)
+        self.assertFalse(core.mux_var_three_mode(raw))
+        self.assertIsNone(core.mux_from_var(raw))
+        self.assertIsNone(core.mux_applied_from_var(raw))
+        self.assertEqual(core.mux_caps_from_var(raw),
+                         {"discrete": None, "integrated": None})
+
+        # Three-mode variable: data byte 5, bits 0-1 = request, bits 2-3 =
+        # what last booted, bit 4 = the marker, bit 5 = integrated offered,
+        # bit 6 set = discrete NOT offered (the inverted polarity is the
+        # variable's own layout, documented in ege-adam/msi-gpu-mode and
+        # implemented by ElXreno/msi-gpu-switcher).
+        def three_mode(gpu_byte):
+            payload = bytearray(20)
+            payload[core.MUX_VAR_GPU_BYTE] = gpu_byte
+            return b"\x07\x00\x00\x00" + bytes(payload)
+
+        # marker only: hybrid requested, hybrid last booted, both modes seem
+        # offered
+        plain = three_mode(core.MUX_VAR_THREE_MODE)
+        self.assertTrue(core.mux_var_three_mode(plain))
+        self.assertEqual(core.mux_from_var(plain), core.MUX_HYBRID)
+        self.assertEqual(core.mux_applied_from_var(plain), core.MUX_HYBRID)
+        self.assertEqual(core.mux_caps_from_var(plain),
+                         {"discrete": True, "integrated": False})
+        # marker + request bit: a discrete switch is pending
+        self.assertEqual(
+            core.mux_from_var(three_mode(core.MUX_VAR_THREE_MODE | 0x01)),
+            core.MUX_DISCRETE)
+        # marker + applied bits: discrete booted, nothing requested
+        booted = three_mode(core.MUX_VAR_THREE_MODE
+                            | (1 << core.MUX_VAR_APPLIED_SHIFT))
+        self.assertEqual(core.mux_from_var(booted), core.MUX_HYBRID)
+        self.assertEqual(core.mux_applied_from_var(booted),
+                         core.MUX_DISCRETE)
+        # marker + "no discrete" bit: the request stays readable (hybrid),
+        # and the cap says the mode does not exist on this firmware
+        capped = three_mode(core.MUX_VAR_THREE_MODE
+                            | core.MUX_VAR_NO_DISCRETE)
+        self.assertEqual(core.mux_from_var(capped), core.MUX_HYBRID)
+        self.assertEqual(core.mux_caps_from_var(capped)["discrete"], False)
+        self.assertEqual(core.mux_caps_from_var(capped)["integrated"], False)
+        # request code 2 is integrated: a real mode this program does not
+        # model, so the honest answer is None rather than a silent hybrid
+        integrated = three_mode(core.MUX_VAR_THREE_MODE | 0x02)
+        self.assertIsNone(core.mux_from_var(integrated))
+
         # absent / truncated must be None, never a guess
         self.assertIsNone(core.mux_from_var(None))
         self.assertIsNone(core.mux_from_var(b""))
-        self.assertIsNone(core.mux_from_var(b"\x07\x00\x00\x00\x01"))
+        # the old mis-reading this test guards against returning: a 1 in
+        # byte 1 with no marker means nothing, anywhere, ever
+        self.assertIsNone(core.mux_from_var(b"\x07\x00\x00\x00\x01\x01"))
 
     def test_mode_validation(self):
         for good in core.MUX_MODES:
@@ -971,9 +1257,13 @@ class TestMuxParsing(unittest.TestCase):
 class TestGraphicsRead(DaemonTest):
     def test_daemon_reports_all_three_sources(self):
         g = self.call({"cmd": "graphics"})
-        # fake sysfs: EC bit set, var byte 1 = 1, no Intel display device
+        # fake sysfs: EC bit set, no three-mode marker in the variable, no
+        # Intel display device.  The variable names nothing on this layout,
+        # so the request comes from the EC bit.
         self.assertEqual(g["ec_mode"], core.MUX_DISCRETE)
-        self.assertEqual(g["var_mode"], core.MUX_DISCRETE)
+        self.assertIsNone(g["var_mode"])
+        self.assertFalse(g["var_three_mode"])
+        self.assertIsNone(g["var_applied"])
         self.assertEqual(g["requested"], core.MUX_DISCRETE)
         self.assertEqual(g["effective"], core.MUX_DISCRETE)
         self.assertFalse(g["reboot_required"])
@@ -1001,17 +1291,23 @@ class TestGraphicsRead(DaemonTest):
         self.assertIsNone(core.local_status(mux=False)["graphics"])
 
     def test_an_intel_gpu_flips_effective_and_raises_the_reboot_flag(self):
-        # var says discrete (next boot), iGPU present (running now) - the
-        # machine is mid-switch.
+        # EC bit set (discrete next), iGPU present (running hybrid now) -
+        # the machine is mid-switch.
         add_fake_igpu(self.sysfs)
         svc = self.make_service()
         g = svc.handle({"cmd": "graphics"})
         self.assertEqual(g["effective"], core.MUX_HYBRID)
         self.assertEqual(g["requested"], core.MUX_DISCRETE)
         self.assertTrue(g["reboot_required"])
-        # ...and it agrees with the unprivileged view.
+        # ...and the unprivileged view agrees about the running mode.  It
+        # cannot see the EC-side request (only the daemon can read the EC
+        # register), so it honestly reports no pending switch there rather
+        # than inventing one out of the variable.
         self.assertTrue(core.igpu_present())
-        self.assertTrue(core.local_graphics()["reboot_required"])
+        local = core.local_graphics()
+        self.assertEqual(local["effective"], core.MUX_HYBRID)
+        self.assertIsNone(local["ec_bit"])
+        self.assertFalse(local["reboot_required"])
 
     def test_igpu_absence_is_not_an_error(self):
         self.assertFalse(core.igpu_present())
@@ -1066,8 +1362,11 @@ class TestGraphicsWrite(DaemonTest):
         self.assertEqual(raw[4 + 1], 0x00)
         self.assertEqual(raw[:4], b"\x07\x00\x00\x00")   # attrs preserved
         self.assertEqual(len(raw), 26)                   # length preserved
-        self.assertEqual(core.mux_from_var(raw), core.MUX_HYBRID)
-        # 2. the EC state bit
+        # The legacy byte is *written*, not read back as a mode: without the
+        # three-mode marker the variable names nothing (see mux_from_var),
+        # and the request this machine can actually report is the EC bit.
+        self.assertIsNone(core.mux_from_var(raw))
+        self.assertFalse(core.mux_var_three_mode(raw))        # 2. the EC state bit
         self.assertEqual(self.ec.mem[core.MUX_EC_ADDR] & core.MUX_EC_MASK, 0)
         # 3. the EC trigger, armed
         self.assertEqual(self.ec.mem[core.MUX_TRIGGER_ADDR],
@@ -1187,6 +1486,127 @@ class TestGraphicsWrite(DaemonTest):
             svc.handle({"cmd": "graphics", "action": "set",
                         "mode": core.MUX_HYBRID})
         self.assertIn("too short", str(ctx.exception))
+
+
+class ThreeModeEc(FakeEc):
+    """A three-mode firmware's EC: the SMI handler stores the request and
+    raises the acknowledge bit the moment the EC is asked, which is what the
+    real handshake looks like from Linux."""
+
+    def write(self, addr: int, val: int):
+        super().write(addr, val)
+        if addr == core.MUX_TRIGGER_ADDR and val & core.MUX_TRIGGER_ARM:
+            self.mem[addr] = (val | core.MUX_TRIGGER_ACK) & 0xFF
+
+
+class TestGraphicsThreeMode(DaemonTest):
+    """The MSI Center protocol: request in byte 5, EC trigger, acknowledge.
+
+    Encoded from ElXreno/msi-gpu-switcher's threemode backend (and, in the
+    layout, from ege-adam/msi-gpu-mode, which first documented byte 5).  The
+    two protocols share one variable, and only the firmware's own marker bit
+    says which one to write; getting it backwards either invents a pending
+    switch (the 16V1 read bug this class's sibling guards against) or pokes
+    a byte the firmware rewrites at POST.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Booted hybrid, nothing pending, both bits of the story consistent.
+        self.ec = ThreeModeEc()
+        self.ec.mem[core.MUX_EC_ADDR] = 0x00
+        add_fake_igpu(self.sysfs)
+        self.write_var(core.MUX_VAR_THREE_MODE)
+        self.svc = self.make_service(config={"AllowMuxSwitch": True})
+
+    def write_var(self, gpu_byte):
+        payload = bytearray(22)
+        payload[core.MUX_VAR_LEGACY_BYTE] = 0x00
+        payload[core.MUX_VAR_GPU_BYTE] = gpu_byte
+        with open(core.mux_var_path(), "wb") as fh:
+            fh.write(b"\x07\x00\x00\x00" + bytes(payload))
+
+    def var_gpu(self) -> int:
+        with open(core.mux_var_path(), "rb") as fh:
+            raw = fh.read()
+        return raw[core.MUX_VAR_SKIP + core.MUX_VAR_GPU_BYTE]
+
+    def test_read_reports_the_three_mode_facts(self):
+        g = self.svc.handle({"cmd": "graphics"})
+        self.assertTrue(g["var_three_mode"])
+        self.assertEqual(g["var_mode"], core.MUX_HYBRID)
+        self.assertEqual(g["var_applied"], core.MUX_HYBRID)
+        self.assertEqual(g["caps"], {"discrete": True,
+                                    "integrated": False})
+        self.assertEqual(g["requested"], core.MUX_HYBRID)
+        self.assertEqual(g["effective"], core.MUX_HYBRID)
+        self.assertFalse(g["reboot_required"])
+
+    def test_discrete_switch_writes_byte5_not_byte1_or_the_state_bit(self):
+        before = dict(self.ec.mem)
+        before_var = self.var_gpu()
+        out = self.svc.handle({"cmd": "graphics", "action": "set",
+                               "mode": core.MUX_DISCRETE})
+        gpu = self.var_gpu()
+        # byte 5: the request moved, everything else in it survived
+        self.assertEqual(gpu & core.MUX_VAR_REQ_MASK, 0x01)
+        self.assertTrue(gpu & core.MUX_VAR_THREE_MODE)
+        self.assertEqual(
+            gpu & ~(core.MUX_VAR_REQ_MASK),
+            before_var & ~(core.MUX_VAR_REQ_MASK))
+        # byte 1: untouched; on this protocol it is not a mode byte at all
+        with open(core.mux_var_path(), "rb") as fh:
+            raw = fh.read()
+        self.assertEqual(raw[core.MUX_VAR_SKIP + core.MUX_VAR_LEGACY_BYTE],
+                         0x00)
+        # the EC: request armed, firmware acknowledged, state bit never
+        # touched (the firmware owns 0x2e on this protocol)
+        trig = self.ec.mem[core.MUX_TRIGGER_ADDR]
+        self.assertTrue(trig & core.MUX_TRIGGER_ARM)
+        self.assertTrue(trig & core.MUX_TRIGGER_ACK)
+        changed = {a for a in set(before) | set(self.ec.mem)
+                   if before.get(a) != self.ec.mem.get(a)}
+        self.assertEqual(changed, {core.MUX_TRIGGER_ADDR})
+        self.assertEqual(out["now"], core.MUX_DISCRETE)
+        self.assertTrue(out["reboot_required"])
+
+    def test_caps_say_no_discrete_is_a_refusal_with_a_reason(self):
+        self.write_var(core.MUX_VAR_THREE_MODE | core.MUX_VAR_NO_DISCRETE)
+        with self.assertRaises(msi_controld.BackendError) as ctx:
+            self.svc.handle({"cmd": "graphics", "action": "set",
+                             "mode": core.MUX_DISCRETE})
+        self.assertIn("does not offer discrete", str(ctx.exception))
+        # refused before anything was written
+        self.assertEqual(self.var_gpu() & core.MUX_VAR_REQ_MASK, 0x00)
+        self.assertNotIn(core.MUX_TRIGGER_ADDR,
+                         {a for a in self.ec.mem if self.ec.mem[a]})
+
+    def test_no_acknowledge_is_an_error_and_not_a_success(self):
+        # a firmware that never acknowledges: the request is staged but the
+        # daemon must say the switch did not complete, not report it done
+        self.ec = FakeEc()
+        self.ec.mem[core.MUX_EC_ADDR] = 0x00
+        self.svc = self.make_service(config={"AllowMuxSwitch": True})
+        self.svc.ec.mux_ack_timeout = 0.2     # keep the test fast
+        with self.assertRaises(msi_controld.BackendError) as ctx:
+            self.svc.handle({"cmd": "graphics", "action": "set",
+                             "mode": core.MUX_DISCRETE})
+        self.assertIn("acknowledge", str(ctx.exception))
+        # the state bit the firmware owns was still never touched
+        self.assertEqual(self.ec.mem[core.MUX_EC_ADDR], 0x00)
+
+    def test_revert_replays_the_image_through_the_same_handshake(self):
+        before_gpu = self.var_gpu()
+        self.svc.handle({"cmd": "graphics", "action": "set",
+                         "mode": core.MUX_DISCRETE})
+        self.assertNotEqual(self.var_gpu(), before_gpu)
+        out = self.svc.handle({"cmd": "graphics", "action": "revert"})
+        self.assertEqual(self.var_gpu(), before_gpu)
+        # and the restore went through the trigger, not the state bit
+        self.assertTrue(self.ec.mem[core.MUX_TRIGGER_ADDR]
+                        & core.MUX_TRIGGER_ACK)
+        self.assertEqual(self.ec.mem[core.MUX_EC_ADDR], 0x00)
+        self.assertEqual(out["now"], core.MUX_HYBRID)
 
 
 class TestEfivarWrite(unittest.TestCase):
@@ -1604,6 +2024,376 @@ class TestDetectAndDraft(unittest.TestCase):
         }
         text = core.render_detect(report)
         self.assertIn("NOTHING", text)
+
+
+# --------------------------------------------------------------------------
+# cpu frequency, undervolting and display overdrive
+# --------------------------------------------------------------------------
+
+class TestFrequency(DaemonTest):
+    """The all-core max frequency knob: cpufreq sysfs through the daemon."""
+
+    def policy_attr(self, pol: str, name: str) -> int:
+        path = os.path.join(self.sysfs, "devices", "system", "cpu",
+                            "cpufreq", pol, name)
+        with open(path, encoding="utf-8") as fh:
+            return int(fh.read().strip())
+
+    def test_status_carries_frequency_facts(self):
+        st = self.call({"cmd": "status"})
+        self.assertTrue(st["freq"]["present"])
+        self.assertEqual(st["freq"]["policies"], 2)
+        self.assertEqual(st["freq"]["cpuinfo_min_khz"], 800000)
+        self.assertEqual(st["freq"]["cpuinfo_max_khz"], 5100000)
+        self.assertEqual(st["freq"]["max_khz"], 5100000)
+
+    def test_set_all_max_reads_back_on_every_policy(self):
+        out = self.call({"cmd": "freq", "action": "set", "max_khz": 3500000})
+        self.assertEqual(out["max_khz"], 3500000)
+        self.assertEqual(out["policies"], 2)
+        self.assertEqual(out["max_khz_applied"], 3500000)
+        for pol in ("policy0", "policy1"):
+            self.assertEqual(self.policy_attr(pol, "scaling_max_freq"),
+                             3500000)
+            # a floor already below the cap is left exactly where it was
+            self.assertEqual(self.policy_attr(pol, "scaling_min_freq"),
+                             800000)
+
+    def test_the_floor_is_lifted_not_overtaken(self):
+        # cpufreq refuses max < min, so a cap below the current floor drags
+        # the floor down with it rather than leaving the pair inconsistent.
+        for pol in ("policy0", "policy1"):
+            path = os.path.join(self.sysfs, "devices", "system", "cpu",
+                                "cpufreq", pol, "scaling_min_freq")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("4000000\n")
+        out = self.call({"cmd": "freq", "action": "set", "max_khz": 2500000})
+        self.assertEqual(out["max_khz_applied"], 2500000)
+        for pol in ("policy0", "policy1"):
+            self.assertEqual(self.policy_attr(pol, "scaling_min_freq"),
+                             2500000)
+            self.assertEqual(self.policy_attr(pol, "scaling_max_freq"),
+                             2500000)
+
+    def test_out_of_range_is_refused_and_changes_nothing(self):
+        with self.assertRaises(core.ProtocolError) as ctx:
+            self.call({"cmd": "freq", "action": "set", "max_khz": 6000000})
+        self.assertIn("max frequency", str(ctx.exception))
+        for pol in ("policy0", "policy1"):
+            self.assertEqual(self.policy_attr(pol, "scaling_max_freq"),
+                             5100000)
+
+    def test_no_cpufreq_is_an_honest_refusal_not_fake_numbers(self):
+        shutil.rmtree(os.path.join(self.sysfs, "devices", "system", "cpu",
+                                   "cpufreq"))
+        self.assertFalse(self.call({"cmd": "freq"})["present"])
+        with self.assertRaises(core.ProtocolError):
+            self.call({"cmd": "freq", "action": "set", "max_khz": 3500000})
+
+    def test_cli_show_and_set(self):
+        show = self.run_cli("freq")
+        self.assertIn("5.10 GHz", show.stdout)
+        proc = self.run_cli("freq", "3.5")          # GHz, the human form
+        self.assertIn("3.50 GHz", proc.stdout)
+        self.assertEqual(self.policy_attr("policy0", "scaling_max_freq"),
+                         3500000)
+        # both classic mistakes die before any write: under the hardware
+        # floor, and over the hardware ceiling
+        self.run_cli("freq", "0.5", expect_rc=1)
+        self.run_cli("freq", "99", expect_rc=1)
+        self.assertEqual(self.policy_attr("policy0", "scaling_max_freq"),
+                         3500000)
+
+
+class TestUndervolt(DaemonTest):
+    """The OC mailbox: read-back, lock detection, the config gate."""
+
+    def setUp(self):
+        super().setUp()
+        for n in ("cpu0", "cpu1"):
+            open(os.path.join(self.cpudev, n, "msr"), "w").close()
+        self.msr = FakeMsr()
+        self._uv_orig = (msi_controld.Undervolt._wr,
+                         msi_controld.Undervolt._rd)
+        msi_controld.Undervolt._wr = staticmethod(
+            lambda path, value: self.msr.write(path, value))
+        msi_controld.Undervolt._rd = staticmethod(
+            lambda path: self.msr.read(path))
+        # A second service with the gate open; the socket keeps serving the
+        # default (gated-off) service so the CLI paths test the real default.
+        self.svc = self.make_service(config={"AllowUndervolt": True})
+
+    def tearDown(self):
+        msi_controld.Undervolt._wr, msi_controld.Undervolt._rd = self._uv_orig
+        super().tearDown()
+
+    def apply(self, values):
+        return self.svc.handle({"cmd": "undervolt", "action": "apply",
+                                "values": values})
+
+    def planes(self) -> dict:
+        return self.svc.handle({"cmd": "undervolt"})["planes"]
+
+    def test_show_reads_boot_zeros(self):
+        out = self.svc.handle({"cmd": "undervolt"})
+        self.assertTrue(out["msr_present"])
+        self.assertTrue(out["allowed"])
+        self.assertEqual(out["planes"], {"core": 0, "gpu": 0, "cache": 0,
+                                         "uncore": 0, "analogio": 0})
+
+    def test_the_gate_is_the_default_and_refusal_touches_nothing(self):
+        with self.assertRaises(core.ProtocolError) as ctx:
+            self.call({"cmd": "undervolt", "action": "apply",
+                       "values": {"core": -80}})
+        self.assertIn("AllowUndervolt", str(ctx.exception))
+        self.assertEqual(self.svc.handle({"cmd": "undervolt"})["planes"]
+                         ["core"], 0)
+
+    def test_apply_reads_back_and_fills_the_unmentioned_planes(self):
+        out = self.apply({"core": -80, "cache": -60})
+        self.assertEqual(out["applied"],
+                         {"core": -80, "gpu": 0, "cache": -60,
+                          "uncore": 0, "analogio": 0})
+        self.assertIn("core -80 mV", out["summary"])
+        self.assertIn("clear at reboot", out["volatile"])
+        planes = self.planes()
+        self.assertEqual(planes["core"], -80)
+        self.assertEqual(planes["cache"], -60)
+        self.assertEqual(planes["gpu"], 0)
+
+    def test_every_thread_carries_the_offset(self):
+        self.apply({"core": -80})
+        self.assertEqual(msi_controld.Undervolt().read_plane("core"),
+                         [-80, -80])
+
+    def test_a_locked_bios_is_reported_as_a_bios_problem(self):
+        self.msr.locked = True
+        with self.assertRaises(msi_controld.BackendError) as ctx:
+            self.apply({"core": -80})
+        text = str(ctx.exception)
+        self.assertIn("refused the voltage offset", text)
+        self.assertIn("BIOS", text)
+        self.assertIn("Overclocking Lock", text)
+        # nothing stuck, the machine is where it started
+        self.assertEqual(msi_controld.Undervolt().read_plane("core"), [0, 0])
+
+    def test_mismatched_threads_report_the_shallowest_value(self):
+        # The sorter is a safety property: an app must never tell the user a
+        # deeper undervolt than some thread is actually running.
+        self.msr.boxes[os.path.join(self.cpudev, "cpu0", "msr")] = \
+            {0: core.uv_encode(-60)}
+        self.msr.boxes[os.path.join(self.cpudev, "cpu1", "msr")] = \
+            {0: core.uv_encode(-80)}
+        self.assertEqual(msi_controld.Undervolt().read_plane("core"),
+                         [-60, -80])
+
+    def test_reset_clears_every_plane(self):
+        self.apply({"core": -80, "gpu": -40, "cache": -60, "uncore": -20,
+                    "analogio": -10})
+        out = self.svc.handle({"cmd": "undervolt", "action": "reset"})
+        self.assertEqual(set(out["applied"].values()), {0})
+        self.assertEqual(set(self.planes().values()), {0})
+
+    def test_deep_or_bogus_planes_are_refused(self):
+        with self.assertRaises(core.ValidationError) as ctx:
+            self.apply({"core": -500})
+        self.assertIn("voltage offset", str(ctx.exception))
+        with self.assertRaises(core.ValidationError):
+            self.apply({"ring": -10})          # no such plane
+
+    def test_no_msr_devices_is_reported_not_crashed(self):
+        for n in ("cpu0", "cpu1"):
+            os.unlink(os.path.join(self.cpudev, n, "msr"))
+        out = self.svc.handle({"cmd": "undervolt"})
+        self.assertFalse(out["msr_present"])
+        self.assertIsNone(out["planes"])
+        with self.assertRaises(msi_controld.BackendError):
+            self.apply({"core": -80})
+
+    def test_cli_shows_offsets_and_requires_yes_to_write(self):
+        show = self.run_cli("undervolt", "show")
+        self.assertIn("Voltage offsets", show.stdout)
+        self.assertIn("0 mV", show.stdout)
+        self.assertIn("AllowUndervolt", show.stdout)
+        proc = self.run_cli("undervolt", "set", "core=-80", expect_rc=1)
+        self.assertIn("--yes", proc.stdout + proc.stderr)
+        # --yes then hits the real config gate (the served service is the
+        # default one), which is the honest behaviour on a fresh install
+        proc = self.run_cli("undervolt", "set", "core=-80", "--yes",
+                            expect_rc=1)
+        self.assertIn("AllowUndervolt", proc.stdout + proc.stderr)
+
+
+class TestOverdrive(DaemonTest):
+    """The panel overdrive toggle: one model-proven EC bit, a one-bit RMW."""
+
+    def enable_overdrive(self, **extra) -> core.Model:
+        """Run the rest of the test as if the shipped model proved bit 4."""
+        with open(os.path.join(REPO, "models", "gs66-stealth-10se",
+                               "model.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["features"]["display_overdrive"] = True
+        spec = {"address": "0x2e", "bit": 4}
+        spec.update(extra)
+        data["ec"]["overdrive"] = spec
+        model = core.Model(data)
+        for p in (mock.patch.object(core, "MODEL", model),
+                  mock.patch.object(core, "OVERDRIVE_REGS",
+                                    dict(model.overdrive_regs))):
+            p.start()
+            self.addCleanup(p.stop)
+        return model
+
+    def test_without_a_proven_register_nothing_is_claimed(self):
+        st = self.call({"cmd": "status"})
+        self.assertEqual(st["overdrive"], {"supported": False, "on": None})
+        out = self.call({"cmd": "overdrive"})
+        self.assertFalse(out["supported"])
+        self.assertIsNone(out["on"])
+        with self.assertRaises(core.ProtocolError) as ctx:
+            self.call({"cmd": "overdrive", "action": "set", "on": True})
+        self.assertIn("no proven", str(ctx.exception))
+        # and the CLI pre-empts the same refusal locally
+        proc = self.run_cli("overdrive", "on", expect_rc=1)
+        self.assertIn("no proven", proc.stdout + proc.stderr)
+
+    def test_show_reads_the_model_bit(self):
+        self.enable_overdrive()
+        self.ec.mem[core.MUX_EC_ADDR] = 0x40 | 0x10
+        st = self.call({"cmd": "status"})
+        self.assertEqual(st["overdrive"], {"supported": True, "on": True})
+        self.ec.mem[core.MUX_EC_ADDR] = 0x40
+        self.assertFalse(self.call({"cmd": "overdrive"})["on"])
+
+    def test_the_toggle_is_a_one_bit_rmw_over_its_neighbours(self):
+        # 0x2e bit 1 is the webcam and bit 6 the MUX state; bit 4 must move
+        # without touching either.  This is the rule from AGENTS.md, proven.
+        self.enable_overdrive()
+        self.ec.mem[core.MUX_EC_ADDR] = 0x42            # webcam on, OD off
+        out = self.call({"cmd": "overdrive", "action": "set", "on": True})
+        self.assertEqual((out["was"], out["now"]), (0, 1))
+        self.assertEqual(self.ec.mem[core.MUX_EC_ADDR], 0x52)
+        out = self.call({"cmd": "overdrive", "action": "set", "on": False})
+        self.assertEqual((out["was"], out["now"]), (1, 0))
+        self.assertEqual(self.ec.mem[core.MUX_EC_ADDR], 0x42)
+
+    def test_byte_override_values_from_the_model_win(self):
+        # A firmware whose EC rewrites the whole byte gets exact on/off
+        # values from the model file instead of bit twiddling.
+        self.enable_overdrive(off="0x02", on="0x52")
+        self.ec.mem[core.MUX_EC_ADDR] = 0x40
+        self.call({"cmd": "overdrive", "action": "set", "on": True})
+        self.assertEqual(self.ec.mem[core.MUX_EC_ADDR], 0x52)
+        self.call({"cmd": "overdrive", "action": "set", "on": False})
+        self.assertEqual(self.ec.mem[core.MUX_EC_ADDR], 0x02)
+
+    def test_a_claimed_flag_without_registers_is_rejected(self):
+        with open(os.path.join(REPO, "models", "gs66-stealth-10se",
+                               "model.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["features"]["display_overdrive"] = True
+        # but no ec.overdrive block: a model cannot claim the register it
+        # never identified, exactly like fan_curve and rpm
+        with self.assertRaises(core.ModelError) as ctx:
+            core.Model(data)
+        self.assertIn("ec.overdrive", str(ctx.exception))
+
+
+class TestSelftest(DaemonTest):
+    """verify.sh as a daemon command: round-trips that restore everything."""
+
+    def snapshot(self):
+        """The settings the self-test is allowed to touch, none of which
+        may be different when it returns."""
+        st = self.call({"cmd": "status"})
+        bat = st.get("battery") or {}
+        return {
+            "shift": st["shift"]["current"],
+            "fan": st["fan"]["current"],
+            "cooler_boost": st.get("cooler_boost"),
+            "charge_end": bat.get("charge_end"),
+            "freq_khz": (st.get("freq") or {}).get("max_khz"),
+            "ec": dict(self.ec.mem),
+        }
+
+    def test_roundtrips_pass_and_everything_comes_back(self):
+        before = self.snapshot()
+        out = self.call({"cmd": "selftest"})
+        self.assertTrue(out["ok"], out.get("summary"))
+        # a walk over every section the report owes the reader
+        sections = {r["section"] for r in out["results"]}
+        for s in ("driver", "model", "shift mode", "fan mode",
+                  "cooler boost", "charge limit", "fan curves",
+                  "cpu frequency", "sanity"):
+            self.assertIn(s, sections)
+        # the one honest note this fixture can make: the fake start
+        # threshold does not follow the limit the way msi-ec does, and
+        # the report must say so instead of pretending it pairs
+        names = " | ".join(r["name"] for r in out["results"])
+        self.assertIn("start threshold held", names)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_the_markdown_is_a_pr_body(self):
+        out = self.call({"cmd": "selftest"})
+        md = out["markdown"]
+        total = len(out["results"])
+        self.assertTrue(md.startswith("## Hardware self-test report\n"))
+        self.assertIn("MSI GS66 Stealth 10SE", md)
+        self.assertIn(f"**{total}/{total} checks passed.**", md)
+        self.assertIn("- [x]", md)
+        self.assertIn("restored", md)
+
+    def test_failure_is_reported_not_hidden(self):
+        # The one failure the fixture can stage honestly: a battery whose
+        # threshold file is gone, the way an absent battery reads at boot.
+        os.unlink(os.path.join(self.sysfs, "class", "power_supply", "BAT1",
+                               "charge_control_end_threshold"))
+        out = self.call({"cmd": "selftest"})
+        self.assertFalse(out["ok"], out.get("summary"))
+        bad = [r for r in out["results"] if not r["ok"]]
+        self.assertEqual([r["name"] for r in bad], ["battery charge threshold"])
+        self.assertIn("- [ ]", out["markdown"])
+        # everything the test *could* reach was still restored: the modes
+        # are back even though the battery part failed
+        after = self.snapshot()
+        self.assertEqual(after["shift"], "comfort")
+        self.assertEqual(after["fan"], "auto")
+        self.assertEqual(after["cooler_boost"], "off")
+
+    def test_the_selftest_writes_nothing_that_survives_a_boot(self):
+        # save_last is the re-apply journal: a self-test passes through
+        # real settings on its way elsewhere and must never leave its
+        # intermediate values there.  A future reboot would replay them.
+        self.call({"cmd": "set", "key": "shift", "value": "sport"})
+        last = os.path.join(self.state, "last.json")
+        with open(last, encoding="utf-8") as fh:
+            before = fh.read()
+        self.call({"cmd": "selftest"})
+        with open(last, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+        # the modes it walked were restored by hand too, not only left
+        # out of the journal
+        self.assertEqual(self.read_attr("shift_mode"), "sport")
+
+    def test_cli_needs_an_explicit_yes(self):
+        proc = self.run_cli("selftest", expect_rc=1)
+        self.assertIn("--yes", proc.stdout + proc.stderr)
+        self.assertIn("restores everything", proc.stdout + proc.stderr)
+        # and the refusal is real: nothing was walked
+        self.assertEqual(self.read_attr("shift_mode"), "comfort")
+
+    def test_cli_yes_reports_and_pr_prints_markdown(self):
+        proc = self.run_cli("selftest", "--yes")
+        self.assertIn("CHECKS PASSED", proc.stdout)
+        pr = self.run_cli("selftest", "--yes", "--pr")
+        self.assertIn("## Hardware self-test report", pr.stdout)
+        js = self.run_cli("selftest", "--yes", "--json")
+        parsed = json.loads(js.stdout)
+        self.assertTrue(parsed["ok"])
+        self.assertTrue(parsed["results"])
+        # the walk left the machine where it found it
+        self.assertEqual(self.read_attr("shift_mode"), "comfort")
+        self.assertEqual(self.bat_file("charge_control_end_threshold"), "60")
 
 
 class TestUnsupportedModelGating(unittest.TestCase):

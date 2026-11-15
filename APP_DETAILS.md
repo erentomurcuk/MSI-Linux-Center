@@ -9,7 +9,9 @@ re-deriving it. Companion to [`TODO.md`](TODO.md).
 
 A Linux control centre for **MSI laptops**, replacing MSI Dragon Center:
 battery charge thresholds, fan speeds / modes / curves, performance (shift)
-modes, Cooler Boost, live monitoring. It was written for one machine and then
+modes, Cooler Boost, live monitoring, the graphics MUX switch, an all-core
+CPU frequency cap, Intel voltage offsets (undervolting), and panel overdrive.
+It was written for one machine and then
 generalised, so the laptop-specific facts live in a **model registry**
 (`models/<id>/model.json`) rather than in the code; see §2a.
 
@@ -32,15 +34,18 @@ substituted because it was already installed. The difference is licensing
 
 ## 2. Architecture
 
-Three programs, one shared module. The daemon owns *every* EC write; the CLI
+Three programs, one shared module. The daemon owns *every* hardware write
+(EC, cpufreq sysfs, the MSR mailbox); the CLI
 and GUI are unprivileged clients.
 
 ```
    msi-control-gui (PySide6)  ─┐
                         ├── JSON over Unix socket ──> msi-controld (root, systemd)
    msi-control (CLI)  ──┘                                  │
-                                                           ▼
-                                    msi-ec kernel driver sysfs + debug iface
+                                    ┌─────────────────────┼─────────────────────┐
+                                    ▼                     ▼                     ▼
+                     msi-ec driver sysfs        cpufreq sysfs (scaling_*)   /dev/cpu/*/msr
+                     + debug iface              one file per policy         the OC mailbox, MSR 0x150
 ```
 
 * **`src/msi_controld.py`**: root daemon, systemd system service `msi-controld`.
@@ -49,7 +54,7 @@ and GUI are unprivileged clients.
   write by reading it back**.
 * **`src/msi-control`**: stdlib-only CLI. Reads work without the daemon
   (plain sysfs); writes need it.
-* **`src/msi-control-gui`**: PySide6 GUI, six sections. Never privileged, never
+* **`src/msi-control-gui`**: PySide6 GUI, eight sections. Never privileged, never
   touches sysfs. All daemon traffic runs on one worker thread.
 * **`src/msi_control.py`**: the model registry, the EC register map,
   validation, protocol and paths. Single source of truth so daemon/CLI/GUI can
@@ -58,8 +63,10 @@ and GUI are unprivileged clients.
 ### Design rules (enforced, not aspirational)
 
 1. Never trust a client: everything is validated in `msi_control`.
-2. Every EC write is followed by a read-back. An EC that silently ignores a
-   byte is indistinguishable from one that accepted it.
+2. Every hardware write is followed by a read-back: an EC byte, a cpufreq
+   sysfs value, an MSR mailbox plane. Hardware that silently ignores a write
+   is indistinguishable from hardware that accepted it; for the undervolt
+   planes the same read-back doubles as the BIOS-lock detector.
 3. Nothing is written optimistically in the UI; the GUI re-reads state after
    each command, so what you see is what the EC actually holds.
 4. With the daemon down the GUI/CLI degrade to **read-only** instead of lying.
@@ -69,6 +76,8 @@ and GUI are unprivileged clients.
 
 `MSI_SYSFS`, `MSI_SOCK`, `MSI_CONFIG`, `MSI_STATE`: let the whole stack
 run against a fake sysfs tree and a RAM-backed EC with no root at all.
+`MSI_CPU_DEV` redirects the `/dev/cpu` tree the undervolt backend probes
+(default `/dev/cpu`, what the `msr` module creates).
 `MSI_MODELS` overrides the model-registry directory, and `MSI_MODEL` forces a
 model id (§2a).
 
@@ -83,9 +92,9 @@ loaded and validated at import:
 | Section | Holds |
 |---|---|
 | `match` | how a machine is recognised: DMI `product_name` (weight 50), `board_name` (40), EC `ec_firmware` glob (30); case-insensitive anchored globs, highest total wins |
-| `ec` | per-model registers: `curve` (cpu/gpu temps + speeds) and `rpm` (`numerator`, cpu/gpu tach addresses) |
+| `ec` | per-model registers: `curve` (cpu/gpu temps + speeds), `rpm` (`numerator`, cpu/gpu tach addresses) and `overdrive` (panel-overdrive bit) |
 | `charge` | the charge-threshold bounds this firmware accepts |
-| `features` | twelve flags: the four driver ones, the three register-backed, and five optional |
+| `features` | thirteen flags: the four driver ones, the four register-backed (fan curves, RPM, MUX, panel overdrive), and five optional |
 | `profiles` | this model's built-in profiles (curves are model-specific) |
 
 Full field-by-field reference: [`models/README.md`](models/README.md). The
@@ -95,7 +104,8 @@ Key behaviours:
 
 * **Validated at load, not at use.** A typo in a register is a message naming
   the file and the field, never a wrong number written to the EC. `fan_curve:
-  true` requires `ec.curve`; `rpm: true` requires `ec.rpm`; `id` must match its
+  true` requires `ec.curve`; `rpm: true` requires `ec.rpm`; `display_overdrive:
+  true` requires `ec.overdrive`; `id` must match its
   directory; no profile may be called `factory`.
 * **Matching nothing is a working state.** The built-in `unknown` model enables
   everything the `msi-ec` driver exposes by itself (temps, shift/fan modes,
@@ -141,7 +151,7 @@ and the in-tree `drivers/platform/x86/msi-ec.c` charge semantics.
 | CPU curve | temps `0x6a-0x6f`, speeds `0x72-0x78` |
 | GPU curve | temps `0x82-0x87`, speeds `0x8a-0x90` |
 | Tachometers | `0xcc` (CPU), `0xca` (GPU), 16-bit big-endian period |
-| **Graphics mode (MUX)** | `0x2e` bit 6 (1 = discrete) · `0xd1` bits 0-1 (trigger) · UEFI `MsiDCVarData` byte 1 |
+| **Graphics mode (MUX)** | `0xd1` (trigger) · `0x2e` bit 6 (legacy state) · UEFI `MsiDCVarData` byte 5 (three-mode) or byte 1 (legacy) |
 
 Curve semantics: **6 temperature thresholds, 7 speed levels**. The fan spins
 at `speeds[0]` until the temperature passes `temps[0]`, then `speeds[1]` …
@@ -157,23 +167,47 @@ non-decreasing.
 ### The MUX registers are *not* in the driver's map
 
 Everything above comes from `msi-ec`'s `CONF_G1_3` or from isw. The graphics
-mode does not: **`msi-ec` has no MUX support of any kind**, so the three
-addresses below are reverse-engineered and cross-checked against
-[`ElXreno/msi-gpu-switcher`](https://github.com/ElXreno/msi-gpu-switcher)
-(which drives the identical trio on an AMD MSI Alpha 17 C7VG):
+mode does not: **`msi-ec` has no MUX support of any kind**, so the addresses
+below are reverse-engineered and cross-checked against
+[`ElXreno/msi-gpu-switcher`](https://github.com/ElXreno/msi-gpu-switcher),
+whose two backends cover both dialects the MSI family speaks. The dialect in
+use is discovered at runtime from the variable itself, never per-model:
+
+* **Three-mode firmware** (newer Optimus machines): variable data byte 5
+  carries the request in bits 0-1 (`0` hybrid, `1` discrete, `2` integrated),
+  the applied mode in bits 2-3, bit 4 (`0x10`) is the **marker** that this
+  dialect is in use, bit 5 says integrated mode exists, and bit 6 set means
+  discrete is **not** supported (the GUI refuses the switch then). A switch
+  is: read-modify-write byte 5, write the efivar, arm the trigger, wait for
+  the acknowledge.
+
+* **Legacy firmware** (the AMD Alpha 17 the reference tool was written for):
+  variable byte 1, the trigger, and the state bit:
 
 | Where | What it holds |
 |---|---|
 | EC `0x2e` bit 6 | MSI's "PXCT" bit: 1 = panel on the dGPU, 0 = hybrid |
-| EC `0xd1` bits 0-1 | the "apply at next POST" trigger; write `(v & ~0x03) \| 0x01` |
+| EC `0xd1` bits 0-1 | the "apply at next POST" trigger; write `(v & ~0x03) \| 0x01`, answer 0x02 |
 | UEFI `MsiDCVarData` byte 1 | the firmware reads this at POST: 1 = discrete, 0 = hybrid |
+
+* **Neither marker**: the variable carries no documented request, and the
+  program reports exactly that instead of guessing. This is not a corner
+  case on this project's own machine: the GS66's `16V1EMS1` firmware rewrites
+  byte 1 itself one second after every POST, mirroring the mode the BIOS
+  applied, not a request. Reading byte 1 as one used to produce a permanent
+  phantom "next boot: Discrete, reboot required" on a machine that booted
+  hybrid every time; found 2026-11-15 by watching the variable get rewritten
+  at boot, and fixed by gating every variable-side request on the marker bit.
 
 `0x2e` also carries the **webcam at bit 1**, which is exactly why every write
 here is a read-modify-write of one bit rather than a whole-byte poke.
 
-Write order follows the reference tool: **UEFI variable → trigger → EC bit**.
-The daemon then re-reads `requested` and raises rather than reporting a switch
-that did not stick.
+Write order follows the reference tool: **UEFI variable → trigger →
+(acknowledge, three-mode) → EC bit (legacy)**. The daemon then re-reads what
+it wrote and raises rather than reporting a switch that did not stick; on
+three-mode firmware the acknowledge can land between the write and the
+read-back, so the trigger write verifies only the request bit, not the whole
+byte.
 
 The `MsiDCVarData` variable is `state: 7` (non-volatile, boot-service,
 runtime-accessible) and normally **immutable** (`lsattr` →
@@ -202,6 +236,42 @@ cat     /sys/devices/platform/msi-ec/debug/ec_get       # read that byte
 `cat` alone returns the *previous* address. Requires root. Only available
 when the module is loaded with `debug=1` (install.sh sets this in
 `/etc/modprobe.d/msi-ec.conf`).
+
+### The non-EC hardware writes (cpufreq + MSR 0x150 + the overdrive bit)
+
+The daemon writes to three things that are not the msi-ec sysfs tree;
+all three follow the same rules (validate, serialise, read back):
+
+* **cpufreq sysfs** (`/sys/devices/system/cpu/cpufreq/policyN/
+  scaling_max_freq`): the all-core cap. Facts come from `cpufreq_facts()`
+  (min/max hardware bounds, per-policy lists); `CpuFreq.set_all_max`
+  lifts a policy's `scaling_min_freq` when the requested max is below it,
+  because cpufreq refuses a max under the floor. Not in `snapshot()` ever:
+  the kernel resets the values at boot, so persisting them would be a lie.
+* **MSR `0x150`, the OC mailbox**: the ThrottleStop undervolt protocol,
+  reimplemented the way Leoyzen's gist and georgewhewell/undervolt do.
+  Command write `0x8000001000000000 | plane << 40` ("data follows") or
+  `0x8000000000000000 | plane << 40` ("read back"), then a data word =
+  11-bit two's complement of `round(mV * 1.024)` at bits 21-31.
+  `-175 mV` encodes to `0xE9A00000`, verified against the value
+  ThrottleStop shows. Planes: 0 core, 1 gpu, 2 cache, 3 uncore, 4 analogio;
+  clamp `0..-300 mV`. Per-thread state: every command goes to every
+  `/dev/cpu/*/msr`; `read_plane` returns the values of all threads
+  shallow-sorted, so the UI can never over-report the depth. A locked BIOS
+  (the Plundervolt default) ignores the writes: the read-back mismatch is
+  the *only* detector, and `Undervolt.apply` reports it naming the three
+  MSI BIOS toggles. Offsets clear at boot and at suspend, which is the
+  safety property the whole feature leans on; nothing about them persists
+  daemon-side. `MSI_CPU_DEV` (default `/dev/cpu`) exists for the tests.
+* **The overdrive bit**, EC `0x2e` bit 4 on the machines it was measured
+  on (GP76 10UG, Blur Busters forum): behind the `display_overdrive`
+  model flag plus `ec.overdrive` (`address`, `bit`, optional whole-byte
+  `off`/`on` values). Same byte as the webcam (bit 1) and the MUX state
+  (bit 6), so `MsiEc.set_overdrive` is a one-bit RMW unless the model
+  supplies explicit byte values. **Not proven for `16V1EMS1`**, so the
+  GS66 model ships with the flag `false` and the GUI/CLI report
+  "no proven register" rather than flipping a bit nobody has watched
+  move on this firmware.
 
 ---
 
@@ -247,11 +317,19 @@ One JSON object per line, one request per connection.
 {"cmd":"curve","which":"cpu","temps":[…6],"speeds":[…7]}
 {"cmd":"profile","action":"list|show|apply|save|delete|save-current","name":…}
 {"cmd":"reapply"}
+{"cmd":"selftest"}                                     // verify.sh ported; reversible, gated by --yes on the CLI
 {"cmd":"capture-factory"}
 {"cmd":"raw","addr":242,"val":13}                   // gated by AllowRaw
 {"cmd":"graphics"}                                  // show the MUX state
 {"cmd":"graphics","action":"set","mode":"hybrid"}    // gated by AllowMuxSwitch
 {"cmd":"graphics","action":"revert"}                 // undo from the saved backup
+{"cmd":"freq"}                                      // all-core cap facts
+{"cmd":"freq","action":"set","max_khz":3500000}     // every policy, read back
+{"cmd":"undervolt"}                                 // five planes + msr_present + allowed
+{"cmd":"undervolt","action":"apply","values":{"core":-80}}  // gated by AllowUndervolt
+{"cmd":"undervolt","action":"reset"}                // all planes back to 0
+{"cmd":"overdrive"}                                 // supported? on?
+{"cmd":"overdrive","action":"set","on":true}        // the model's proven bit, RMW
 ```
 
 Response is always `{"ok":true,"data":{…}}` or `{"ok":false,"error":"…"}`.
@@ -270,6 +348,7 @@ already get.
 | `DefaultProfile` | `null` | explicit profile at boot; wins over `RestoreLast` |
 | `AllowRaw` | `false` | expose `msi-control raw`: an unvalidated EC byte is the one way this program can hurt you |
 | `AllowMuxSwitch` | `false` | allow the graphics-mode (MUX) switch | 
+| `AllowUndervolt` | `false` | allow writing Intel voltage offsets (MSR `0x150`); offsets are still volatile, the gate only unlocks the write |
 | `SocketGroup` | `wheel` | group allowed to talk to the socket |
 | `ReapplyOnResume` | `true` | re-apply after S3, which sometimes resets the EC |
 
@@ -319,6 +398,16 @@ side effect.
 > so a reboot restores it. That is a deliberate restore, not a profile
 > applying itself.
 
+A **saved** profile (`save-current` in either client) may carry the same
+optional shape on the CPU side, and the same mechanism applies: absent means
+untouched, and both keys go through `_apply_profile_dict` only, never the
+re-apply snapshot.
+
+| Key | Captured when | Applied how |
+|---|---|---|
+| `freq_khz` | the live all-core cap (`freq.max_khz`), if the policies agree | `freq.set_all_max`, clamped to this CPU's real bounds, with a read-back note |
+| `undervolt` | only the planes with a nonzero live offset | `uv.apply(fill_missing=False)`: named planes only, so a profile cannot zero an offset it did not mention; skipped with a warning when `AllowUndervolt` is off |
+
 ---
 
 ## 8. UI structure (PySide6)
@@ -330,7 +419,8 @@ shown at a time, each page wrapped in a scroll area:
 Header   brand · connection pill · Refresh · Quit
 Banner   shown only when the daemon is offline (read-only warning)
 ─────────────────────────────────────────────────────────────
-Sidebar  Dashboard Performance Fans Battery Profiles Settings
+Sidebar  Dashboard Performance Frequency Undervolting Fans
+         Battery Profiles Settings
 NavStack the visible page
 Status   transient actions (left) · daemon + firmware (right, permanent)
 ```
@@ -338,11 +428,21 @@ Status   transient actions (left) · daemon + firmware (right, permanent)
 | Section | Contents |
 |---|---|
 | Dashboard | 4 stat tiles (CPU/GPU temp, CPU/GPU fan RPM) + Battery + Right now + System |
-| Performance | shift mode buttons + Cooler Boost + **Graphics mode (MUX)** |
+| Performance | shift mode buttons + Cooler Boost + **Graphics mode (MUX)** + panel overdrive (model-gated) |
+| Frequency | all-core max-frequency slider + four quick slots; values reset at reboot |
+| Undervolting | five plane offsets + Apply/Reset + the permanent BIOS-unlock notice + the app-startup set |
 | Fans | fan mode + draggable CPU/GPU curve canvases with factory ghost |
 | Battery | charge-limit slider + 60/80/100 presets + Apply/Revert |
 | Profiles | built-in + saved bundles, save/delete |
-| Settings | daemon state, re-apply, factory capture, full config, raw EC console |
+| Settings | sections on/off, daemon state, re-apply, factory capture, hardware self-test (runs `selftest`, renders the per-check lines, keeps the paste-ready markdown behind Copy), accent presets (live re-style + sidebar rebuild), full config, raw EC console |
+
+The Frequency and Undervolting sections can be hidden from Settings
+(`QSettings` keys `sections/freq`, `sections/undervolt`; a hidden section
+also disappears from the sidebar and the `Ctrl+N` shortcuts skip it), for
+users who do not undervolt. The undervolt startup set lives in `QSettings`
+too (`undervolt/startup`) on the app side only: the daemon never persists
+voltages, which is the stability design (§2 of the README's undervolting
+section).
 
 ### Themes
 
@@ -353,6 +453,19 @@ reports, so a headless screenshot is deterministic). `apply_theme(app)` is
 called from both `MainWindow.__init__` and `main()`; the smoke test never calls
 `main()`, so the `__init__` call is the one that matters there.
 
+**The accent is a token too, not a constant**: a preset in `ACCENTS` (six of
+them, `ACCENT_DEFAULT = "msi-red"`) supplies `accent` + `accent_hover` per
+theme, `build_theme(name, accent_id)` lays it over the base, and the rest is
+derived: `on_accent` picks black or white by luminance, `accent_ink` is pushed
+toward white (dark) or black (light) in fixed steps until it clears 4.5:1 on
+the accent's own soft tint, because the bare accent is only ~2.6:1 there. The
+choice lives in `QSettings` (`style/accent`), read in `main()` before the first
+stylesheet and re-applied live by `MainWindow.set_accent()`, which also
+rebuilds the sidebar: nav icons bake the accent into their selected pixmap,
+and setting a stylesheet rebuilds no icons. The brand mark is painted from
+`BRAND_RED` regardless, because the mark is the brand. The smoke test
+measures every preset in both themes, not just the one this process wears.
+
 * Font sizes are set in code (`setFont`), **never in QSS**: a QSS `font-size`
   silently overrides `setFont` and that is how a theme pass ends up with
   inconsistent type.
@@ -361,6 +474,17 @@ called from both `MainWindow.__init__` and `main()`; the smoke test never calls
 * `muted_color()` derives secondary text from the live palette (blend 0.6 fg →
   0.4 bg), so it is legible on both themes rather than the hardcoded grey that
   was near-invisible on light.
+* The chrome is flat: header, sidebar and status bar paint the window
+  background with no separator lines, and a page is a set of cards floating
+  on that one surface. Both themes carry that (`bg` is one step away from
+  `surface`, and the hairline `border` only exists to keep a card's edge
+  findable). The sidebar marks the current section with a rounded neutral
+  pill (`surface3`) plus the accent-tinted icon; there is no coloured bar,
+  so the red accent keeps meaning "interactive value", never "chrome".
+* Buttons are full pills (`R_BTN`, pinned as half the control rung); inputs,
+  list rows and menus keep the `R_CTRL` radius; chips and tooltips use
+  `R_PILL`. Card captions and the temperature-band/battery chips are
+  sentence case, not upper case.
 
 #### The tokens (`<name>_<rung>`)
 
@@ -368,11 +492,11 @@ called from both `MainWindow.__init__` and `main()`; the smoke test never calls
 |---|---|---|
 | Surfaces | `bg surface surface2 surface3 border border_strong` | |
 | Text | `text text_dim muted` | `muted` is the QSS value; `muted_color()` is the live-palette one |
-| Brand | `accent accent_hover accent_soft accent_ink accent_line on_accent` | MSI red. `on_accent` is **computed** by `text_on()`, never chosen by hand |
+| Brand | `accent accent_hover accent_soft accent_ink on_accent` | MSI red. `on_accent` is **computed** by `text_on()`, never chosen by hand |
 | Status | `crit crit_soft` + `COL_OK/COL_WARM/COL_HOT/COL_CRIT/COL_DEAD` | the temperature band; `temp_color()` maps a reading onto it |
-| Shape | `r_card r_ctrl r_pill r_bar r_inner` | `R_CARD` 16, `R_CTRL` 10, `R_PILL` 8, `R_BAR` 5, `R_INNER` 12 |
+| Shape | `r_card r_btn r_ctrl r_pill r_bar r_inner` | `R_CARD` 20, `R_BTN` 18 (half the 36 px control rung: buttons are full pills), `R_CTRL` 10, `R_PILL` 9, `R_BAR` 3, `R_INNER` 14 |
 | Controls | `pad_ctrl_v pad_hero_v h_ctrl h_spin` | `PAD_CTRL_V` 6, `PAD_HERO_V` 12, `H_CTRL` 22, `H_SPIN` 19: one rung for every control; see below |
-| Layout | `SPACE` 8, `PAGE_PAD` 20, `PAGE_PAD_V` 18, `PAGE_GAP` 14 | `page_layout()` is the only place a page's margin is written |
+| Layout | `SPACE` 8, `PAGE_PAD` 24, `PAGE_PAD_V` 20, `PAGE_GAP` 16 | `page_layout()` is the only place a page's margin is written |
 | Type | `TYPE_DISPLAY` 30, `TYPE_H1` 21, `TYPE_H2` 16, `TYPE_BODY` 13, `TYPE_CAPTION` 11, `TYPE_MICRO` 10 | `ui_font()`/`mono_font()`; pixels, never points |
 
 **One control height.** `H_CTRL` + twice `PAD_CTRL_V` + the border is the
@@ -447,7 +571,17 @@ stylesheet can interpolate.
   themed panel. Settings chooses it and `QSettings` remembers it, because it is
   a property of this window rather than of the EC. `check_tray_icon` samples
   the painted pixels of all three, since a mode that quietly fell back to the
-  tinted shield would still look like a menu that worked.
+  tinted shield would still look like a menu that worked. Beside the icon
+  sits a menu with the everyday switches: show the window, the four
+  performance modes as radio actions, Cooler Boost, and the 60/80/100 charge
+  limits. It is built even where no system tray exists (a WM without one,
+  the offscreen platform) so the mirror logic is exercised everywhere, and
+  every entry routes through `submit -> daemon -> self.set_key`, the same
+  validated path as the window's own buttons; `_update_tray_menu()` flips
+  the checks from the latest status poll and never writes anything itself.
+  `check_tray_menu` pins the current state, the modes hidden where the
+  firmware lacks them, and that everything goes dead when the daemon is
+  offline.
 * `Banner`, `Header`, `Sidebar`, `NavStack` as above. `NavStack` keeps the old
   `addTab`/`count`/`currentIndex`/`tabText` surface so the smoke test and the
   geometry/tab persistence were untouched by the move away from `QTabWidget`.
@@ -471,7 +605,9 @@ control where "why can't I click this" is a genuinely important question.
 
 **With the daemon down, every writer goes dead**: shift/fan buttons, Cooler
 Boost, the MUX switch, Apply/Revert on Battery and Fans, Profiles Save/Delete,
-and Settings Re-apply/Capture. The banner already says the app is read-only; a
+Settings Re-apply/Capture, the Frequency page's Apply and slot buttons, the
+undervolt Apply/Reset, and the overdrive toggle. The banner already says the
+app is read-only; a
 control that stayed live and answered with a `✗` on click would contradict it.
 `check_offline_disables_writes` and the graphics/battery checks pin this.
 
@@ -491,15 +627,26 @@ both had a live-write bug:
   (cleared only when the EC matches the editor) gates adoption; Apply is
   enabled only when valid **and** dirty **and** online.
 
+The Frequency slider follows the same pending pattern (a slow drag must not
+re-cap the cores on every step); its four quick slots are `QSettings`
+(`freq/slot1..4`), storing the cap *number* only, so they survive restarts
+without ever becoming a daemon-side persisted state.
+
 ---
 
 ## 9. Tests
 
-**`tests/test_msi_control.py`: 142 tests, offline, unprivileged, ~6 s.**
+**`tests/test_msi_control.py`: 173 tests, offline, unprivileged, ~9 s.**
 
 Runs the *real* daemon (Service + Unix socket server + protocol), the real
-validation and the real CLI as a subprocess, against a fake sysfs tree and a
-RAM-backed EC (`FakeEc`). `MsiEc._xfer_read/_xfer_write` are monkeypatched.
+validation and the real CLI as a subprocess, against a fake sysfs tree
+(cpufreq policies included) and a RAM-backed EC (`FakeEc`);
+`MsiEc._xfer_read/_xfer_write` are monkeypatched. The undervolt tests patch
+`Undervolt._wr/_rd` onto a `FakeMsr` that decodes the OC-mailbox command
+words, so per-plane read-backs, the lock-detector refusal and the
+shallower-value sorter are all exercised; the overdrive tests patch
+`core.MODEL`/`core.OVERDRIVE_REGS` to a model with `ec.overdrive` and prove
+the one-bit RMW preserves the webcam and MUX bits of `0x2e`.
 `MSI_MODELS` points at the repo's `models/` and `MSI_MODEL` pins the GS66 entry,
 so the suite is deterministic on any machine; the model-registry tests
 (`TestRegistry`, `TestModelSelection`, `TestDetectAndDraft`,
@@ -535,7 +682,11 @@ It also pins the things that are invisible by construction:
 | `check_theme_tokens` | a theme that silently lost a token (the stylesheet interpolates an empty string, so a widget just loses its border) or an accent whose ink fails AA |
 | `check_brand_mark` | `icons/msi-control.svg` drifting from the mark the GUI paints, measured by rasterising both and comparing the ink boxes. Also pins that the corners are still transparent (the tile has not crept back) and that the tray's `9` / `62` / `100` fit inside the badge |
 | `check_tray_icon` | a tray ink mode that quietly did nothing: it samples the mean brightness of the colour, white and black marks (white must be brighter than the band tint, which must be brighter than black), pins that the colour mode still follows the band, and that the Settings controls mirror the window instead of keeping a second copy |
-| `check_glyphs` | a typo in `Sidebar.ITEMS`: `glyph_pixmap` falls through its if-chain and returns a transparent pixmap, so the sidebar shows a label with a hole beside it |
+| `check_tray_menu` | a tray action that flips a state nobody rendered, or a mode the firmware does not have still showing as clickable, or the whole menu pretending to work while the daemon is offline |
+| `check_selftest_card` | a self-test reply rendered as an unclear dump, the Copy button handing over the rendered text instead of the PR markdown, or the run button left disabled forever after an error |
+| `check_accent_switch` | an accent preset that changed the button's look but nothing else: the click must land in `THEME`, in the app stylesheet, in `QSettings`, and rebuild the sidebar (its icons bake the accent in), and an unknown id must change nothing |
+| `check_theme_tokens` (accent half) | a preset that fails WCAG AA in either theme: every preset is measured in both, not only the one this process happens to wear |
+| `check_glyphs` | a typo in a sidebar page's `glyph` name: `glyph_pixmap` falls through its if-chain and returns a transparent pixmap, so the sidebar shows a label with a hole beside it |
 | `check_nav_matches_tabs` | a section with no nav entry (unreachable) or a nav entry with no section (a dead click) |
 | `check_type_scale` | the five dashboard tiles disagreeing about `TYPE_DISPLAY`, or a card caption that is not `TYPE_CAPTION` bold |
 | `check_control_sizes` | one control that is 10 px taller than its neighbour, the battery `Apply` bug, which is invisible as a bug in a screenshot because it just looks like the button is emphasised |

@@ -16,7 +16,8 @@ workflow. If you are here *because your laptop is not fully supported*, jump to
 
 A Linux control centre for **MSI laptops**: battery charge thresholds,
 performance (shift) modes, fan modes and Cooler Boost, custom fan curves, named
-profiles, a graphics-mode (MUX) switch, and live temperature / fan-RPM
+profiles, a graphics-mode (MUX) switch, an all-core CPU frequency cap, Intel
+undervolting, panel overdrive, and live temperature / fan-RPM
 monitoring: the things MSI's Dragon Center does on Windows, on Linux, without
 Dragon Center.
 
@@ -28,7 +29,7 @@ is what makes it about *your* laptop.
 
 | Piece | Runs as | Talks to |
 |---|---|---|
-| `src/msi_controld.py` → `msi-controld` | root, systemd | the EC, through the **only** writer |
+| `src/msi_controld.py` → `msi-controld` | root, systemd | the EC, cpufreq sysfs and the MSR mailbox, through the **only** writer |
 | `src/msi_control.py` | imported by all | the model registry, validation, paths, protocol |
 | `src/msi-control` | unprivileged CLI | the daemon's Unix socket |
 | `src/msi-control-gui` | unprivileged, PySide6 | the daemon's Unix socket |
@@ -36,15 +37,16 @@ is what makes it about *your* laptop.
 
 ```
 msi-control-gui ─┐
-msi-control     ─┼─► /run/msi-controld.sock ─► msi-controld (root) ─► msi-ec + BAT*
+msi-control     ─┼─► /run/msi-controld.sock ─► msi-controld (root) ─► msi-ec + BAT* + cpufreq + MSR
                  ┘        JSON one line              │
                                               msi-ec kernel driver
                                               (vendored, out-of-tree, debug=1)
 ```
 
-**Only `msi-controld` writes to the EC.** It validates every value it is
+**Only `msi-controld` writes to the hardware.** It validates every value it is
 handed, takes one lock around every EC write, and **reads every byte back** so
-it can never report a write that did not stick. With the daemon down the GUI
+it can never report a write that did not stick (for the undervolt planes the
+same read-back is the BIOS-lock detector). With the daemon down the GUI
 and CLI degrade to read-only rather than lying.
 
 Everything the daemon and CLI do is **stdlib-only**; they must work in a
@@ -76,13 +78,13 @@ reason.
 src/msi_control.py      shared core: model registry, EC map, validation, paths
 src/msi_controld.py     the privileged daemon (systemd service msi-controld)
 src/msi-control         CLI (subcommands: status, detect, monitor, mode, fan,
-                        boost, battery, curve, profile, graphics, reapply,
-                        raw, wait)
-src/msi-control-gui     PySide6 GUI, six sections
+                        boost, battery, curve, profile, graphics, freq,
+                        undervolt, overdrive, reapply, selftest, raw, wait)
+src/msi-control-gui     PySide6 GUI, eight sections
 models/<id>/model.json  one laptop model: THE file you add for a new laptop
 models/README.md        the model-file format, field by field
 models/<id>/README.md   optional: notes on how that model's registers were found
-tests/test_msi_control.py  offline suite: fake sysfs + RAM-backed EC, 142 tests
+tests/test_msi_control.py  offline suite: fake sysfs + RAM-backed EC + fake MSR, 173 tests
 tests/gui_smoke.py         headless GUI build + behaviour + screenshots
 tests/shots/               committed screenshots: dark, light/ beside it
 tools/                  hardware probes (need root) + fixup/recapture helpers
@@ -106,7 +108,7 @@ DKMS build needs no network. Its device strings, identifiers and file names are
 There is no build step. To run a test you need nothing but Python 3.10+:
 
 ```bash
-python3 tests/test_msi_control.py                       # 142 tests, no root, ~6 s
+python3 tests/test_msi_control.py                       # 173 tests, no root, ~9 s
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py    # GUI, needs PySide6
 make check        # compile + the offline suite + the GUI smoke test
 make shots        # regenerate tests/shots/          (dark)
@@ -121,12 +123,13 @@ it. Everything release-shaped lands in `dist/`, which is gitignored: a
 built artifact must never be committed, because the version is defined by
 the source and an artifact is only its echo.
 
-`tests/test_msi_control.py` needs **no root and no hardware**: it builds a fake
-sysfs tree and a RAM-backed EC and runs the *real* daemon over the *real*
+**Run `make check` after every change.** 173 tests, offline: the suite builds a fake
+sysfs tree (cpufreq policies included), a RAM-backed EC and a fake OC mailbox,
+and runs the *real* daemon over the *real*
 socket, so protocol, validation, profiles and the CLI are exercised
-end-to-end. `MSI_SYSFS`, `MSI_SOCK`, `MSI_CONFIG`, `MSI_STATE` and `MSI_MODELS`
-redirect every path, which is what makes that possible, and it is also how you
-test a new model without installing it.
+end-to-end. MSI_SYSFS, MSI_SOCK, MSI_CONFIG, MSI_STATE, MSI_CPU_DEV and
+MSI_MODELS redirect every path, which is what makes that possible, and it is
+also how you test a new model without installing it.
 
 **Run `make check` after every change.** A green suite is the bar; there is no
 CI. If you changed a colour, a label or a state machine, extend
@@ -161,7 +164,8 @@ A model file describes **only what differs between machines**:
       "gpu": {"temps": ["0x82","0x83","0x84","0x85","0x86","0x87"],
               "speeds":["0x8a","0x8b","0x8c","0x8d","0x8e","0x8f","0x90"]}
     },
-    "rpm": {"numerator": 478000, "cpu": "0xcc", "gpu": "0xca"}
+    "rpm": {"numerator": 478000, "cpu": "0xcc", "gpu": "0xca"},
+    "overdrive": {"address": "0x2e", "bit": 4}  // per-model, if proven
   },
 
   "charge": {"min": 20, "max": 100, "step": 10},
@@ -170,7 +174,7 @@ A model file describes **only what differs between machines**:
     "shift": true, "fan": true, "cooler_boost": true, "charge_limit": true,
     "fan_curve": true, "rpm": true, "mux": true,
     "webcam": false, "webcam_block": false, "super_battery": false,
-    "fn_key": false, "win_key": false
+    "fn_key": false, "win_key": false, "display_overdrive": false
   },
 
   "profiles": {                       // this model's built-in profiles
@@ -193,8 +197,9 @@ field, never a silent wrong number written to the EC):
 * `id` must equal the directory name; the same `PROFILE_NAME_RE`
   (`^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`) applies to model ids and profile names.
 * Feature flags must be `true`/`false`. `rpm: true` requires `ec.rpm` present;
-  `fan_curve: true` requires both curve blocks. Absence is checked, so a model
-  cannot *claim* a feature it has no registers for.
+  `fan_curve: true` requires both curve blocks; `display_overdrive: true`
+  requires `ec.overdrive`. Absence is checked, so a model cannot *claim* a
+  feature it has no registers for.
 * A built-in profile may not be named `factory`; `factory` is reserved for the
   snapshot captured from the live EC on first run.
 * Charge bounds must be sane (`min <= max`, both 20-100 by convention).
@@ -294,6 +299,11 @@ only becomes meaningful once a matching model exists; before that it says so
 and skips the register-backed checks. **It restores what it changes**, but run
 it on a machine you can afford to have mis-set, not on a production box.
 
+The daemon runs the same walk as a command: `msi-control selftest --yes --pr`
+round-trips the same settings through the socket and prints a paste-ready
+markdown report, which is the natural attachment for a model pull request.
+`--yes` exists because, like `verify.sh`, it writes real modes on the way.
+
 ### Step 6: fill in the model's README
 
 Copy `models/gs66-stealth-10se/README.md` and replace the content: which
@@ -365,6 +375,7 @@ feature, not a bug.**
 | `MSI_SOCK` | `/run/msi-controld.sock` | tests (a throwaway socket) |
 | `MSI_CONFIG` | `/etc/msi-control/config.json` | tests |
 | `MSI_STATE` | `/var/lib/msi-control` | tests |
+| `MSI_CPU_DEV` | `/dev/cpu` | the fake MSR tree in tests |
 | `MSI_MODELS` | the registry directory | tests, and trying a model out un-installed |
 | `MSI_MODEL` | model auto-detection; forces one model id | tests, debugging |
 | `MSI_THEME` | `light` \| `dark` (else follow the desktop) | the GUI |

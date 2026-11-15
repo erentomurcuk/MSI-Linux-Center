@@ -45,10 +45,20 @@ charge threshold (`0xef`) are **not** in this file: the `msi-ec` driver exposes
 them through sysfs, so they are model-independent (see `../README.md` §
 `features`).
 
-The graphics-mode (MUX) addresses are also not here. `0x2e` bit 6, the trigger
-at `0xd1`, and the UEFI variable `MsiDCVarData` are shared across the MSI
-family, so they live once in `src/msi_control.py`; this model only sets
+The graphics-mode (MUX) addresses are also not here. The trigger at `0xd1`,
+register `0x2e` bit 6 and the UEFI variable `MsiDCVarData` are shared across the
+MSI family, so they live once in `src/msi_control.py`; this model only sets
 `"mux": true`.
+
+One firmware-specific fact *is* worth recording here: this machine's EC
+firmware (`16V1EMS1`) does **not** carry the three-mode marker in
+`MsiDCVarData` byte 5, and byte 1 is written by the firmware itself at every
+POST (it mirrors the mode applied by the BIOS, not a request). This program
+therefore reports no variable-side request on this model and only shows what
+the EC state bit and the PCI bus say; before 2026-11-15 it misread byte 1 as
+a request and reported a permanent phantom "next boot: Discrete". A software
+switch to discrete has **not** been proven on this firmware; the BIOS setting
+is the tested route.
 
 ## What was confirmed on hardware, not just copied
 
@@ -74,6 +84,7 @@ family, so they live once in `src/msi_control.py`; this model only sets
 | `fan_curve`, `rpm` | `true` | the registers above; curve write-back verified by `verify.sh` |
 | `mux` | `true` | the shared MUX block; the switch itself is still opt-in (`AllowMuxSwitch`) |
 | `webcam`, `webcam_block`, `super_battery`, `fn_key`, `win_key` | `false` | not present on this config; they read back as absent, so the GUI disables them instead of pretending |
+| `display_overdrive` | `false` | pending: `0x2e` bit 4 is the toggle on a same-generation GP76 (Blur Busters forum), but nobody has watched it move on `16V1EMS1`. Flip it on only after a dump-diff while toggling Dragon Center, or a write-back test on this firmware; until then the app rightly says "no proven register" |
 
 ## The built-in profiles
 

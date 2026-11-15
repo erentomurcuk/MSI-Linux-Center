@@ -106,7 +106,7 @@ vary it.
 
 ### `ec` (optional, but it is the point)
 
-The registers the `msi-ec` driver does not know. Two sub-blocks:
+The registers the `msi-ec` driver does not know. Three sub-blocks:
 
 ```jsonc
 "ec": {
@@ -114,7 +114,8 @@ The registers the `msi-ec` driver does not know. Two sub-blocks:
     "cpu": { "temps": ["0x6a", …, "0x6f"], "speeds": ["0x72", …, "0x78"] },
     "gpu": { "temps": ["0x82", …, "0x87"], "speeds": ["0x8a", …, "0x90"] }
   },
-  "rpm": { "numerator": 478000, "cpu": "0xcc", "gpu": "0xca" }
+  "rpm": { "numerator": 478000, "cpu": "0xcc", "gpu": "0xca" },
+  "overdrive": { "address": "0x2e", "bit": 4 }
 }
 ```
 
@@ -130,6 +131,15 @@ The registers the `msi-ec` driver does not know. Two sub-blocks:
   where the two bytes at `rpm.cpu` / `rpm.gpu` are a **period count**, not a
   speed. A wrong constant prints plausible-looking nonsense. Reproduce it from
   a source you trust and record that source in `provenance`.
+* `overdrive` is the display (panel) overdrive toggle from Dragon Center:
+  `address` plus the `bit` (0-7) that flips it. On the machines it was
+  measured on it is a bit of a byte other features live in (on the GS66
+  the webcam is bit 1 and the MUX state bit 6 of the same `0x2e`), so the
+  daemon writes it as a **one-bit read-modify-write**, never a whole-byte
+  poke. Two optional whole-byte values, `"off"` and `"on"`, exist for
+  firmwares whose EC rewrites the whole byte; give them only if you have
+  watched those exact values on a dump, otherwise omit them and the RMW
+  does the right thing.
 
 Omit a block you have not identified. The `features` cross-check (below) then
 keeps the matching flag off for you.
@@ -149,7 +159,7 @@ range can say so.
 
 ### `features`
 
-What this firmware can actually do. All twelve keys are optional; anything
+What this firmware can actually do. All thirteen keys are optional; anything
 omitted falls back to the unsupported defaults (driver features `true`, the
 register-backed ones `false`):
 
@@ -162,11 +172,13 @@ register-backed ones `false`):
 | `fan_curve` | register | custom fan curves: **requires `ec.curve`** |
 | `rpm` | register | fan tachometers: **requires `ec.rpm`** |
 | `mux` | register | graphics-mode (MUX) switch |
+| `display_overdrive` | register | panel overdrive: **requires `ec.overdrive`** |
 | `webcam`, `webcam_block`, `super_battery`, `fn_key`, `win_key` | driver | optional features only some firmwares have |
 
 The first four are also checked at runtime against the attributes the driver
 actually exposes, so a model cannot enable a control the driver does not offer.
-`fan_curve: true` with no `ec.curve`, or `rpm: true` with no `ec.rpm`, is a
+`fan_curve: true` with no `ec.curve`, `rpm: true` with no `ec.rpm`, or
+`display_overdrive: true` with no `ec.overdrive`, is a
 **load error**; a model may not claim a feature it has no registers for.
 
 Only turn a flag on for something you have proven. `fan_curve` and `mux` in
@@ -212,9 +224,12 @@ A machine that matches no model loads the built-in `unknown` model, which
 enables everything the `msi-ec` driver exposes by itself:
 
 * **works**: temperatures, fan duty, shift modes, fan modes, Cooler Boost, the
-  charge limit;
-* **refused**: fan curves, RPM, and the graphics switch; these need registers
-  only a model file can supply, and the program refuses rather than guesses.
+  charge limit, and the all-core CPU frequency cap (plain cpufreq sysfs, no
+  model registers needed);
+* **refused**: fan curves, RPM, the graphics switch and the overdrive toggle;
+  these need registers only a model file can supply, and the program refuses
+  rather than guesses. (Undervolting is not model-gated: it needs the BIOS
+  unlock and the `AllowUndervolt` config, not registers.)
 
 The GUI shows an amber banner, the Fan tab becomes read-only with a notice, and
 the Settings tab points at `msi-control detect`. Everything on the dashboard

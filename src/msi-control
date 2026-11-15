@@ -253,15 +253,18 @@ def cmd_monitor(args):
 
 
 def _set(args, key, value):
+    # OSError is a transport-level failure (socket missing or refused), which
+    # is exactly the "is the daemon running?" case, so it gets the hint; a
+    # ProtocolError is the daemon answering "no", which the hint would only
+    # obscure.  The old version sniffed the message text for "No such file"
+    # and "errno", which broke the moment an error message changed wording.
     try:
         res = core.call({"cmd": "set", "key": key, "value": value},
                         timeout=args.timeout)
-    except (OSError, ProtocolError) as e:
-        msg = str(e)
-        if "No such file" in msg or "Connection refused" in msg \
-                or "refused" in msg or "errno" in msg.lower():
-            die(f"{msg}\n{need_daemon_hint()}")
-        die(msg)
+    except OSError as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    except ProtocolError as e:
+        die(str(e))
     if args.json:
         print(json.dumps(res, indent=2, sort_keys=True))
         return
@@ -460,9 +463,20 @@ def _print_graphics(g: dict) -> None:
 
     req = g.get("requested")
     src = []
-    if g.get("var_present"):
-        src.append(f"{core.MUX_VAR_NAME} byte 1 = "
-                   f"{1 if g.get('var_mode') == core.MUX_DISCRETE else 0}")
+    if g.get("var_three_mode"):
+        # The one variable layout that names a request: byte 5, behind the
+        # firmware's own marker bit.  Show the whole byte, because its other
+        # bits are what booted and what the firmware can do.
+        gpu = g.get("var_applied")
+        src.append(f"{core.MUX_VAR_NAME}[5]: requested "
+                   f"{core.MUX_LABELS.get(g.get('var_mode'), 'unavailable')}"
+                   + (f", last boot {gpu}" if gpu else ""))
+    elif g.get("var_present"):
+        # Present but unreadable: only the three-mode layout documents where
+        # a request lives, and pretending byte 1 was one is how this program
+        # once showed a permanent phantom "reboot to go discrete".
+        src.append(f"{core.MUX_VAR_NAME} carries no request this firmware "
+                   "documents")
     if g.get("ec_bit") is not None:
         src.append("EC 0x2e bit 6 = "
                    f"{1 if g.get('ec_mode') == core.MUX_DISCRETE else 0}")
@@ -507,10 +521,12 @@ def cmd_graphics(args):
 
     if not args.yes:
         die("refusing to switch the graphics mode without --yes.\n"
-            "  A switch writes EC 0x2e and the UEFI variable MsiDCVarData and\n"
-            "  only takes effect at the next reboot.  On a model whose MUX was\n"
-            "  never reverse engineered it can leave the machine with no\n"
-            "  display.  Re-run as `msi-control graphics " + args.value
+            "  A switch writes the UEFI variable MsiDCVarData and arms the\n"
+            "  EC switch trigger, EC 0x2e bit 6 on firmware without the\n"
+            "  three-mode marker.  It only takes effect at the next reboot.\n"
+            "  On a model whose MUX was never reverse engineered it can\n"
+            "  leave the machine with no display.  Re-run as `msi-control\n"
+            "  graphics " + args.value
             + " --yes`\n  once you have read the Graphics (MUX) section of "
             "README.md.")
     try:
@@ -557,6 +573,47 @@ def cmd_reapply(args):
         print(dim("state re-applied: nothing to change"))
 
 
+def cmd_selftest(args):
+    """verify.sh as one command: reversible round-trips on the real EC."""
+    if not args.yes:
+        die("the self-test briefly writes real modes, a real charge limit "
+            "and\n  the real curves to your EC, verifying each by reading "
+            "it back, and\n  restores everything it found.  Re-run with "
+            "--yes once you have read\n  this.  It is the same check "
+            "verify.sh performs, minus the process\n  startups.")
+    try:
+        # A walk over every mode can legitimately outlive the 5 s a terse
+        # command needs, so the floor here is generous, not the default.
+        out = core.call({"cmd": "selftest"}, timeout=max(args.timeout, 30.0))
+    except (OSError, ProtocolError) as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    if args.pr:
+        print(out.get("markdown", ""))
+        return
+    section = None
+    failed = 0
+    for r in out.get("results") or []:
+        if r.get("section") != section:
+            section = r.get("section")
+            print(bold(f"\n{section}"))
+        mark = green("✓ ") if r.get("ok") else red("✗ ")
+        detail = f": {r['detail']}" if r.get("detail") else ""
+        print(f"  {mark}{r.get('name', '?')}{detail}")
+        failed += 0 if r.get("ok") else 1
+    total = len(out.get("results") or [])
+    print()
+    if failed or not out.get("ok"):
+        print(red(f"SELF-TEST FAILED: {failed} of {total} checks"))
+        return 1
+    print(green(f"ALL {total} CHECKS PASSED"))
+    print(dim("  everything was restored; paste-ready report: "
+              "msi-control selftest --yes --pr"))
+    return 0
+
+
 def cmd_wait(args):
     """Block until the daemon answers; handy in scripts/units."""
     deadline = time.time() + args.seconds
@@ -567,6 +624,203 @@ def cmd_wait(args):
         time.sleep(0.3)
     print("timed out", file=sys.stderr)
     return 1
+
+
+def _freq_show(args):
+    """Frequency facts, locally when possible: they are world-readable."""
+    facts = core.cpufreq_facts()
+    if not facts.get("present") and not args.direct:
+        # The daemon might see a cpufreq the unprivileged caller cannot;
+        # unlikely, but asking costs one round trip.
+        try:
+            facts = core.call({"cmd": "freq"}, timeout=args.timeout)
+        except (OSError, ProtocolError):
+            pass
+    if not facts.get("present"):
+        if args.json:
+            print(json.dumps({"present": False}, indent=2))
+        else:
+            die("cpufreq is unavailable (no /sys/.../cpufreq policies; "
+                "is this a CPU without frequency scaling?)")
+        return
+    if args.json:
+        print(json.dumps(facts, indent=2))
+        return
+    print(bold("CPU frequency (all cores)"))
+    print(f"  max       {core.khz_to_ghz(facts.get('max_khz'))} GHz"
+          + ("" if facts.get("max_khz") else dim("  (differs per core)")))
+    if facts.get("max_khz") is None:
+        uniq = sorted({v for v in facts.get("max_khz_list") or []})
+        print("  per core  " + ", ".join(core.khz_to_ghz(v) for v in uniq)
+              + " GHz")
+    print(f"  hardware range  {core.khz_to_ghz(facts.get('cpuinfo_min_khz'))}"
+          f"..{core.khz_to_ghz(facts.get('cpuinfo_max_khz'))} GHz")
+    print(dim(f"  {facts.get('policies')} policies; values reset at reboot"))
+
+
+def cmd_freq(args):
+    if args.max is None:
+        _freq_show(args)
+        return
+    # Accept "3.5" or "3500" as GHz, a plain kHz count as itself: the
+    # classic reading mistake (one zeroes too few) would pin the CPU to
+    # its floor, so anything small is GHz and huge values get one check.
+    try:
+        number = float(args.max)
+    except ValueError:
+        die(f"max frequency: {args.max!r} is not a number "
+            "(use GHz like 3.5, or kHz like 3500000)")
+    khz = int(number * 1_000_000) if number < 100000 else int(number)
+    facts = core.cpufreq_facts()
+    if facts.get("present"):
+        # The same bounds the daemon will apply, so an out-of-range value
+        # dies here with a clear message instead of a daemon round trip.
+        core.check_freq_khz(khz, facts["cpuinfo_min_khz"],
+                            facts["cpuinfo_max_khz"], "max frequency")
+    try:
+        out = core.call({"cmd": "freq", "action": "set", "max_khz": khz},
+                        timeout=args.timeout)
+    except OSError as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    except (ProtocolError, ValidationError) as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    print(green("✓ ") + out.get("summary", "max frequency set"))
+    print(dim("  resets at reboot; per-core values clear individually"))
+
+
+def cmd_undervolt(args):
+    """Read the OC mailbox, or write offsets to it (AllowUndervolt)."""
+    if args.action == "show":
+        out = None
+        if not args.direct:
+            try:
+                out = core.call({"cmd": "undervolt"}, timeout=args.timeout)
+            except (OSError, ProtocolError) as e:
+                if args.json:
+                    print(json.dumps({"planes": None, "allowed": None,
+                                      "error": str(e)}, indent=2))
+                else:
+                    die(f"{e}\n{need_daemon_hint()}")
+                return
+        planes = (out or {}).get("planes")
+        allowed = (out or {}).get("allowed")
+        if planes is None:
+            if args.json:
+                print(json.dumps({"planes": None, "allowed": allowed},
+                                 indent=2))
+            else:
+                die("no MSR devices (/dev/cpu/*/msr): undervolting is "
+                    "unavailable in this kernel")
+            return
+        if args.json:
+            print(json.dumps({"planes": planes, "allowed": allowed},
+                             indent=2))
+            return
+        print(bold("Voltage offsets (volatile; cleared by reboot and sleep)"))
+        for plane, _idx in core.UV_PLANES:
+            mv = planes.get(plane)
+            print(f"  {plane:<9} " + (f"{mv} mV" if mv is not None
+                                     else dim("?")))
+        if not allowed:
+            print(yellow("undervolting is NOT enabled in the config: set "
+                         "AllowUndervolt to write offsets"))
+        else:
+            print(dim("write with: msi-control undervolt set core=-80 "
+                      "cache=-60"))
+        return
+
+    if args.action != "set" and args.action != "reset":
+        raise ValidationError(f"unknown undervolt action {args.action!r}")
+    if args.action == "reset":
+        out = core.call({"cmd": "undervolt", "action": "reset"},
+                        timeout=args.timeout)
+        if args.json:
+            print(json.dumps(out, indent=2, sort_keys=True))
+        else:
+            print(green("✓ ") + out["summary"])
+            print(dim("  " + out.get("volatile", "")))
+        return
+
+    if not args.values:
+        raise ValidationError("undervolt set needs at least one "
+                              "plane=mV pair (e.g. core=-80 cache=-60)")
+    values = {}
+    for item in args.values:
+        try:
+            plane, mv = item.split("=", 1)
+        except ValueError:
+            raise ValidationError(f"{item!r} is not plane=mV "
+                                  "(core=-80, cache=-60, gpu=0, ...)")
+        plane = plane.strip().lower()
+        try:
+            mv = int(mv)
+        except ValueError:
+            raise ValidationError(f"{item!r}: {mv!r} is not an integer mV")
+        values[core.check_uv_plane(plane)] = core.check_uv_mv(mv)
+    if not args.yes:
+        die("refusing to change CPU voltages without --yes.\n"
+            "  A too-deep offset freezes the machine *now*; the values hold\n"
+            "  until the next reboot or suspend, which is the recovery.  A\n"
+            "  locked BIOS ignores them, so the daemon verifies every write\n"
+            "  and reports a refusal.  Re-run as `msi-control undervolt set "
+            + " ".join(f"{k}={v}" for k, v in values.items())
+            + " --yes`\n  once you have read the Undervolting section of "
+            "README.md.")
+    try:
+        out = core.call({"cmd": "undervolt", "action": "set",
+                         "values": values}, timeout=args.timeout)
+    except OSError as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    except (ProtocolError, ValidationError) as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    print(green("✓ applied"))
+    for plane, mv in out["applied"].items():
+        if mv:
+            print(f"  {plane:<9} {mv} mV")
+    print(dim("  " + out.get("volatile", "")))
+
+
+def cmd_overdrive(args):
+    """Panel overdrive: the Dragon Center toggle, one EC bit (model-gated)."""
+    if args.value is None:
+        st = status(args)
+        od = st.get("overdrive") or {}
+        if args.json:
+            print(json.dumps(od, indent=2))
+            return
+        if not od.get("supported"):
+            print(dim("display overdrive: no proven register for this "
+                      "laptop's model file"))
+            return
+        cur = od.get("on")
+        if cur is None:
+            print("display overdrive: ? "
+                  + dim("(register unreachable)"))
+        else:
+            print(f"display overdrive: {'on' if cur else 'off'}")
+        return
+    if not core.feature("display_overdrive"):
+        die("this laptop's model file has no proven display overdrive "
+            "register; flipping an unproven bit is exactly the kind of "
+            "write this program refuses")
+    try:
+        out = core.call({"cmd": "overdrive", "action": "set",
+                         "on": args.value == "on"}, timeout=args.timeout)
+    except OSError as e:
+        die(f"{e}\n{need_daemon_hint()}")
+    except (ProtocolError, ValidationError) as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    print(green("✓ ") + out.get("summary", "set"))
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -662,9 +916,39 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("val", nargs="?", help="value to write, e.g. 0x0d")
     m.set_defaults(fn=cmd_raw)
 
+    m = sp("freq", help="CPU max frequency, all cores at once")
+    m.add_argument("max", nargs="?", metavar="GHZ",
+                   help="cap every core at this max (3.5 or 3500000; "
+                        "omit to show)")
+    m.set_defaults(fn=cmd_freq)
+
+    m = sp("undervolt", help="Intel voltage offsets (AllowUndervolt)")
+    m.add_argument("action", nargs="?", default="show",
+                   choices=["show", "set", "reset"],
+                   help="set writes plane=mV pairs and needs --yes")
+    m.add_argument("values", nargs="*", metavar="plane=mV",
+                   help="e.g. core=-80 cache=-60 (planes: core, gpu, "
+                        "cache, uncore, analogio)")
+    m.add_argument("--yes", action="store_true",
+                   help="confirm the offsets; too deep freezes the machine")
+    m.set_defaults(fn=cmd_undervolt)
+
+    m = sp("overdrive", help="panel overdrive (model-gated EC bit)")
+    m.add_argument("value", nargs="?", choices=["on", "off"],
+                   help="toggle it (omit to show)")
+    m.set_defaults(fn=cmd_overdrive)
+
     sp("reapply",
        help="re-apply persisted state (used after resume)"
        ).set_defaults(fn=cmd_reapply)
+
+    m = sp("selftest",
+           help="reversible hardware round-trips (verify.sh as one command)")
+    m.add_argument("--yes", action="store_true",
+                   help="confirm: it writes real modes and restores them")
+    m.add_argument("--pr", action="store_true",
+                   help="print a paste-ready markdown report instead")
+    m.set_defaults(fn=cmd_selftest)
 
     m = sp("wait", help="wait for the daemon to come up")
     m.add_argument("--seconds", type=float, default=30.0)
@@ -700,14 +984,16 @@ def main(argv=None) -> int:
                 die(f"{field}: {v!r} is not a number (use 0x.. for hex)")
 
     try:
-        args.fn(args)
+        rc = args.fn(args)
     except ValidationError as e:
         die(str(e))
     except ProtocolError as e:
         die(str(e))
     except BrokenPipeError:
         return 0
-    return 0
+    # A command may fail honestly (self-test) without being an error to
+    # die() about; its return code decides the process's.
+    return rc if isinstance(rc, int) else 0
 
 
 if __name__ == "__main__":

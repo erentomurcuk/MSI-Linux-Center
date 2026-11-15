@@ -10,6 +10,13 @@ does on Windows, on Linux, without Dragon Center:
   pinned at 100%).
 * **Custom fan curves**: 6 temperature thresholds × 7 speed levels per fan,
   edited by dragging points on a graph.
+* **CPU frequency cap**: one slider caps every core's maximum frequency at
+  once, with four quick slots for the caps you actually use.
+* **Intel undervolting**: the ThrottleStop voltage offsets (core, GPU,
+  cache, uncore, analog I/O) through MSR `0x150`; volatile by design, gated
+  behind a config switch, needs the BIOS unlocked (the page says how).
+* **Display overdrive**, the panel toggle from Dragon Center, when this
+  model's EC register has been proven.
 * **Profiles**: save any of the above under a name, including a `factory`
   profile captured from the EC so you can always go back.
 * **Graphics mode (MUX)**: run the panel off the Intel iGPU (hybrid) or the
@@ -43,8 +50,9 @@ msi-control ─┼──► Unix socket ──► msi-controld (root) ──► 
                                  (out-of-tree, debug=1)
 ```
 
-Only **`msi-controld`** runs as root and only it writes to the EC. The GUI and the
-CLI are unprivileged clients. Every value they send is validated, every EC
+Only **`msi-controld`** runs as root, and only it writes to the hardware: the
+EC, the cpufreq sysfs files and the MSR voltage mailbox. The GUI and the
+CLI are unprivileged clients. Every value they send is validated, every hardware
 write is read back, and with the daemon down the GUI degrades to read-only
 rather than lying to you.
 
@@ -224,6 +232,16 @@ ls /sys/devices/platform/msi-ec/debug   # present ⇒ RPM + curves available
 systemctl status msi-controld
 ```
 
+When the daemon is up, the deeper check is the **hardware self-test**
+(`msi-control selftest --yes`), which is `verify.sh` as one command: it walks
+every performance and fan mode, blips Cooler Boost, round-trips the charge
+limit and your fan curves, and reads everything back. It restores the machine
+exactly as it found it, whatever happens on the way, and it writes nothing to
+the re-apply journal, so a future boot never replays a value it was merely
+probing. The GUI offers the same test from Settings with a confirmation
+dialog, and `msi-control selftest --yes --pr` prints a paste-ready markdown
+report, which is exactly what a model pull request should attach.
+
 ---
 
 ## Use
@@ -243,20 +261,35 @@ msi-control profile save quiet-office
 msi-control profile apply gaming
 msi-control graphics                      # graphics mode (MUX): hybrid | discrete
 msi-control graphics discrete --yes       # switch it (reboot to apply)
+msi-control freq                          # all-core max frequency (GHz)
+msi-control freq 3.5                      # cap every core at 3.5 GHz
+msi-control undervolt                     # Intel voltage offsets (show)
+msi-control undervolt set core=-80 cache=-60 --yes   # write them
+msi-control undervolt reset               # back to 0, now, not at reboot
+msi-control overdrive                     # panel overdrive (model-gated)
 msi-control reapply                      # push persisted state back into the EC
+msi-control selftest                      # verify.sh as one command (add --yes to run)
+msi-control selftest --yes --pr           # the same, printing a paste-ready PR report
 ```
 
 …or run `msi-control-gui` (also in your application menu as **MSI Linux Control**). It has
-six sections, reached from a sidebar: Dashboard, Performance, Fans, Battery,
-Profiles, Settings. The window, the menu entry and the tray all carry the same
+eight sections, reached from a sidebar: Dashboard, Performance, Frequency,
+Undervolting, Fans, Battery, Profiles, Settings. The Frequency and Undervolting
+sections can be hidden from Settings by anyone who does not use them. The window,
+the menu entry and the tray all carry the same
 mark (MSI's red shield with **Tux** on it, and nothing else): it is built to be
 read at the 16-22 px a taskbar actually renders, where a tile and a model
 number turn into a dark square with a smudge in it, and the tray's copy is
 tinted by the hottest temperature and labelled with it, so you can read the
 machine's heat without opening anything. Settings can switch that copy to a
 flat white or flat black shield to match a light or a dark panel, or turn the
-reading off altogether. The Performance section also carries the graphics
-switch, for the same reason MSI Center puts it there.
+reading off altogether. The tray also carries a menu with the everyday
+switches on it: show the window, jump straight to a performance mode, Cooler
+Boost, and one of the three charge limits, all through the same validated
+daemon writes as the window, so a laptop that is doing fine never has to be
+opened to change one of them. The Performance section also carries the graphics
+switch, for the same reason MSI Center puts it there, and the panel overdrive
+toggle when this laptop's model file has proven its register.
 
 If no model file matches your laptop, the window carries an amber banner saying
 so, the Fans section goes read-only with a notice, and the Settings section
@@ -268,8 +301,13 @@ really supports instead of offering controls it cannot honour.
 The interface is a header, a sidebar, and one page at a time, not a strip of
 tabs, so the window reads as one system at any size:
 
-* **MSI's colours, and one meaning per colour.** The accent is MSI red, and it
-  is the app's only "this is selected / this is your value" colour. The
+* **MSI's colours, and one meaning per colour.** The accent is the app's only
+  "this is selected / this is your value" colour, and it is MSI red by
+  default. Settings offers a handful of other presets (blue, purple, teal,
+  orange, pink), each with one pair per theme, because the swatch that reads
+  on near-black turns to mud on white; every preset's contrast is measured
+  the way the themes' is, and the shield mark stays MSI red whatever you
+  pick, because the mark is the brand rather than a setting. The
   green→amber→orange→red band is reserved for temperature, so a red bar always
   means *hot* and never *chosen*, which is why the battery tile, a percentage
   and not a temperature, wears the accent instead. The offline banner and the
@@ -339,6 +377,16 @@ profile has no business moving it; previously all three carried
 picked. The rule is uniform: **a profile that does not mention a charge limit
 does not touch one.**
 
+The same absent-means-untouched rule covers the two CPU-side keys a saved
+profile may carry. `save-current` also snapshots the all-core frequency cap
+you have set and any nonzero voltage offsets you have applied, as
+`freq_khz` and `undervolt` (`{plane: millivolts}`, only the planes you named:
+a profile cannot zero an offset it did not mention). Applying a profile that
+carries them sets the cap and pushes the offsets; the built-ins mention
+neither, so they never change your CPU settings. Offsets in a profile obey
+the same gate as the Undervolting page: if `AllowUndervolt` is off the rest
+of the profile applies and the offsets are skipped with a warning.
+
 ### Config: `/etc/msi-control/config.json`
 
 The default is the repo's [`etc/config.json`](etc/config.json); `install.sh`
@@ -350,6 +398,7 @@ copies it in on first install and never overwrites an existing one.
   "DefaultProfile": null,     // apply this profile at boot instead (wins over RestoreLast)
   "AllowRaw": false,          // expose the raw EC peek/poke (`msi-control raw`)
   "AllowMuxSwitch": false,    // allow the graphics-mode (MUX) switch
+  "AllowUndervolt": false,    // allow writing Intel voltage offsets
   "SocketGroup": "wheel",     // who may talk to the daemon
   "ReapplyOnResume": true     // re-apply after suspend
 }
@@ -382,15 +431,16 @@ take effect, and this program will never reboot your machine for you.
 
 #### ⚠️ Read this before you switch
 
-* **The switch writes bytes outside the documented EC map**: register `0x2e`
-  bit 6 (MSI's "PXCT" bit), the trigger byte at `0xd1`, and byte 1 of the UEFI
-  variable `MsiDCVarData` (`dd96baaf-145e-4f56-b1cf-193256298e99`). These are
-  the only addresses this program writes outside its documented setting map,
-  and `msi-ec` itself has **no MUX support at all**, so none of it is
-  vendor-documented for Linux.
+* **The switch writes bytes outside the documented EC map**: the UEFI variable
+  `MsiDCVarData` (`dd96baaf-145e-4f56-b1cf-193256298e99`) and, depending on
+  which protocol the firmware speaks (see below), data byte 5 of that variable
+  plus the trigger byte at `0xd1`, or byte 1 plus `0xd1` plus register `0x2e`
+  bit 6 (MSI's "PXCT" bit). These are the only addresses this program writes
+  outside its documented setting map, and `msi-ec` itself has **no MUX support
+  at all**, so none of it is vendor-documented for Linux.
 * **The mechanism is reverse-engineered.** It is cross-checked against
   [`ElXreno/msi-gpu-switcher`](https://github.com/ElXreno/msi-gpu-switcher),
-  which drives the identical trio, but that tool was developed and tested on
+  which drives the same protocols, but that tool was developed and tested on
   an **AMD** MSI Alpha 17 C7VG, not on this model.
 * **MSI's own MUX documentation does not list a 10th-generation MSI.**
   ArchWiki's *MSI GS66 11UX* page records reverse-engineering this switch
@@ -408,12 +458,33 @@ on resume, not from a profile. A graphics switch is a decision, not a setting.
 
 #### How it knows what mode you are in
 
-Three independent sources, and they agree on this machine:
+The request lives in the UEFI variable `MsiDCVarData`, and its firmware
+comes in two dialects, told apart by a marker bit:
+
+* **Three-mode firmware** (newer Optimus machines): data **byte 5** holds
+  the request in bits 0-1 (`0` hybrid, `1` discrete, `2` integrated), what
+  was applied at boot in bits 2-3, and marker bit 4 (`0x10`). Bit 5 says
+  whether integrated mode exists at all; bit 6 set means discrete is **not**
+  supported, and the GUI then refuses the switch rather than writing a
+  request the firmware will ignore. A switch is byte 5, the trigger and the
+  acknowledge, exactly what MSI Center sends.
+* **Legacy firmware** (the Alpha 17 the above tool was written for):
+  variable byte 1, the trigger, and the state bit `0x2e` bit 6.
+* **Everything else**: the variable carries no documented request, and this
+  program says so instead of guessing. On this project's own GS66
+  (`16V1EMS1`) byte 1 is written by the firmware itself at every POST and
+  holds the applied mode, not a request; reading it as one used to produce a
+  permanent phantom "next boot: Discrete, reboot required" on a machine that
+  booted hybrid every time. That is fixed: a request is only believed when
+  the three-mode marker bit is present (found 2026-11-15, by watching the
+  variable get rewritten one second after every boot).
+
+Three independent sources, when the firmware documents all of them:
 
 | Source | Read from | Says |
 |---|---|---|
-| EC state bit | register `0x2e` bit 6, via the daemon | what the EC currently holds |
-| UEFI variable | `MsiDCVarData` byte 1 (world-readable) | what the firmware will do at the **next POST** |
+| EC state bit | register `0x2e` bit 6, via the daemon | what the EC currently holds (firmware that has the document) |
+| UEFI variable | `MsiDCVarData` byte 5, marker-gated (world-readable) | what the firmware will do at the **next POST** |
 | PCI bus | is there an Intel `0x8086` display controller? | what the machine is **actually running right now** |
 
 The third one is the honest one: the firmware powers the iGPU down in discrete
@@ -427,6 +498,82 @@ world-readable), so `msi-control status` still reports the mode with the
 daemon down. Only the EC register needs the daemon, and the offline view says
 so rather than guessing.
 
+### CPU frequency: one cap for every core
+
+`msi-control freq` caps the *maximum* frequency of every core at once by
+writing one `scaling_max_freq` per cpufreq policy (the same thing four
+setfreq scripts on a desktop do, in one knob):
+
+```bash
+msi-control freq          # show every core's cap + the hardware range
+msi-control freq 3.5      # cap all cores at 3.5 GHz (values reset at reboot)
+```
+
+The value is clamped to what the CPU reports (`cpuinfo_min_freq`…
+`cpuinfo_max_freq`), and where the requested max is below a core's current
+*minimum*, the floor is lifted with it so the pair can never be inverted.
+It is a sysfs knob, not an EC byte, and it limits rather than forces:
+nothing pins the CPU at the cap, it merely cannot exceed it. The kernel
+resets it at every boot, so it is deliberately not part of the re-apply
+snapshot. The GUI page holds the slider pending until you press Apply and
+carries four quick slots (store the values you actually use).
+
+### Undervolting an Intel CPU
+
+Undervolting lowers the voltage the CPU runs at, which lowers heat and
+fan noise at the same performance. On Linux the interface is MSR `0x150`,
+Intel's own OC mailbox: the same protocol ThrottleStop drives on Windows.
+It works on 6th-10th generation Intel CPUs (this project's own i7-10875H
+is a 10th generation Comet Lake).
+
+**Your BIOS ships with it locked, and it can only be unlocked in the BIOS.**
+After the Plundervolt disclosure (CVE-2019-11157) the microcode ignores
+these writes. On MSI machines the route is the Advanced OC menu: disable
+**Overclocking Lock**, **CFG Lock** and **Undervolt Protection**. There is
+no way to read the lock from the OS; a write that does not read back is
+the only signal, and the daemon reports exactly that, with the BIOS route,
+rather than claiming a success it cannot see.
+
+Safety properties, all deliberate:
+
+* **Offsets are volatile.** They clear at every reboot *and* at suspend.
+  If an offset is too deep and the machine freezes, a reboot recovers it:
+  nothing persistent ever holds a voltage the machine has not survived.
+  For the same reason a deep offset never survives a suspend you can also
+  use as recovery.
+* **The range is clamped** to `0 … -300 mV`, five voltage planes (core,
+  GPU, cache, uncore, analog I/O). The reference tools start warning
+  around -200.
+* **Writing needs the config gate** (`"AllowUndervolt": true`) *and*
+  `--yes` on the CLI, or a confirmation dialog in the GUI.
+* **The app re-applies a saved set when the app starts, not at boot.**
+  If you want your offsets back, save them on the Undervolting page (the
+  *Use at startup* button); the GUI re-applies that set when *it* starts,
+  because a set the machine has not survived would otherwise stick around
+  invisibly. If the machine freezes after an apply, do not press the
+  startup save button until you have found stable values.
+
+```bash
+msi-control undervolt                                # read the five planes
+msi-control undervolt set core=-80 cache=-60 --yes   # apply (volatile!)
+msi-control undervolt reset                          # all back to 0, now
+```
+
+Test the way testers do: go deeper in small steps, one plane at a time,
+load the CPU (a compile, a stress test) for some minutes between steps,
+and treat a freeze as a signal to back off 20 mV, not as a failure.
+
+### Display overdrive
+
+The panel overdrive toggle from Dragon Center is one EC bit, addressed per
+model: a model file that has proven its register carries
+`features.display_overdrive` plus `ec.overdrive` (address, bit). On the
+models it was measured on (same generation GP76) it is bit 4 of the same
+byte that holds the webcam and the MUX state, so it is written as a one-bit
+read-modify-write, never a whole-byte poke. The control is on the
+Performance page, next to the graphics switch, and it refuses (rather than
+guesses) on models without a proven register.
+
 ---
 
 ## Safety model
@@ -435,9 +582,12 @@ so rather than guessing.
    *daemon* side; the GUI and CLI validate too, but the daemon never trusts
    them. Curves must be 6 strictly-increasing temperatures and 7
    non-decreasing speeds, all in range; charge limits are 20-100.
-2. **Read-back.** Every EC write is followed by a read. An EC that silently
-   ignores a byte is indistinguishable from one that accepted it, so the
-   daemon refuses to report success unless the byte really stuck.
+2. **Read-back.** Every hardware write is followed by a read: an EC byte, a
+   cpufreq sysfs value, an OC mailbox plane. Hardware that silently ignores
+   a write is indistinguishable from hardware that accepted it, so the
+   daemon refuses to report success unless the value really stuck. Undervolt
+   read-back is also the *lock detector*: a locked BIOS is indistinguishable
+   from a refused write, so that is how it is reported.
 3. **Serialisation.** All EC writes take one lock: the kernel's ACPI code
    talks to the same controller.
 4. **Least privilege.** Only `msi-controld` is root. The socket is `0660
@@ -455,11 +605,12 @@ so rather than guessing.
 src/msi_control.py     model registry, EC map, validation, protocol  (shared)
 src/msi_controld.py           the privileged daemon
 src/msi-control        CLI (status · detect · monitor · mode · fan · boost ·
-                       battery · curve · profile · graphics · reapply · raw · wait)
+                       battery · curve · profile · graphics · freq ·
+                       undervolt · overdrive · reapply · raw · wait)
 src/msi-control-gui           PySide6 GUI
 models/<id>/model.json one laptop model: the per-model EC map + features
 models/README.md       the model-file format, field by field
-tests/test_msi_control.py     142 offline tests: fake sysfs + RAM-backed EC
+tests/test_msi_control.py     173 offline tests: fake sysfs + RAM-backed EC
 tests/gui_smoke.py     headless GUI construction + behaviour + screenshots
 tests/shots/           committed screenshots: dark, and light/ beside it
 tools/                 hardware probes (need root) + fixup/recapture helpers
@@ -478,7 +629,7 @@ LICENSE                GPL-2.0-or-later (the whole program)
 ### Tests
 
 ```bash
-python3 tests/test_msi_control.py                     # 142 tests, no root, no hardware
+python3 tests/test_msi_control.py                     # 173 tests, no root, no hardware
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py   # needs PySide6
 
 make check                                     # both of the above + a syntax check
@@ -501,12 +652,13 @@ and that the icon it ships and the mark it paints are the same silhouette,
 with nothing behind the shield. `make shots` and `make shots-light` regenerate
 the two checked-in sets.
 
-The suite builds a **fake sysfs tree** and a **RAM-backed EC**, then runs the
-real daemon in-process and drives it over the real socket, so protocol,
-validation, profiles, restore-after-reboot and the CLI are all exercised
-end-to-end. The environment variables `MSI_SYSFS`, `MSI_SOCK`,
-`MSI_CONFIG` and `MSI_STATE` redirect every path, which is what makes this
-possible without root.
+The suite builds a **fake sysfs tree** (cpufreq policies included) and a
+**RAM-backed EC**, plus a fake OC mailbox standing in for `/dev/cpu/*/msr`,
+then runs the real daemon in-process and drives it over the real socket, so
+protocol, validation, profiles, restore-after-reboot and the CLI are all
+exercised end-to-end. The environment variables `MSI_SYSFS`, `MSI_SOCK`,
+`MSI_CONFIG`, `MSI_STATE` and `MSI_CPU_DEV` redirect every path, which is
+what makes this possible without root.
 
 It deliberately covers the ugly cases: an EC byte that refuses to be written
 (read-back must catch it), a `True` that must not become fan speed 1, a
@@ -538,6 +690,12 @@ back, and must not leave the UEFI variable mutable if the write fails.
 | The graphics switch is greyed out | it is off by default; set `"AllowMuxSwitch": true` in the config and restart `msi-controld` |
 | Switched the graphics mode but nothing changed | that is by design: it applies at the **next reboot**. The card says `reboot required` until it does |
 | No display after a graphics switch | reset the firmware (clear CMOS / BIOS defaults) from an external screen, then `msi-control graphics revert` |
+| The undervolt apply reports a refusal | the BIOS lock; the message lists it: Advanced OC menu, Overclocking Lock / CFG Lock / Undervolt Protection off, then try again |
+| Undervolt offsets silently vanished | they clear at reboot and suspend by design; open the GUI (it re-applies your startup set) or re-run the `set` command |
+| `msi-control freq` says cpufreq is unavailable | no `/sys/devices/system/cpu/cpufreq`; an exotic BIOS or a CPU without scaling. Nothing is guessed |
+| The overdrive control is greyed out | this model file has no proven register for it; see `models/README.md` |
+| `msi-control selftest` prints a refusal | by design: it writes real modes to your EC. Read the message and re-run with `--yes` |
+| The self-test reports a failed check | copy the report (`selftest --yes --pr` or the Settings button) into an issue; the failing line names the register or file that ignored us |
 
 ---
 

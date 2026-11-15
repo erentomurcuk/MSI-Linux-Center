@@ -14,6 +14,226 @@ it was made; the runbook convention is documented in `CONTRIBUTING.md`.
 
 ---
 
+## 2026-11-15 (evening) - tray quick actions, hardware self-test, profiles with CPU settings
+
+Three integrations from the review pass; keyboard backlight and NVIDIA clock
+controls were considered and dropped as out of scope.
+
+### Added
+- **Tray quick actions.** The tray icon now carries a menu with the everyday
+  switches: show the window, the four performance modes as radio entries,
+  Cooler Boost, and the 60/80/100 charge limits. Everything routes through
+  the window's own `submit` path, so it is the same validated, read-back
+  daemon write a button press is; the checks mirror the latest status poll
+  rather than writing anything themselves. The menu is built even where no
+  system tray exists, which is what lets `check_tray_menu` pin its state,
+  the firmware-unavailable modes being hidden, and everything going dead
+  when the daemon is offline.
+- **A hardware self-test as a command** (`msi-control selftest`, plus a
+  Settings card in the GUI): `verify.sh` ported onto the daemon's own
+  validated primitives. It walks every shift and fan mode, blips Cooler
+  Boost, round-trips the charge limit (80 then 60), re-writes each fan
+  curve where it already is, re-caps every core where it already is, and
+  reads every change back, then restores the machine exactly as it found
+  it whatever happened on the way. It is gated twice over: the CLI refuses
+  without `--yes` and the GUI asks a confirmation that names what gets
+  written. Its writes never touch `last.json` (it goes through the EC
+  backend, not the journaling dispatch), so a future boot cannot replay a
+  value it was merely probing. `--pr`, and the card's Copy button, hand
+  over a paste-ready markdown report for a model pull request, free of
+  hostname, serial and home paths. One honest footnote: the charge check
+  verifies the end limit read-back as ours, and reports the start
+  threshold informationally, because `start = limit - 10` is the msi-ec
+  driver's doing, not this program's write; a firmware that pins it is a
+  passing "held at its own value", never a silent success.
+- **Saved profiles can carry the CPU-side settings.** `save-current`
+  snapshots the all-core frequency cap as `freq_khz` and any nonzero
+  voltage offsets as `undervolt`. Applying follows the same
+  absent-means-untouched rule as `charge_end`: built-ins mention neither
+  key, so they never touch your CPU settings. Offsets are stored as the
+  planes named and applied with `fill_missing=False`, so a profile cannot
+  zero an offset it did not mention, and they obey the `AllowUndervolt`
+  gate: with it off the rest of the profile applies and the offsets are
+  skipped with a warning.
+- **A selectable accent.** Six presets in Settings (MSI red, blue, purple,
+  teal, orange, pink), each carrying one pair per theme, because the swatch
+  that reads on near-black turns to mud on white. Applying one re-styles the
+  app live: the stylesheet and palette are rebuilt, and the sidebar is
+  rebuilt too because nav icons bake the accent into their selected pixmap.
+  Everything else is derived, not hand-tuned: `on_accent` picks black or
+  white by luminance, and `accent_ink` (the selected-row ink) is pushed
+  toward white or black in fixed steps until it clears AA on the accent's
+  own soft tint, which the bare accent fails at ~2.6:1. The shield mark
+  stays MSI red whatever is picked, because the mark is the brand. The
+  choice lives in QSettings (`style/accent`) beside the geometry. Every
+  preset is measured in both themes by the smoke test. Plus a smoke-suite
+  hardening found on the way: the output dir (and therefore
+  `XDG_CONFIG_HOME`) is absolutised, so a run invoked with a relative path
+  can never fall back to the developer's real `~/.config` (Qt ignores a
+  relative `XDG_CONFIG_HOME` and writes home instead, which is exactly the
+  leak the scratch config dir exists to prevent).
+- 16 offline tests (validation of the new profile keys, the profile
+  round-trips, TestSelftest for pass/failure/restoration/CLI gating;
+  189 total) plus `check_tray_menu` and `check_selftest_card` in the GUI
+  suite. Screenshots regenerated for both themes. Docs updated: README
+  (Use, Verify, tray paragraph, profiles, troubleshooting), APP_DETAILS
+  (protocol, profiles table, UI table, tray section, smoke-checks table),
+  AGENTS (CLI subcommand list, self-test next to `verify.sh`).
+
+---
+
+## 2026-11-15 (latest) - CPU frequency caps, Intel undervolting, panel overdrive
+
+Three new control surfaces, two of them deliberately conservative. All three
+go through the daemon: it owns every hardware write, and the offline suite
+grew fake cpufreq policies and a fake OC mailbox to prove it.
+
+### Added
+- **CPU frequency configurator** (`msi-control freq`, the Frequency page): one
+  cap for every core's `scaling_max_freq`, clamped to `cpuinfo_min..max`,
+  lifting a policy's min when the cap drops below it, read back per policy
+  by the daemon. Four quick slots store day-to-day caps in QSettings.
+  Deliberately not part of the re-apply snapshot: the kernel resets the caps
+  at boot and a cap is a live decision, not a machine state.
+- **Intel undervolting** (`msi-control undervolt`, the Undervolting page):
+  the ThrottleStop protocol, MSR `0x150` OC mailbox, five planes (core, gpu,
+  cache, uncore, analogio), clamped to `0..-300 mV`. The encoding matches
+  ThrottleStop byte for byte (`-175 mV` = `0xE9A00000`, checked on the
+  dev machine too). Safety design exactly as requested:
+  offsets are **volatile** (they clear at reboot and suspend, and nothing
+  persists them daemon-side), a separate *Use at startup* button saves a
+  set the **GUI re-applies when the app starts**, never a boot path; the
+  page carries a permanent notice that the BIOS must have undervolting
+  unlocked (Overclocking Lock / CFG Lock / Undervolt Protection off in the
+  Advanced OC menu) and the daemon reports a locked BIOS (a write that
+  does not read back) naming that route instead of claiming success.
+  Writing needs `"AllowUndervolt": true` in the config plus `--yes` on the
+  CLI / a confirmation dialog in the GUI.
+- **Display overdrive** (`msi-control overdrive`, a Panel card on the
+  Performance page): the Dragon Center panel toggle, one EC bit addressed
+  per model. A model that proves it carries `features.display_overdrive`
+  plus `ec.overdrive` (`address`, `bit`, optional whole-byte `off`/`on`);
+  the write is a one-bit read-modify-write of the same `0x2e` that holds
+  the webcam (bit 1) and the MUX state (bit 6). **The flag ships `false`
+  for the GS66**: bit 4 was measured on a same-generation GP76 (Blur
+  Busters forum) but never on `16V1EMS1`, and the repo's rule is that a
+  register is proven or the feature stays off; the GUI and CLI say
+  "no proven register" rather than flipping an unwatched bit.
+- Settings can hide the Frequency and Undervolting sections entirely;
+  a hidden section also leaves the sidebar and the `Ctrl+N` cycle.
+- The sections were renumbered (`Ctrl+1..8`): Dashboard, Performance,
+  Frequency, Undervolting, Fans, Battery, Profiles, Settings.
+- Protocol: `freq` (show/set), `undervolt` (show/apply/reset, gated on
+  `AllowUndervolt`), `overdrive` (show/set, model-gated); `status` carries
+  freq facts, the overdrive state and the current voltage planes.
+- 26 offline tests (TestFrequency, TestUndervolt, TestOverdrive and the
+  pure-function additions; 173 total) plus GUI smoke checks for the three
+  new pages (pending-cap state, slot store/clear, BIOS notice, startup-set
+  save/delete, offline-disables-writes extended). Docs updated everywhere:
+  README (three new sections + troubleshooting rows + feature list),
+  APP_DETAILS (§2 diagram, the non-EC writes subsection, protocol, UI
+  table, tests), models/README (`ec.overdrive` + `display_overdrive`),
+  AGENTS (counts, ec table line, env table `MSI_CPU_DEV`).
+
+### Changed
+- The base test fixture now carries two fake cpufreq policies and a fake
+  `/dev/cpu` tree (`MSI_CPU_DEV`), so a test run no longer depends on the
+  host having (or not having) MSRs and the undervolt backend is always
+  exercised offline.
+- `Service.status()` gained `freq`, `overdrive` and `undervolt` keys and
+  echoes `AllowUndervolt` in its config block.
+
+---
+
+## 2026-11-15 (later) - MUX: the phantom "next boot: Discrete" and the three-mode protocol
+
+The settings app claimed "next boot: Discrete, reboot required" forever on a
+machine that booted hybrid every time. It was not the BIOS being confused; it
+was this program misreading a byte. Found by watching the UEFI variable get
+rewritten one second after every boot.
+
+### Fixed
+- **A phantom graphics request on firmwares that carry none.** The program
+  read byte 1 of `MsiDCVarData` as "the mode to apply at next POST", which is
+  what that byte means on the Alpha 17 the reference tool was written for.
+  On this machine (`16V1EMS1`) the firmware itself rewrites byte 1 right
+  after POST to mirror the mode the BIOS applied; it holds the current mode,
+  not a request, so a hybrid BIOS setting looked like a pending discrete
+  switch that would never apply. A variable-side request is now only believed when the
+  three-mode marker bit (byte 5 bit 4) is present, and firmwares without it
+  get an honest "the variable carries no documented request" instead of a
+  guess.
+
+### Added
+- **Three-mode protocol support** (newer Optimus firmware, the second backend
+  of ElXreno/msi-gpu-switcher): the request lives in byte 5 bits 0-1
+  (hybrid/discrete/integrated), bits 2-3 name the applied mode, bit 5 says
+  whether integrated exists and bit 6 set means discrete is not supported.
+  A switch is byte 5, the efivar write, the `0xd1` trigger and an
+  acknowledge poll, exactly what MSI Center sends; the GUI disables the
+  discrete button when the firmware flags it unsupported rather than writing
+  a request that cannot be honoured. The legacy path (byte 1, trigger,
+  `0x2e` bit 6) is kept for firmware that speaks it; the dialect is detected
+  from the variable at runtime, never configured per model.
+- Five daemon tests for the three-mode handshake (write facts, refusal,
+  no-acknowledge error, revert), a caps-refused state in the GUI smoke test,
+  and provenance in README, APP_DETAILS and the GS66 model README. A software
+  discrete switch on `16V1EMS1` is still **unproven**, and the docs say so;
+  the tested route on that machine is the BIOS setting.
+
+---
+
+## 2026-11-15 - minimalist UI pass (quiet surfaces, pill controls) + three repairs
+
+The GUI keeps its structure (token themes, the one-rung control heights, the
+one type scale, every invariant the smoke test pins) but reads differently:
+near-flat chrome, cards that float on the background, pill-shaped buttons
+and a rounded neutral sidebar selection, with the red accent kept as the
+one saturated colour. Plus three small repairs found while auditing: a
+registry re-parse on every GUI poll, a private-attribute reach-in inside the
+daemon, and message-sniffing where the CLI decides "daemon not running".
+
+### Changed (GUI look, no behaviour)
+- **Quiet surface language.** New palettes: the light theme is the
+  `#f5f5f7`-on-white settings-app look, the dark theme a near-black
+  `#0a0a0c` with `#151518` cards. The header, sidebar and status bar now
+  share the window background with no separator lines, so a page is a set
+  of cards floating on one surface rather than panels inside a frame.
+- **Pill buttons.** New `R_BTN` token (18 px, exactly half the 36 px control
+  rung, pinned in the smoke test); every button is a full pill, spin boxes
+  and line edits stay at the 10 px control radius. Sidebar selection is a
+  rounded neutral pill (`surface3`) instead of the red left rule; the
+  accent stays on the icon, so red keeps meaning "interactive", not
+  "chrome".
+- **Bigger radius, more air.** `R_CARD` 16 to 20, `R_INNER` 12 to 14,
+  `PAGE_PAD` 20 to 24, `PAGE_GAP` 14 to 16; cards, progress bars and the
+  slider groove slimmer (`H_BAR` 8 to 6, `R_BAR` 5 to 3); the slider handle
+  grows to a 20 px white circle.
+- **Sentence case everywhere a chip used to shout.** Card captions keep the
+  caller's case instead of upper-casing (no tracking on lowercase), the
+  temperature bands read "Warm" not "WARM", and the battery chip keeps the
+  kernel's own spelling ("Not charging"). The smoke test's pinned labels
+  were updated to match. The Cooler Boost hero keeps its all-caps brand
+  name, deliberately.
+### Fixed
+- **The GUI re-parsed the whole model registry on every poll.**
+  `SettingsTab.refresh()` called `core.model_errors()`, which re-opens and
+  re-parses every `models/*/model.json`, every 1.5 s, on the GUI thread.
+  The registry cannot change while the process lives, so the errors are
+  read once at startup.
+- **`msi-controld` reached into `MsiEc._p()`** to test for the debug
+  interface; that is now the public `MsiEc.debug_present()`.
+- **The CLI's `_set()` sniffed error text** ("No such file", "errno") to
+  decide whether to print the "start the daemon" hint. `OSError` (transport
+  failure, the actual offline case) and `ProtocolError` (the daemon
+  answering "no") are now caught separately.
+- **`check_int()`'s float clause** relied on operator precedence that was
+  correct but easy to break while reading it; parenthesised.
+- Screenshots in `tests/shots/` (dark and light) regenerated for the new
+  look.
+
+---
+
 ## 2026-10-19 - release preparation: licence, packaging, model-PR guides
 
 The pass that turns the tree into something publishable: a licence, an rpm
