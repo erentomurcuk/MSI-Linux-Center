@@ -30,6 +30,15 @@ it was made; the runbook convention is documented in `CONTRIBUTING.md`.
   Two regression tests simulate the lagging attribute.
 
 ### Added
+- **A stored Frequency slot now applies on click.** The page slots used
+  to only preload the slider, so a stored cap still needed an Apply press
+  that the hand-written desktop scripts never did; and while the
+  read-back bug above lived, the Apply step was the one that said
+  "failed" for a write that had stuck. A slot click now sends the value
+  straight through the daemon's validated writer (the same `freq set`
+  payload the tray submenu sends), and if the daemon is down the slot
+  says so in a flash instead of pretending. `check_frequency_page` pins
+  the exact command a click produces.
 - **The tray menu gained a CPU frequency cap submenu**: the Frequency
   page's four quick slots (read from the page's own QSettings keys, so
   the tray can never disagree with the page about what slot 1 holds,

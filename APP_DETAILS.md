@@ -434,7 +434,7 @@ Status   transient actions (left) · daemon + firmware (right, permanent)
 |---|---|
 | Dashboard | 4 stat tiles (CPU/GPU temp, CPU/GPU fan RPM) + Battery + Right now + System |
 | Performance | shift mode buttons + Cooler Boost + **Graphics mode (MUX)** + panel overdrive (model-gated) |
-| Frequency | all-core max-frequency slider + four quick slots; values reset at reboot |
+| Frequency | all-core max-frequency slider + four quick slots (a slot click applies immediately); values reset at reboot |
 | Undervolting | five plane offsets + Apply/Reset + the permanent BIOS-unlock notice + the app-startup set |
 | Fans | fan mode + draggable CPU/GPU curve canvases with factory ghost |
 | Battery | charge-limit slider + 60/80/100 presets + Apply/Revert |
@@ -640,7 +640,9 @@ both had a live-write bug:
 The Frequency slider follows the same pending pattern (a slow drag must not
 re-cap the cores on every step); its four quick slots are `QSettings`
 (`freq/slot1..4`), storing the cap *number* only, so they survive restarts
-without ever becoming a daemon-side persisted state.
+without ever becoming a daemon-side persisted state. Dragging stays pending,
+but clicking a stored slot skips the queue and applies at once: a stored
+value is a decision, not a draft.
 
 ---
 

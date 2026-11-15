@@ -762,6 +762,15 @@ def check_frequency_page(win) -> None:
     f.slot_store_btns[0].click()
     assert f._slot_khz(0) == 3_000_000, "slot did not store the value"
     assert "3.00 GHz" in f.slot_btns[0].text()
+    # and the click applies it in one go: the shell scripts these slots
+    # replace never asked for a second button
+    sent = []
+    orig = win.client.submit
+    win.client.submit = lambda cmd, tag=None: sent.append(cmd)
+    f.slot_btns[0].click()
+    win.client.submit = orig
+    assert sent == [{"cmd": "freq", "action": "set", "max_khz": 3_000_000}], \
+        f"a slot click sent {sent}"
     f._slot_clear(0)
     assert f._slot_khz(0) is None, "slot did not clear"
     f.slider.setValue(4_000_000 // gui.FREQ_STEP_KHZ)

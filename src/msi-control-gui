@@ -2158,6 +2158,7 @@ class CpuFreqTab(QWidget):
             b = QPushButton(name)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip("Apply this stored cap to every core at once")
             b.clicked.connect(lambda _=False, n=i: self._slot_pick(n))
             store = QPushButton("Store")
             store.setToolTip("Save the slider's current value here")
@@ -2176,7 +2177,10 @@ class CpuFreqTab(QWidget):
         slots.box.addLayout(grid)
         slots.box.addWidget(hint_label(
             "The slots live in this desktop's own settings, not the "
-            "daemon's config; they are your shortcuts, not machine state.",
+            "daemon's config; they are your shortcuts, not machine state. "
+            "Clicking a stored slot applies it immediately, the way the "
+            "hand-written scripts it replaces did, and Store fills the "
+            "empty one of your choice with the slider's current value.",
             slots))
         lay.addWidget(slots)
         lay.addStretch(1)
@@ -2276,8 +2280,17 @@ class CpuFreqTab(QWidget):
             self.slider.setValue(khz // FREQ_STEP_KHZ)
         self._sync_pending()
         self._sync_slots()
-        self.win.flash(f"slot {i + 1}: {core.khz_to_ghz(khz)} GHz selected, "
-                       "press Apply to write it")
+        # A one-click shortcut that still needs a second click is no
+        # shortcut: the shell scripts these slots replace wrote the value
+        # straight out, so a stored slot applies at once, through the same
+        # validated write the tray's copy of it uses.  The daemon's reply
+        # (its summary, or its ✗ error) is flashed by the generic action
+        # path, so the click reports itself.
+        if self._loaded and self.win.online:
+            self.win.send({"cmd": "freq", "action": "set", "max_khz": khz})
+            return
+        self.win.flash(f"slot {i + 1}: {core.khz_to_ghz(khz)} GHz pending; "
+                       "it goes out when the daemon is back")
 
     def _slot_store(self, i: int):
         khz = self.slider.value() * FREQ_STEP_KHZ

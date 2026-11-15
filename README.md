@@ -518,7 +518,10 @@ It is a sysfs knob, not an EC byte, and it limits rather than forces:
 nothing pins the CPU at the cap, it merely cannot exceed it. The kernel
 resets it at every boot, so it is deliberately not part of the re-apply
 snapshot. The GUI page holds the slider pending until you press Apply and
-carries four quick slots (store the values you actually use).
+carries four quick slots (store the values you actually use). Clicking a
+stored slot applies it immediately, with no second button: the slot is a
+one-click cap the way a desktop script was, and it goes through the same
+validated write as Apply.
 
 ### Undervolting an Intel CPU
 
