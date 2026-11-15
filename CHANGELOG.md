@@ -14,6 +14,33 @@ it was made; the runbook convention is documented in `CONTRIBUTING.md`.
 
 ---
 
+## 2026-11-15 (night) - frequency cap fixed on real intel_pstate, frequency slots in the tray
+
+### Fixed
+- **The frequency cap reported a refusal on every set after the first.**
+  Real hardware caught what the fixtures could not: Intel cpufreq
+  (intel_pstate with HWP, observed on the i7-10875H) applies a new
+  `scaling_max_freq` a few milliseconds *after* `write(2)` returns, so the
+  daemon's immediate read-back saw the previous cap and answered
+  `core policy0: read back 5.10 GHz` for a write that had in fact stuck.
+  The write was real (the cap landed; the error was the lie), which is
+  exactly the wrong way round. The read-back is now a short poll with an
+  80 ms deadline per policy; a genuine refusal still surfaces once the
+  deadline passes (tested with a patched read that never converges).
+  Two regression tests simulate the lagging attribute.
+
+### Added
+- **The tray menu gained a CPU frequency cap submenu**: the Frequency
+  page's four quick slots (read from the page's own QSettings keys, so
+  the tray can never disagree with the page about what slot 1 holds,
+  empty slots hidden) plus a Full speed action that re-posts the hardware
+  maximum. Both go through the daemon's validated writer; the checks
+  mirror the live cap exactly like the mode actions beside them.
+  `check_tray_menu` now pins the submenu's labels, checked states and
+  the exact command payloads a click produces, offline and on.
+
+---
+
 ## 2026-11-15 (evening) - tray quick actions, hardware self-test, profiles with CPU settings
 
 Three integrations from the review pass; keyboard backlight and NVIDIA clock

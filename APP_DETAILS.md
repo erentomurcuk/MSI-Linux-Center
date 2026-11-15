@@ -248,6 +248,11 @@ all three follow the same rules (validate, serialise, read back):
   lifts a policy's `scaling_min_freq` when the requested max is below it,
   because cpufreq refuses a max under the floor. Not in `snapshot()` ever:
   the kernel resets the values at boot, so persisting them would be a lie.
+  The read-back is a short poll (80 ms deadline per policy), not one
+  shot: on Intel cpufreq (intel_pstate with HWP) the kernel applies a new
+  limit *after* `write(2)` returns, so an immediate read saw the previous
+  cap and refused a write that had stuck, on every set after the first.
+  A genuine refusal still surfaces once the deadline passes.
 * **MSR `0x150`, the OC mailbox**: the ThrottleStop undervolt protocol,
   reimplemented the way Leoyzen's gist and georgewhewell/undervolt do.
   Command write `0x8000001000000000 | plane << 40` ("data follows") or
@@ -573,15 +578,20 @@ stylesheet can interpolate.
   the painted pixels of all three, since a mode that quietly fell back to the
   tinted shield would still look like a menu that worked. Beside the icon
   sits a menu with the everyday switches: show the window, the four
-  performance modes as radio actions, Cooler Boost, and the 60/80/100 charge
-  limits. It is built even where no system tray exists (a WM without one,
-  the offscreen platform) so the mirror logic is exercised everywhere, and
-  every entry routes through `submit -> daemon -> self.set_key`, the same
-  validated path as the window's own buttons; `_update_tray_menu()` flips
+  performance modes as radio actions, Cooler Boost, the 60/80/100 charge
+  limits, and a CPU frequency cap submenu holding the Frequency page's
+  four quick slots (read from the page's own QSettings keys, so the tray
+  can never disagree with the page about what slot 1 holds, re-labelled on
+  every poll, empty slots hidden) plus a "Full speed" action that re-posts
+  the hardware maximum. It is built even where no system tray exists
+  (a WM without one, the offscreen platform) so the mirror logic is
+  exercised everywhere, and every entry routes through the same
+  `submit -> daemon -> validated write` path as the window's own buttons;
+  `_update_tray_menu()` flips
   the checks from the latest status poll and never writes anything itself.
   `check_tray_menu` pins the current state, the modes hidden where the
-  firmware lacks them, and that everything goes dead when the daemon is
-  offline.
+  firmware lacks them, the slot submenu's labels, checks and exact command
+  payloads, and that everything goes dead when the daemon is offline.
 * `Banner`, `Header`, `Sidebar`, `NavStack` as above. `NavStack` keeps the old
   `addTab`/`count`/`currentIndex`/`tabText` surface so the smoke test and the
   geometry/tab persistence were untouched by the move away from `QTabWidget`.
@@ -682,7 +692,7 @@ It also pins the things that are invisible by construction:
 | `check_theme_tokens` | a theme that silently lost a token (the stylesheet interpolates an empty string, so a widget just loses its border) or an accent whose ink fails AA |
 | `check_brand_mark` | `icons/msi-control.svg` drifting from the mark the GUI paints, measured by rasterising both and comparing the ink boxes. Also pins that the corners are still transparent (the tile has not crept back) and that the tray's `9` / `62` / `100` fit inside the badge |
 | `check_tray_icon` | a tray ink mode that quietly did nothing: it samples the mean brightness of the colour, white and black marks (white must be brighter than the band tint, which must be brighter than black), pins that the colour mode still follows the band, and that the Settings controls mirror the window instead of keeping a second copy |
-| `check_tray_menu` | a tray action that flips a state nobody rendered, or a mode the firmware does not have still showing as clickable, or the whole menu pretending to work while the daemon is offline |
+| `check_tray_menu` | a tray action that flips a state nobody rendered, a mode the firmware does not have still showing as clickable, a frequency slot that is stored but absent (or labelled with another value than the page holds), or the whole menu pretending to work while the daemon is offline |
 | `check_selftest_card` | a self-test reply rendered as an unclear dump, the Copy button handing over the rendered text instead of the PR markdown, or the run button left disabled forever after an error |
 | `check_accent_switch` | an accent preset that changed the button's look but nothing else: the click must land in `THEME`, in the app stylesheet, in `QSettings`, and rebuild the sidebar (its icons bake the accent in), and an unknown id must change nothing |
 | `check_theme_tokens` (accent half) | a preset that fails WCAG AA in either theme: every preset is measured in both, not only the one this process happens to wear |

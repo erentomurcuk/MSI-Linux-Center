@@ -977,11 +977,50 @@ def check_tray_menu(win) -> None:
         "an unavailable mode must leave the menu"
     assert win._tray_shift["sport"].isChecked()
 
+    # The CPU frequency quick slots: stored ones appear labelled with their
+    # value, the empty ones leave, the cap the machine is actually at is
+    # checked, and Full speed is there to lift the cap back.  The values
+    # come from the Frequency page's own QSettings keys, so the tray can
+    # never disagree with the page about what slot 1 holds.
+    win._qs.setValue("freq/slot1", 4_000_000)       # the cap FAKE reports
+    win._qs.setValue("freq/slot2", 2_500_000)
+    win._refresh(FAKE)
+    a1, a2, a3 = (win._tray_freq[1], win._tray_freq[2], win._tray_freq[3])
+    assert a1.isVisible() and a1.text() == "1 · 4.00 GHz", a1.text()
+    assert a1.isChecked(), "the live cap is not checked on its slot"
+    assert a2.isVisible() and a2.text() == "2 · 2.50 GHz", a2.text()
+    assert not a2.isChecked()
+    assert a2.isEnabled(), "a stored slot must be live online"
+    assert not a3.isVisible(), "an empty slot must leave the menu"
+    fs = win._tray_freq_full
+    assert fs.isVisible() and fs.isEnabled() and not fs.isChecked()
+    # and the click sends exactly the command the page's Apply sends
+    sent = []
+    orig = win.client.submit
+    win.client.submit = lambda cmd, tag=None: sent.append(cmd)
+    a2.trigger()
+    win.client.submit = orig
+    assert sent == [{"cmd": "freq", "action": "set", "max_khz": 2_500_000}], \
+        f"a slot click sent {sent}"
+    # no slots stored: only Full speed remains, and it sends the hardware max
+    win._qs.remove("freq/slot1")
+    win._qs.remove("freq/slot2")
+    win._qs.sync()
+    win._refresh(FAKE)
+    assert not a1.isVisible() and not a2.isVisible()
+    sent.clear()
+    win.client.submit = lambda cmd, tag=None: sent.append(cmd)
+    fs.trigger()
+    win.client.submit = orig
+    assert sent == [{"cmd": "freq", "action": "set",
+                     "max_khz": FAKE["freq"]["cpuinfo_max_khz"]}], \
+        f"full speed sent {sent}"
+
     # Offline the whole menu goes read-only with the rest of the app.
     win.online = False
     win._refresh(FAKE)
     for act in (win._tray_shift["eco"], win._tray_boost,
-                win._tray_charge[80]):
+                win._tray_charge[80], win._tray_freq_full):
         assert not act.isEnabled(), "a quick action stayed live offline"
     win.online = True
 

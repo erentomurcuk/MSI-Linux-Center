@@ -2104,6 +2104,48 @@ class TestFrequency(DaemonTest):
         self.assertEqual(self.policy_attr("policy0", "scaling_max_freq"),
                          3500000)
 
+    def test_intel_pstate_applies_the_cap_after_write_returns(self):
+        # Real-hardware regression: intel_pstate (with HWP) updates the
+        # attribute a few milliseconds after write(2) returns, so the
+        # one-shot read-back reported "read back 5.10 GHz" for a write
+        # that had in fact stuck, on every set after the first.  The fake
+        # here returns the old cap for the first few reads, exactly what
+        # the real machine was observed doing; the set must now succeed.
+        real_read = core.read_khz
+        stale = {"n": 0}
+
+        def lagging_read(path):
+            if path.endswith("scaling_max_freq"):
+                stale["n"] += 1
+                if stale["n"] <= 3:            # still applying the write
+                    return 5_100_000
+            return real_read(path)
+
+        with mock.patch.object(core, "read_khz", lagging_read):
+            out = self.call({"cmd": "freq", "action": "set",
+                             "max_khz": 3_500_000})
+        self.assertEqual(out["max_khz"], 3_500_000)
+        self.assertEqual(out["max_khz_applied"], 3_500_000)
+        self.assertTrue(stale["n"] > 3, "the poll never retried")
+
+    def test_a_write_that_never_lands_is_still_a_refusal(self):
+        # The wait must not turn a genuine refusal into a success by trying
+        # long enough: a policy that reports the old value past the deadline
+        # is named, exactly as before.
+        real_read = core.read_khz
+
+        def frozen_read(path):
+            if path.endswith("scaling_max_freq"):
+                return 5_100_000                    # ignores us, forever
+            return real_read(path)
+
+        with mock.patch.object(core, "read_khz", frozen_read):
+            with self.assertRaises(core.ProtocolError) as ctx:
+                self.call({"cmd": "freq", "action": "set",
+                           "max_khz": 3_500_000})
+        self.assertIn("read back", str(ctx.exception))
+        self.assertIn("policy0", str(ctx.exception))
+
 
 class TestUndervolt(DaemonTest):
     """The OC mailbox: read-back, lock detection, the config gate."""

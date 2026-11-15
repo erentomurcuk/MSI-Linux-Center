@@ -4312,6 +4312,23 @@ class MainWindow(QMainWindow):
         for pct, act in self._tray_charge.items():
             act.setEnabled(online and charge_end is not None)
             act.setChecked(charge_end == pct)
+        # The slots change when the Frequency page stores or clears one, so
+        # they are re-read and re-labelled on every status poll rather than
+        # built once; setChecked staying gesture-free is what keeps the
+        # mirror below the write.
+        freq = st.get("freq") or {}
+        cur_khz = freq.get("max_khz")
+        for i, act in self._tray_freq.items():
+            khz = self.cpu._slot_khz(i - 1)
+            act.setVisible(bool(khz))
+            if khz:
+                act.setText(f"{i} · {core.khz_to_ghz(khz)} GHz")
+            act.setEnabled(online and bool(freq.get("present")) and bool(khz))
+            act.setChecked(bool(khz) and khz == cur_khz)
+        full = freq.get("cpuinfo_max_khz")
+        self._tray_freq_full.setVisible(bool(freq.get("present")))
+        self._tray_freq_full.setEnabled(online and bool(full))
+        self._tray_freq_full.setChecked(bool(full) and full == cur_khz)
 
     def set_accent(self, accent: str) -> None:
         """Apply and persist the chrome accent; the repaint is immediate.
@@ -4382,10 +4399,40 @@ class MainWindow(QMainWindow):
             act.triggered.connect(
                 lambda _=False, v=pct: self.set_key("charge_end", v))
             self._tray_charge[pct] = act
+        # The quick slots from the Frequency page, the same four the taskbar
+        # user set up there.  They live in QSettings, so the tray reads them
+        # from the page's own helper rather than keeping a second copy; an
+        # empty slot is hidden, and the round trip still goes through the
+        # daemon's validated write.
+        self._tray_freq = {}
+        freq_menu = menu.addMenu("CPU frequency cap")
+        for i in range(1, 5):
+            act = freq_menu.addAction(f"{i}")
+            act.setCheckable(True)
+            act.setVisible(False)
+            # the page's helper takes a zero-based slot index and derives
+            # the QSettings key itself; the menu labels slots from 1 the
+            # way the page's buttons do
+            act.triggered.connect(
+                lambda _=False, n=i: self._tray_freq_apply(
+                    self.cpu._slot_khz(n - 1)))
+            self._tray_freq[i] = act
+        self._tray_freq_full = freq_menu.addAction("Full speed")
+        self._tray_freq_full.setCheckable(True)
+        self._tray_freq_full.triggered.connect(
+            lambda: self._tray_freq_apply(
+                ((self._last_status or {}).get("freq") or {})
+                .get("cpuinfo_max_khz")))
         menu.addSeparator()
         quit_act = menu.addAction("Quit")
         quit_act.triggered.connect(self.quit_app)
         return menu
+
+    def _tray_freq_apply(self, khz):
+        """One of the tray's slot entries; None means a bogus read."""
+        if not khz:
+            return
+        self.send({"cmd": "freq", "action": "set", "max_khz": khz})
 
     def _show_window(self):
         self.show()

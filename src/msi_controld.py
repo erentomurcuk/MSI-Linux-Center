@@ -638,10 +638,20 @@ class CpuFreq:
     """The `scaling_max_freq` of every policy, as one knob.
 
     Each policy file read back after the write, because that is the
-    house rule for every hardware write; the kernel clamps out-of-range
-    values itself, so a "read back differs" here means cpufreq is not
-    loaded rather than silent hardware refusal.
+    house rule for every hardware write.  One footnote from real
+    hardware: Intel cpufreq (intel_pstate + HWP on an i7-10875H) applies
+    a new limit *asynchronously*: `write(2)` returns before the sysfs
+    attribute reflects the value, so an immediate read-back sees the
+    previous cap and reports a refusal for a write that did stick.  The
+    read-back is therefore a short poll with a deadline, not one shot;
+    a genuine refusal still surfaces, it just has to outlast the wait.
     """
+
+    # Generous next to the observed few-millisecond application time, so a
+    # busy machine (16 policies hammered during a load spike) is not
+    # declared broken; 80 ms per policy, 1.6 s for the whole set worst-case.
+    APPLY_WAIT_S = 0.08
+    APPLY_POLL_S = 0.002
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -684,7 +694,15 @@ class CpuFreq:
                 with open(self._path(pol, "scaling_max_freq"), "w",
                           encoding="utf-8") as fh:
                     fh.write(f"{wanted}\n")
-                got = core.read_khz(self._path(pol, "scaling_max_freq"))
+                # Poll rather than read once: the kernel applies the new
+                # limit after write(2) returns (see the class docstring).
+                got = None
+                deadline = time.monotonic() + self.APPLY_WAIT_S
+                while True:
+                    got = core.read_khz(self._path(pol, "scaling_max_freq"))
+                    if got == wanted or time.monotonic() >= deadline:
+                        break
+                    time.sleep(self.APPLY_POLL_S)
                 if got != wanted:
                     stops.append(f"core {pol}: read back "
                                  f"{core.khz_to_ghz(got)} GHz")

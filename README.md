@@ -285,7 +285,9 @@ machine's heat without opening anything. Settings can switch that copy to a
 flat white or flat black shield to match a light or a dark panel, or turn the
 reading off altogether. The tray also carries a menu with the everyday
 switches on it: show the window, jump straight to a performance mode, Cooler
-Boost, and one of the three charge limits, all through the same validated
+Boost, one of the three charge limits, and the Frequency page's four quick
+slots under a CPU frequency cap submenu (plus a Full speed action), all
+through the same validated
 daemon writes as the window, so a laptop that is doing fine never has to be
 opened to change one of them. The Performance section also carries the graphics
 switch, for the same reason MSI Center puts it there, and the panel overdrive
