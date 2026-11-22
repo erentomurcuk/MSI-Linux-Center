@@ -14,6 +14,137 @@ it was made; the runbook convention is documented in `CONTRIBUTING.md`.
 
 ---
 
+## 2026-11-22 (check-up) - the undervolt backend was blind on real kernels; display overdrive proven
+
+### Fixed
+- **Undervolting was unavailable on every real machine.** `_msr_files()`
+  accepted a path with `os.path.isfile()`, and `/dev/cpu/*/msr` is a
+  *character device*, for which `isfile()` is False: the daemon reported
+  "no MSR devices (/dev/cpu/*/msr)" on hardware that had a healthy
+  OC mailbox, the page rendered as unavailable, and every undervolt write
+  path was dead air. The offline suite could not catch it (fixture msr
+  nodes are regular files); it surfaced in the check-up's live pass.
+  Accepted nodes are now counted with `os.path.exists()`, and a regression
+  test fakes the real shape with a FIFO.
+- **An unopenable MSR node could sink the whole status payload.**
+  `os.open` failures in the mailbox read/write path (permissions, or ENXIO
+  once a driver is gone again) are backend facts now: `status()` degrades
+  the undervolt block to "unavailable" and the CLI names the reason,
+  instead of the old unhandled `OSError` that failed the entire status
+  command ("internal error: Permission denied"). Found by the same
+  regression window: the suite's real-daemon process runs unprivileged.
+
+### Changed
+- **Display overdrive is proven on `16V1EMS1.118` and ships enabled.**
+  Prior art: the same-generation GP76 10UG toggles its panel overdrive
+  with EC `0x2e` bit 4, confirmed by that machine's owner writing the bit
+  under Linux (Blur Busters thread 8627); this byte already carries this
+  model's webcam bit 1 and MUX bit 6. The write-back test on this own
+  machine (2026-11-22, through the daemon's validated one-bit RMW):
+  the firmware accepted and read back both directions, the neighbour
+  bits and every other model-owned register stayed byte-identical, and
+  the original state (overdrive ON, `0x5b`) was restored. `msi-control
+  overdrive`, the Performance page's toggle and the status readout are
+  live on this laptop; visual confirmation of the panel's response-time
+  change remains a human check.
+- The check-up's regression count: 194 offline tests (the MSR-blindness
+  FIFO test and the shipped-model overdrive claim joined).
+- `Card`'s docstring still described the pre-restyle caption (the
+  caller's own case); it now describes the uppercase tracked caption
+  the code draws.
+
+---
+
+## 2026-11-22 (later) - rare-style refresh, quiet copy, start-with-session
+
+### Added
+- **Start with the session, optionally in the tray.** Settings carries a
+  Startup card. "Start with the session" writes the standard XDG autostart
+  entry for this user (`~/.config/autostart/msi-control.desktop`); "Start in
+  the tray" adds `--hidden` to its Exec line, and a hidden start opens no
+  window: the tray icon is the way in. A machine without a system tray shows
+  the window anyway, because a tray-less hidden start is an unreachable app,
+  and a second launch of an already-running copy hands over without raising
+  its window when the launch was `--hidden` (the running copy is doing what
+  the session asked of it). The desktop file is the whole truth about how
+  the session will start: nothing is mirrored in QSettings where the two
+  could drift apart, the boxes rewrite it the moment they are clicked, and
+  `check_autostart` asserts the file rather than the checkboxes.
+
+### Changed
+- **rareui-style refresh of the surfaces, within the same token set.** Card
+  edges are one step stronger than hairline (the structure now comes from
+  the visible edge rather than colour contrast alone), the selected nav
+  row wears the accent tint every other selection wears, card captions
+  are tracked uppercase micro-labels, and buttons carry accent press and
+  focus rings. Every colour pair still clears the WCAG AA checks the smoke
+  suite measures, in both themes and for every accent preset.
+- **The copy stopped explaining itself.** The hint paragraph is gone from
+  every card that carried one (Performance, Cooler Boost, the MUX block,
+  re-apply/factory, the self-test, tray ink, sections, the dashboard's
+  system card, the fan editor, battery, slots); tool tips carry the
+  reasons a control needs where one is needed (e.g. what each shift mode
+  trades), and the one warning that earns its keep stays: the MUX card's
+  one-paragraph note, because a reboot-backed firmware switch is the one
+  control where pretending it is as safe as a fan mode is the worse lie.
+  The undervolting page's BIOS notice is a single sentence naming the
+  three BIOS switches it depends on.
+- The shipped `desktop/msi-control.desktop` carried its Comment across two
+  lines, which is invalid in the format and earned a parse warning from
+  the desktop on every login; it is one line now, and `Categories` drops
+  its second main category ("System"), which desktop-file-validate
+  flagged as a possible double listing in the menu.
+
+---
+
+## 2026-11-22 - undervolt writes that never landed, one GUI per user, tray-quiet polling
+
+### Fixed
+- **The GUI and the CLI sent the daemon an `undervolt` verb it never
+  had.** The Undervolting page (Apply, and the startup set re-apply on the
+  first status) and `msi-control undervolt set --yes` all sent
+  `"action": "set"`, while the daemon answers `show`, `apply` and `reset`
+  and refuses anything else. With the config gate shut, both sides hit the
+  gate first and the wording hid the difference; with `AllowUndervolt` on,
+  every real write came back `unknown undervolt action 'set'`, the page
+  said "failed" and no offset ever reached the MSR. The clients now speak
+  `apply` (the CLI subcommand keeps its user-facing `set` name, and the
+  page's hint text with it), and a new offline test serves the gate-open
+  service and drives the exact command line end to end, because exercising
+  the write only through the gate-off path is how the mismatch survived.
+- **Apply on the Undervolting page crashed before the confirmation
+  dialog.** The dialog's message iterated `core.UV_PLANES` with a single
+  loop variable, so the plane name was a `(name, index)` tuple and
+  `vals[("core", 0)]` raised `KeyError` on every Apply click: the dialog
+  never opened, nothing was written, and because the click was
+  dialog-gated the smoke suite had never pressed it. It does now, with
+  the dialog auto-answered, and it pins the exact socket payload, which is
+  exactly how this one came to light.
+- **The GUI could be started twice.** The daemon refuses a second
+  listener; the window never checked anything, and a copy hidden in the
+  tray does not look like a copy at all: each extra instance polled the
+  same daemon on its own 1.5 s beat, painted a second tray icon,
+  re-applied the startup undervolt set and argued over the same saved
+  window state. A second launch now probes a per-UID `QLocalServer` name
+  before any window is built (`InstanceGuard`): the running copy is asked
+  to show its window and the new process exits 0, so clicking the menu
+  entry with the app already running focuses it. A socket file left by a
+  crashed copy is removed only after the probe finds nobody listening.
+  `check_single_instance` pins the handover and the stale-lock recovery.
+
+### Changed
+- **Hidden to the tray, the app polls the hardware ten times slower.**
+  One `status` is a full read-back: ~31 EC-byte transfers, ~160 OC-mailbox
+  MSR operations (five planes times every logical CPU), ~50 sysfs reads,
+  and a fresh thread per request, every 1.5 s, forever, only to keep a
+  tray badge fresh. The poll now runs at `POLL_MS_HIDDEN` (10 s) while the
+  window is hidden and returns to `POLL_MS` when it is shown, plus one
+  immediate poll on reopening so the window is never a stale reading.
+  Nothing changes while a window is on screen. Two new smoke checks pin
+  both sides of the show/hide state machine.
+
+---
+
 ## 2026-11-15 (night) - frequency cap fixed on real intel_pstate, frequency slots in the tray
 
 ### Fixed

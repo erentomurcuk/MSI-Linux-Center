@@ -58,6 +58,7 @@ flatten the big readouts back to body size.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import queue
@@ -92,6 +93,8 @@ _add_lib_path()
 
 from PySide6.QtCore import (QObject, QPointF, QRectF, QSettings, QSize, Qt,
                             QTimer, Signal)
+# QLocalServer/QLocalSocket live in Qt Network, not Core, since Qt 5.
+from PySide6.QtNetwork import QLocalServer, QLocalSocket          # noqa: E402
 from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QKeySequence,
                            QLinearGradient, QPainter, QPainterPath, QPalette,
                            QPen, QPixmap, QShortcut)
@@ -106,6 +109,11 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame,
 import msi_control as core                                     # noqa: E402
 
 POLL_MS = 1500
+# Tray-only cadence.  One status is a full hardware read-back: about thirty
+# EC-byte transfers plus the OC-mailbox round trip on every logical CPU,
+# which is fine every 1.5 s while a window is on screen, and pure idle cost
+# once the window is hidden and only the tray icon still shows a number.
+POLL_MS_HIDDEN = 10000
 
 # --------------------------------------------------------------------------
 # Temperature palette: the SEMANTIC colours.  They are status, not chrome,
@@ -135,10 +143,10 @@ def temp_color(temp):
 # --------------------------------------------------------------------------
 
 SPACE = 8             # one spacing unit; margins and gaps are multiples of it
-R_CARD = 20           # cards and dialogs
+R_CARD = 16           # cards and dialogs: component-rounded, not slab-round
 R_BTN = 18            # buttons are full pills: half of the 36 px control rung
 R_CTRL = 10           # inputs, list rows
-R_INNER = 14          # an inset panel inside a card (the curve plot)
+R_INNER = 12          # an inset panel inside a card (the curve plot)
 PAGE_PAD = 24         # a page's outer margin, left and right
 PAGE_PAD_V = 20      # ... and top / bottom
 PAGE_GAP = 16         # the gap between a page's cards
@@ -171,17 +179,22 @@ TYPE_CAPTION = 11     # card captions, chips, the connection pill
 TYPE_MICRO = 10       # axis labels, the sidebar shortcut hint
 
 
-def ui_font(px: int, *, bold: bool = False, italic: bool = False) -> QFont:
+def ui_font(px: int, *, bold: bool = False, italic: bool = False,
+             caps: bool = False) -> QFont:
     """One helper for every explicitly-sized label.
 
     Sizes are pixels, never points.  The GUI used to mix `setPointSize` and
     `setPixelSize`, so the same nominal "big" number rendered at two different
-    heights depending on which widget happened to draw it.
+    heights depending on which widget happened to draw it.  `caps` adds the
+    small tracking that makes an uppercase caption read as a designed label
+    rather than shouted body text.
     """
     f = QFont()
     f.setPixelSize(px)
     f.setBold(bold)
     f.setItalic(italic)
+    if caps:
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.1)
     return f
 
 
@@ -258,16 +271,16 @@ def muted_color(widget) -> str:
 # Theme: one token set per theme, one stylesheet, so nothing drifts.
 # --------------------------------------------------------------------------
 
-# The surface language is deliberately quiet: one background, one card
-# colour, one fill for nested controls, with only a hairline between them.
-# A tab of cards is read as a set of surfaces floating on the background
-# (the slab-of-glass look of a settings window on a modern desktop), so the
-# separation has to come from the colours themselves rather than from
-# borders the eye trips over.
+# The surface language: layered neutrals with a *visible* card edge, the
+# component-library look rather than the borderless slab it replaced.  The
+# borders are what carry the structure here, so they are tuned one step
+# stronger than "hairline": a card reads as a card at a glance and at a
+# laptop-screen angle, and the accent is reserved for selection, not for
+# panel outlines.
 _DARK = {
     "name": "dark",
     "bg": "#0a0a0c", "surface": "#151518", "surface2": "#1d1d21",
-    "surface3": "#26262b", "border": "#232328", "border_strong": "#333339",
+    "surface3": "#26262b", "border": "#2a2a31", "border_strong": "#3f3f47",
     "text": "#f5f5f7", "text_dim": "#c7c7cc", "muted": "#8e8e95",
     "accent": "#e2231a", "accent_hover": "#ff4a3d",
 }
@@ -275,7 +288,7 @@ _DARK = {
 _LIGHT = {
     "name": "light",
     "bg": "#f5f5f7", "surface": "#ffffff", "surface2": "#f2f2f7",
-    "surface3": "#e8e8ed", "border": "#ececf1", "border_strong": "#d6d6de",
+    "surface3": "#e8e8ed", "border": "#e4e4eb", "border_strong": "#cfcfd8",
     "text": "#1d1d1f", "text_dim": "#48484d", "muted": "#86868b",
     "accent": "#c8102e", "accent_hover": "#a30d25",
 }
@@ -397,7 +410,7 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 #Header { background: %(bg)s; }
 #Sidebar { background: %(bg)s; }
 
-#Card { background: %(surface)s; border: 1px solid %(border)s;
+#Card { background: %(surface)s; border: 1px solid %(border_strong)s;
         border-radius: %(r_card)s; }
 #CardTitle { color: %(muted)s; }
 
@@ -423,7 +436,7 @@ QPushButton {
     border-radius: %(r_btn)s; padding: %(pad_ctrl_v)s 14px; color: %(text)s;
 }
 QPushButton:hover { background: %(surface3)s; border-color: %(muted)s; }
-QPushButton:pressed { background: %(border)s; }
+QPushButton:pressed { background: %(border)s; border-color: %(accent)s; }
 QPushButton:focus { border-color: %(accent)s; }
 QPushButton:disabled { color: %(muted)s; background: %(surface2)s;
                        border-color: %(border)s; }
@@ -443,6 +456,8 @@ QPushButton[choice="true"]:checked {
 }
 QPushButton[choice="true"]:checked:hover { background: %(accent_hover)s;
     border-color: %(accent_hover)s; }
+QPushButton[choice="true"]:checked:pressed { background: %(accent_hover)s;
+    border-color: %(on_accent)s; }
 QPushButton[primary="true"] { background: %(accent)s; border-color: %(accent)s;
                               color: %(on_accent)s; font-weight: bold; }
 QPushButton[primary="true"]:hover { background: %(accent_hover)s;
@@ -461,10 +476,11 @@ QPushButton[ghost="true"]:hover { background: %(surface3)s; color: %(text)s; }
 QPushButton[ghost="true"]:pressed { background: %(border)s; }
 
 /* Nav rows: rounded pills on the shared background.  The current section
-   reads from a neutral fill plus the accent-tinted icon, not from a
-   coloured bar: the red stays what it means everywhere else (an interactive
-   value), and the section chrome stays quiet.  Same vertical padding as a
-   button, so a nav row and a page control are the same height. */
+   carries the same accent tint every other selection in the app wears:
+   the sidebar is the app's primary selector, and the row that reads
+   "you are here" is exactly what accent-underlined selection was made
+   for.  Same vertical padding as a button, so a nav row and a page
+   control are the same height. */
 #Sidebar QPushButton[nav="true"] {
     background: transparent; border: 1px solid transparent;
     border-radius: %(r_ctrl)s;
@@ -473,7 +489,10 @@ QPushButton[ghost="true"]:pressed { background: %(border)s; }
 #Sidebar QPushButton[nav="true"]:hover { background: %(surface3)s;
                                          color: %(text)s; }
 #Sidebar QPushButton[nav="true"]:checked {
-    background: %(surface3)s; color: %(text)s; font-weight: 600;
+    background: %(accent_soft)s; color: %(accent_ink)s; font-weight: 600;
+}
+#Sidebar QPushButton[nav="true"]:checked:hover {
+    background: %(accent_soft)s; color: %(accent_ink)s;
 }
 
 /* --------------------------------------------------------------- readouts */
@@ -1063,6 +1082,133 @@ class Client(QObject):
 
 
 # --------------------------------------------------------------------------
+# single instance
+# --------------------------------------------------------------------------
+
+def autostart_dir() -> str:
+    """The user's XDG autostart directory (honours XDG_CONFIG_HOME)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "autostart")
+
+
+def autostart_path() -> str:
+    return os.path.join(autostart_dir(), "msi-control.desktop")
+
+
+# The Exec line carries the --hidden choice, so the file the desktop reads
+# is the whole truth about how the app will start; nothing is duplicated in
+# QSettings where the two could drift apart.
+AUTOSTART_ENTRY = """[Desktop Entry]
+Type=Application
+Name=MSI Linux Control
+Exec=msi-control-gui{args}
+Icon=msi-control
+Terminal=false
+X-GNOME-Autostart-enabled=true
+"""
+
+
+def autostart_write(hidden: bool) -> None:
+    os.makedirs(autostart_dir(), exist_ok=True)
+    entry = AUTOSTART_ENTRY.format(args=" --hidden" if hidden else "")
+    tmp = autostart_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(entry)
+    os.replace(tmp, autostart_path())
+
+
+def autostart_state() -> tuple:
+    """(enabled, hidden) as the desktop will read them, from the file."""
+    try:
+        with open(autostart_path(), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return False, False
+    return True, "--hidden" in text
+
+
+def autostart_disable() -> None:
+    try:
+        os.unlink(autostart_path())
+    except FileNotFoundError:
+        pass
+
+
+# The existence channel of the rendezvous: a probe that connects here is
+# asking "is a copy running?" without asking it to show anything (the
+# autostart launch with --hidden).  Connection *identity* is the whole
+# message, so nothing has to survive a disconnect-and-delete race.
+QUIET_CHANNEL = "-quiet"
+
+
+class InstanceGuard(QObject):
+    """One GUI per user: a second launch shows the first window and exits.
+
+    A second copy is not harmless.  It polls the same daemon on the same
+    beat (a full EC and OC-mailbox read per tick), paints a second tray
+    icon and re-applies the startup undervolt set, so the check runs
+    before a window is built.  QLocalServer is the rendezvous, named with
+    the UID so two desktop users get two legitimate sessions rather than
+    a false collision.  A copy that answers is asked to show its window;
+    the new process exits 0, because "the icon I clicked focused the copy
+    that was already running" is the correct outcome of a second launch.
+
+    There are two channels, because there are two questions: `name` means
+    "show yourself", `name` + QUIET_CHANNEL means "only checking, do not
+    disturb" (the autostart copy).  The connection itself is the message:
+    parsing bytes instead would race the disconnect, whose teardown can
+    eat a readyRead that has not been served yet.
+    """
+
+    showRequested = Signal()
+
+    def __init__(self, name: str, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self.server = QLocalServer(self)          # the "show" channel
+        self.quiet = QLocalServer(self)           # the "is anyone there" one
+        # A stale socket file from a crashed copy would refuse listen()
+        # forever; the probe in claim() already established that nobody
+        # answers, so whatever the names hold can only be a leftover.
+        for path, srv in ((name, self.server),
+                          (name + QUIET_CHANNEL, self.quiet)):
+            QLocalServer.removeServer(path)
+            srv.listen(path)
+        self.claimed = self.server.isListening() and self.quiet.isListening()
+        self.server.newConnection.connect(self._accept_show)
+        self.quiet.newConnection.connect(lambda: self._drain(self.quiet))
+
+    @classmethod
+    def claim(cls, name: str | None = None, show_request: bool = True):
+        """Take the per-user slot, or return None after contacting its owner.
+
+        show_request=False is the autostart launch with --hidden: the copy
+        that answers is doing exactly what the user asked of it (running in
+        the tray), and asking it to show a window would be the one thing
+        the user did not ask for.
+        """
+        base = name or f"msi-control-gui-{os.getuid()}"
+        probe = QLocalSocket()
+        probe.connectToServer(
+            base if show_request else base + QUIET_CHANNEL)
+        if probe.waitForConnected(250):
+            probe.disconnectFromServer()
+            return None
+        return cls(base)
+
+    def _accept_show(self):
+        # Drain the accepted queue so the channel can never stall on
+        # maxPendingConnections sockets nobody collected.
+        self._drain(self.server)
+        self.showRequested.emit()
+
+    @staticmethod
+    def _drain(server: QLocalServer):
+        while server.hasPendingConnections():
+            server.nextPendingConnection().deleteLater()
+
+
+# --------------------------------------------------------------------------
 # small building blocks
 # --------------------------------------------------------------------------
 
@@ -1085,9 +1231,9 @@ class Card(QFrame):
     A plain QFrame + a small bold caption rather than a QGroupBox: the
     groupbox title is drawn by the style at a size and colour we cannot
     control, which is what made the old tabs read as unstyled.  The caption
-    keeps the caller's own case: lowercase words set in small bold read as
-    a quiet label, and uppercase words would shout against a surface this
-    plain."""
+    is uppercased and tracked (see ui_font's caps), whatever the caller
+    passed: the micro-label look is a property of the card, not of the
+    texts its pages happen to carry."""
     def __init__(self, title: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("Card")
@@ -1096,9 +1242,9 @@ class Card(QFrame):
         self.box.setSpacing(SPACE + 2)
         self.header = QHBoxLayout()
         self.header.setSpacing(SPACE)
-        self.title = QLabel(title)
+        self.title = QLabel(title.upper() if title else title)
         self.title.setObjectName("CardTitle")
-        self.title.setFont(ui_font(TYPE_CAPTION, bold=True))
+        self.title.setFont(ui_font(TYPE_CAPTION, bold=True, caps=True))
         self.header.addWidget(self.title)
         self.header.addStretch(1)
         if title:
@@ -1610,9 +1756,6 @@ class DashboardTab(QWidget):
             row, v = kv_row(key, self.syscard, selectable=True)
             self.syscard.box.addLayout(row)
             self.sys_rows[key] = v
-        self.syscard.box.addWidget(hint_label(
-            "Read from the daemon's own status, not from sysfs: this window "
-            "never opens the hardware directly.", self.syscard))
         lay.addWidget(self.syscard)
         lay.addStretch(1)
 
@@ -1741,10 +1884,6 @@ class PerformanceTab(QWidget):
         lay = page_layout(self)
 
         card = Card("Performance mode (shift)")
-        self.note = hint_label(
-            "MSI's shift modes trade sustained performance against heat and "
-            "fan noise.  Changes reach the EC immediately.", card)
-        card.box.addWidget(self.note)
         self.btns = QButtonGroup(self)
         self.btns.setExclusive(True)
         row = QHBoxLayout()
@@ -1752,6 +1891,12 @@ class PerformanceTab(QWidget):
         self.buttons = {}
         for name in ("eco", "comfort", "sport", "turbo"):
             b = QPushButton(name.capitalize())
+            b.setToolTip({
+                "eco": "Silent and cool",
+                "comfort": "Everyday",
+                "sport": "Sustained load",
+                "turbo": "Maximum, and loud",
+            }[name])
             b.setCheckable(True)
             mark_checked(b)
             b.clicked.connect(lambda _=False, n=name: self.win.set_key("shift", n))
@@ -1759,9 +1904,6 @@ class PerformanceTab(QWidget):
             self.buttons[name] = b
             row.addWidget(b)
         card.box.addLayout(row)
-        card.box.addWidget(hint_label(
-            "eco · quiet and cool; comfort · everyday; sport · sustained "
-            "load; turbo · maximum (loud)", card))
         lay.addWidget(card)
 
         boost = Card("Cooling")
@@ -1773,24 +1915,15 @@ class PerformanceTab(QWidget):
         self.boost_btn.setProperty("hero", True)
         self.boost_btn.setFont(ui_font(TYPE_H2, bold=True))
         self.boost_btn.setCursor(Qt.PointingHandCursor)
+        self.boost_btn.setToolTip("Both fans at full speed, until you turn it off")
         self.boost_btn.clicked.connect(self._boost)
         boost.box.addWidget(self.boost_btn)
-        boost.box.addWidget(hint_label(
-            "Forced maximum cooling, e.g. right after a gaming session.  "
-            "It stays on until you turn it off (or the daemon re-applies "
-            "your saved state at boot).  The duty registers do not move under "
-            "Cooler Boost; watch the RPM beside them.", boost))
         lay.addWidget(boost)
 
         # ---- graphics mode (MUX) -----------------------------------------
         # Same place MSI Center puts "Graphics Switch", and the same trade:
         # discrete is faster and hybrid is cooler and longer-running.
         gfx = Card("Graphics mode (MUX)")
-        gfx.box.addWidget(hint_label(
-            "Which GPU drives the built-in display.  A switch is written to "
-            "the embedded controller and to a UEFI variable, and takes effect "
-            "at the next reboot; this session is unaffected.", gfx))
-
         self.gfx_rows = {}
         for label in ("running now", "at next boot"):
             row, v = kv_row(label, gfx)
@@ -1819,17 +1952,18 @@ class PerformanceTab(QWidget):
         self.gfx_warn.setWordWrap(True)
         self.gfx_warn.setVisible(False)
         gfx.box.addWidget(self.gfx_warn)
-        gfx.box.addWidget(hint_label(
-            "⚠ A switch rewrites the UEFI variable "
-            f"{core.MUX_VAR_NAME}; on firmware with its three-mode marker "
-            "set it writes byte 5, arms EC 0xd1 and waits for the firmware "
-            "to acknowledge.  Other firmware also gets the legacy bytes: "
-            "EC 0x2e bit 6 and the request in variable byte 1.  The switch "
-            "is off unless “AllowMuxSwitch” is set in the config, it always "
-            "needs a reboot, and on a laptop whose MUX was never reverse "
-            "engineered it can leave the machine with no display; recovery "
-            "would then mean resetting the firmware.  The previous value is "
-            "backed up first.", gfx))
+        # The one paragraph that earns its keep: a switch is a reboot-backed,
+        # firmware-level act on a register only reverse engineering has
+        # proven, and pretending it is as safe as a fan mode is the worse
+        # lie.  Everything else about the page explains itself.
+        self.gfx_note = QLabel(
+            f"Applies at the next reboot; this session is unaffected.  Off "
+            f"unless \"AllowMuxSwitch\" is set; on firmware the MUX was "
+            f"never proven for, it can leave the machine without a display.  "
+            f"The previous value is backed up first.")
+        self.gfx_note.setWordWrap(True)
+        self.gfx_note.setStyleSheet(notice_style(COL_WARM))
+        gfx.box.addWidget(self.gfx_note)
         lay.addWidget(gfx)
 
         # ---- display overdrive --------------------------------------------
@@ -1839,13 +1973,6 @@ class PerformanceTab(QWidget):
         # state), so it appears only when a model file proves the bit and
         # toggles instantly; there is no reboot wait like the MUX has.
         panel = Card("Panel")
-        panel.box.addWidget(hint_label(
-            "Display overdrive drives the panel's pixels harder for faster "
-            "transitions.  Without it a fast panel shows motion ghosting; "
-            "with it, an overshoot can add inverse-ghosting artefacts "
-            "instead, so it is a taste-and-panel setting: Dragon Center's "
-            "own toggle, written to one EC bit the model file names.",
-            panel))
         prow = QHBoxLayout()
         prow.setSpacing(SPACE)
         row, self.od_val = kv_row("display overdrive", panel)
@@ -1983,11 +2110,11 @@ class PerformanceTab(QWidget):
             note = "the daemon is offline, so nothing can be written"
             style = notice_style(muted_color(self))
         elif discrete_banned:
-            note = ("⚠ the variable says this firmware does not offer "
-                    "discrete mode; hybrid remains available")
+            note = ("this firmware does not offer discrete mode; hybrid "
+                    "remains available")
             style = notice_style(COL_WARM, COL_WARM)
         elif pending:
-            note = "⚠ a reboot is required for the requested mode to apply"
+            note = "a reboot is required for the requested mode to apply"
             style = notice_style(COL_HOT, COL_HOT)
         else:
             note = ""
@@ -2117,7 +2244,8 @@ class CpuFreqTab(QWidget):
         row.setSpacing(SPACE)
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setProperty("primary", True)
-        self.apply_btn.setToolTip("Write the chosen maximum to every core")
+        self.apply_btn.setToolTip(
+            "Write the chosen maximum to every core; it resets at reboot")
         self.apply_btn.clicked.connect(self._apply)
         self.revert_btn = QPushButton("Revert")
         self.revert_btn.setToolTip("Discard the pending change")
@@ -2133,20 +2261,9 @@ class CpuFreqTab(QWidget):
         self.pending_label.setVisible(False)
         card.box.addWidget(self.pending_label)
 
-        card.box.addWidget(hint_label(
-            "Caps how fast every core may run, on top of the shift mode.  "
-            "Lower it when plugged into a hot charger or on battery to "
-            "trade peak speed for a lot of heat and noise.  It resets at "
-            "reboot and never touches the EC: this is the kernel's own "
-            "cpufreq, written by the daemon.", card))
         lay.addWidget(card)
 
         slots = Card("Quick slots")
-        slots.box.addWidget(hint_label(
-            "Four set-and-forget ceilings, like the setfreq scripts this "
-            "replaces.  Click a value to select it (still needs Apply to "
-            "write); Store keeps the slider's current choice there.",
-            slots))
         self.slot_btns = {}
         self.slot_store_btns = {}
         self.slot_clear_btns = {}
@@ -2175,13 +2292,6 @@ class CpuFreqTab(QWidget):
             self.slot_store_btns[i] = store
             self.slot_clear_btns[i] = clear
         slots.box.addLayout(grid)
-        slots.box.addWidget(hint_label(
-            "The slots live in this desktop's own settings, not the "
-            "daemon's config; they are your shortcuts, not machine state. "
-            "Clicking a stored slot applies it immediately, the way the "
-            "hand-written scripts it replaces did, and Store fills the "
-            "empty one of your choice with the slider's current value.",
-            slots))
         lay.addWidget(slots)
         lay.addStretch(1)
         self._sync_slots()
@@ -2379,14 +2489,11 @@ class UndervoltTab(QWidget):
         self.notice.setWordWrap(True)
         self.notice.setStyleSheet(notice_style(COL_WARM, COL_WARM))
         self._base_notice = (
-            "⚠ Lowering the CPU's voltage makes it run cooler at the same "
-            "speed, but too deep an offset freezes the machine.  Your BIOS "
-            "must unlock it first: in the Advanced / OC menu disable "
+            "Needs a BIOS unlock: in the Advanced / OC menu, disable "
             "Overclocking Lock, CFG Lock and Undervolt Protection, or the "
-            "CPU silently ignores every offset.  The offsets are volatile: "
-            "a reboot or suspend clears them, which is the built-in "
-            "recovery.  Start shallow (about -50 mV) and step down while "
-            "the machine is under load.")
+            "CPU ignores every offset.  Offsets clear at reboot and "
+            "suspend; a too-deep one freezes the machine, so start shallow "
+            "(about -50 mV).")
         self.notice.setText(self._base_notice)
         lay.addWidget(self.notice)
 
@@ -2433,10 +2540,6 @@ class UndervoltTab(QWidget):
         self.pending_label.setWordWrap(True)
         self.pending_label.setFont(ui_font(TYPE_BODY, bold=True))
         card.box.addWidget(self.pending_label)
-        card.box.addWidget(hint_label(
-            "Offsets hold until reboot or suspend.  Most users only need "
-            "core and cache; watch a stress run's temperature as you step "
-            "down, and back off at the first crash or freeze.", card))
         lay.addWidget(card)
 
         start = Card("Apply at app start")
@@ -2456,12 +2559,6 @@ class UndervoltTab(QWidget):
         row.addWidget(self.startup_del)
         row.addStretch(1)
         start.box.addLayout(row)
-        start.box.addWidget(hint_label(
-            "The startup set applies when this app starts, not at boot: "
-            "the values are never written to any firmware, so an offset "
-            "that turns out unstable cannot survive a reboot and surprise "
-            "you before the app is even open.  This is the one deliberate "
-            "persistence, and removing the set removes it.", start))
         lay.addWidget(start)
         lay.addStretch(1)
         self._sync_startup()
@@ -2523,7 +2620,7 @@ class UndervoltTab(QWidget):
         answer = QMessageBox.warning(
             self, "Apply voltage offsets",
             "Write these offsets to the CPU?\n\n"
-            + "  ".join(f"{p} {vals[p]} mV\n" for p in core.UV_PLANES
+            + "  ".join(f"{p} {vals[p]} mV\n" for p, _idx in core.UV_PLANES
                          if vals[p]).lstrip().rstrip()
             + "\n\nA too-deep offset freezes the machine *now*; recovery "
             "is a reboot (the CPU clears these at restart).  If the BIOS "
@@ -2532,7 +2629,11 @@ class UndervoltTab(QWidget):
             "Apply?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer == QMessageBox.Yes:
-            self.win.send({"cmd": "undervolt", "action": "set",
+            # "apply", never "set": the daemon's protocol is
+            # show/apply/reset, and a verb it does not know is refused
+            # (the `msi-control undervolt set` subcommand is a CLI-only
+            # name; on the socket it maps to this verb too).
+            self.win.send({"cmd": "undervolt", "action": "apply",
                            "values": vals}, tag="undervolt")
 
     def _reset(self):
@@ -2659,13 +2760,6 @@ class FansTab(QWidget):
         row.addSpacing(SPACE)
         row.addWidget(self.mode_now, 0)
         mode.box.addLayout(row)
-        mode.box.addWidget(hint_label(
-            "EC fan modes.  “advanced” lets the fan follow the custom curve "
-            "below; “silent” caps the speed; “auto” is the firmware default.  "
-            + ("The curve editor is live: drag a point and Apply writes it."
-               if self.curve_ok else
-               "The curve below needs a model definition for this laptop."),
-            mode))
         lay.addWidget(mode)
 
         self.canvases = {}
@@ -2734,7 +2828,7 @@ class FansTab(QWidget):
             reset_btn.setToolTip("Load the original firmware curve into the "
                                  "editor (nothing is written until you Apply)")
             reset_btn.clicked.connect(lambda _=False, w=which: self._load_ghost(w))
-            pending = QLabel("● unsaved changes")
+            pending = QLabel("unsaved changes")
             pending.setVisible(False)
             pending.setFont(ui_font(TYPE_CAPTION, bold=True))
             pending.setStyleSheet(f"color:{COL_HOT}")
@@ -2993,7 +3087,9 @@ class BatteryTab(QWidget):
         # a real state: disabled when there is nothing to apply.
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setProperty("primary", True)
-        self.apply_btn.setToolTip("Write the selected limit to the battery")
+        self.apply_btn.setToolTip(
+            "Write the selected limit to the battery; charging resumes "
+            "about 10% below it")
         self.apply_btn.clicked.connect(self._apply)
         self.revert_btn = QPushButton("Revert")
         self.revert_btn.setToolTip("Discard the pending change")
@@ -3019,11 +3115,6 @@ class BatteryTab(QWidget):
         card.box.addLayout(row)
         card.box.addWidget(self.pending_label)
         card.box.addWidget(self.detail)
-        card.box.addWidget(hint_label(
-            "Charging stops at the limit and resumes when the battery dips "
-            "about 10% below it; keeping a laptop at 60-80% is the single "
-            "biggest thing you can do for long-term battery health.  "
-            "Choose a value, then press Apply.", card))
         lay.addWidget(card)
 
         info = Card("Battery")
@@ -3170,14 +3261,12 @@ class ProfilesTab(QWidget):
         self.listw = QListWidget()
         self.listw.setMinimumHeight(240)
         self.listw.itemDoubleClicked.connect(lambda _i: self._apply())
+        self.listw.setToolTip("Double-click applies a profile")
         left.box.addWidget(self.listw, 1)
         self.apply_btn = QPushButton("Apply selected")
         self.apply_btn.setProperty("primary", True)
         self.apply_btn.clicked.connect(self._apply)
         left.box.addWidget(self.apply_btn)
-        left.box.addWidget(hint_label(
-            "Double-click a profile to apply it.  “factory” restores exactly "
-            "what this laptop shipped with.", left))
         lay.addWidget(left, 1)
 
         right = Card("Save / delete")
@@ -3188,6 +3277,10 @@ class ProfilesTab(QWidget):
         right.box.addWidget(self.name)
         b1 = QPushButton("Save current settings as…")
         b1.setProperty("primary", True)
+        b1.setToolTip(
+            "A profile stores modes, boost, both curves and, when set, "
+            "the frequency cap and voltage offsets.  Only \"battery\" "
+            "touches the charge limit.")
         b1.clicked.connect(self._save)
         b2 = QPushButton("Delete selected")
         b2.setProperty("danger", True)
@@ -3200,19 +3293,10 @@ class ProfilesTab(QWidget):
         # above them that reads as a layout bug.
         right.box.addWidget(b1)
         right.box.addWidget(b2)
-        right.box.addStretch(1)
-        right.box.addWidget(hint_label(
-            "A profile stores performance mode, fan mode, cooler boost, "
-            "both fan curves and, when they are set, the CPU frequency "
-            "cap and your voltage offsets.  “factory” is captured from "
-            "the EC on first start; apply it to return to exactly what the "
-            "laptop shipped with.\n\n"
-            "Applying one does not touch your charge limit; that is a "
-            "battery choice, not a performance one.  Only the “battery” "
-            "profile sets it (to 60%).", right))
         # Top-aligned so the card is only as tall as its contents: letting it
         # stretch to match the (tall) profile list left a large void under the
         # two buttons that reads as a broken layout.
+        right.box.addStretch(1)
         lay.addWidget(right, 1, Qt.AlignTop)
         self._names: list = []
 
@@ -3325,11 +3409,6 @@ class SettingsTab(QWidget):
         row.addWidget(self.factory_btn)
         row.addStretch(1)
         card.box.addLayout(row)
-        card.box.addWidget(hint_label(
-            "“Re-apply” pushes your persisted settings back into the EC; "
-            "useful after a suspend, when firmware sometimes resets it.  "
-            "“Capture factory” snapshots the current EC state as the "
-            "“factory” profile, once.", card))
         lay.addWidget(card)
 
         st_card = Card("Hardware self-test")
@@ -3357,15 +3436,6 @@ class SettingsTab(QWidget):
         self.selftest_out.setMinimumHeight(140)
         st_card.box.addWidget(self.selftest_out)
         self._selftest_markdown = ""
-        st_card.box.addWidget(hint_label(
-            "The same reversible round-trips verify.sh performs: every "
-            "shift and fan mode walked, Cooler Boost lit briefly, the "
-            "charge threshold written twice, the fan curve and the "
-            "frequency cap re-written where they already are.  Each is "
-            "verified by reading it back, everything it found is "
-            "restored, and the paste-ready report names exactly what "
-            "passed.  Run it on a machine you are watching, not under "
-            "load.", st_card))
         lay.addWidget(st_card)
 
         tray = Card("Tray icon")
@@ -3384,6 +3454,11 @@ class SettingsTab(QWidget):
                            ("black", "Black")):
             b = QPushButton(label)
             b.setCheckable(True)
+            b.setToolTip({
+                "colour": "Tint the shield by the temperature band",
+                "white": "Draw the reading in white",
+                "black": "Draw the reading in black",
+            }[key])
             mark_checked(b)
             b.clicked.connect(lambda _=False, k=key: self._tray_changed(k))
             self.tray_modes.addButton(b)
@@ -3396,10 +3471,6 @@ class SettingsTab(QWidget):
             "nowhere to appear.  The choice is remembered anyway.", tray)
         self.tray_note.setVisible(False)
         tray.box.addWidget(self.tray_note)
-        tray.box.addWidget(hint_label(
-            "Colour tints the shield by the temperature band, so how hot the "
-            "laptop is shows at a glance.  White and Black draw a flat "
-            "monochrome shield for matching a light or a dark panel.", tray))
         lay.addWidget(tray)
 
         sections = Card("Sections")
@@ -3417,12 +3488,24 @@ class SettingsTab(QWidget):
         self.sec_uv.toggled.connect(
             lambda on: win.set_section_visible("undervolt", on))
         sections.box.addWidget(self.sec_uv)
-        sections.box.addWidget(hint_label(
-            "Two pages tune the Intel CPU rather than the MSI EC, so they "
-            "are yours to hide: off removes the page from the sidebar until "
-            "it is turned back on here.  The choice is remembered per "
-            "desktop, like the tray icon's.", sections))
         lay.addWidget(sections)
+
+        start = Card("Startup")
+        self.start_boot = QCheckBox("Start with the session")
+        self.start_boot.setToolTip(
+            "The standard XDG autostart entry for this user "
+            "(~/.config/autostart/msi-control.desktop)")
+        self.start_boot.toggled.connect(self._startup_toggled)
+        start.box.addWidget(self.start_boot)
+        self.start_hidden = QCheckBox("Start in the tray")
+        self.start_hidden.setToolTip(
+            "The app starts with no window; the tray icon opens it.  "
+            "Without a system tray the window opens as usual.")
+        self.start_hidden.toggled.connect(self._startup_toggled)
+        start.box.addWidget(self.start_hidden)
+        # Before the first poll lands, so the boxes are not briefly wrong.
+        self._sync_startup_controls()
+        lay.addWidget(start)
 
         acc = Card("Accent colour")
         row = QHBoxLayout()
@@ -3444,21 +3527,18 @@ class SettingsTab(QWidget):
             row.addWidget(b)
         row.addStretch(1)
         acc.box.addLayout(row)
-        acc.box.addWidget(hint_label(
-            "The accent colours your selection: the checked chip and row, "
-            "the sliders, the curve you own.  The shield mark stays MSI "
-            "red, because the mark is the brand rather than a setting.  "
-            "A per-desktop choice, like the tray icon's.", acc))
         lay.addWidget(acc)
 
         cfg = Card("Config")
         self.cfg_text = QPlainTextEdit()
         self.cfg_text.setReadOnly(True)
         self.cfg_text.setFont(mono_font(TYPE_BODY))
+        # The path is how you find the file to edit; a tooltip keeps the
+        # card to the dump itself, one piece of information per element.
+        self.cfg_text.setToolTip(
+            f"{core.config_path()}; edit it by hand, the daemon re-reads it "
+            "at start-up")
         cfg.box.addWidget(self.cfg_text)
-        cfg.box.addWidget(hint_label(
-            f"{core.config_path()}: edit by hand, the daemon re-reads it at "
-            "start-up.", cfg))
         lay.addWidget(cfg)
 
         raw = Card("Raw EC console")
@@ -3482,7 +3562,10 @@ class SettingsTab(QWidget):
         self.raw_read.setToolTip("Read the byte at the address above")
         self.raw_read.clicked.connect(lambda: self._raw(None))
         self.raw_write = QPushButton("Write")
-        self.raw_write.setToolTip("Write the value into the address above")
+        self.raw_write.setToolTip(
+            "Write the value into the address above.  Unvalidated EC "
+            "access: one wrong byte can crash the machine.  Off unless "
+            "AllowRaw is set")
         self.raw_write.clicked.connect(lambda: self._raw(True))
         row.addWidget(self.raw_addr)
         row.addWidget(self.raw_val)
@@ -3494,10 +3577,6 @@ class SettingsTab(QWidget):
         self.raw_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.raw_out.setFont(mono_font(TYPE_BODY))
         raw.box.addWidget(self.raw_out)
-        raw.box.addWidget(hint_label(
-            "Unvalidated EC access.  One wrong byte here can crash the "
-            "embedded controller and the machine with it, which is why it "
-            "is off unless AllowRaw is set in the config.", raw))
         lay.addWidget(raw)
         lay.addStretch(1)
 
@@ -3601,6 +3680,32 @@ class SettingsTab(QWidget):
             b.setEnabled(avail and show)
         self.tray_note.setVisible(not avail)
 
+    def _startup_toggled(self, _on=False):
+        # The file is written here, the moment the box is clicked; the
+        # desktop reads that file, so it never diverges from what the
+        # user just chose.  If the write fails, the sync that follows
+        # reverts the box: a checkbox cannot silently claim something
+        # the session will not do.
+        if self.start_boot.isChecked():
+            autostart_write(self.start_hidden.isChecked())
+        else:
+            autostart_disable()
+        self._sync_startup_controls()
+
+    def _sync_startup_controls(self):
+        """Mirror the autostart file into the two checkboxes.
+
+        Blocked for the same reason as the tray sync: these are the very
+        controls that write that file, and the poll calls this every
+        1.5 s.
+        """
+        enabled, hidden = autostart_state()
+        with QSignalBlockerSafe(self.start_boot):
+            self.start_boot.setChecked(enabled)
+        with QSignalBlockerSafe(self.start_hidden):
+            self.start_hidden.setChecked(enabled and hidden)
+        self.start_hidden.setEnabled(enabled)
+
     def refresh(self, st: dict):
         drv = st.get("driver", {})
         model = st.get("model") or core.MODEL.summary()
@@ -3630,6 +3735,7 @@ class SettingsTab(QWidget):
             f"{core.MODEL_SCHEMA}")
         cfg = st.get("config") or {}
         self.cfg_text.setPlainText(json.dumps(cfg, indent=2, sort_keys=True))
+        self._sync_startup_controls()
         # Re-apply and capture-factory are daemon writes; disable them with
         # the daemon, same as every other writer in the app.
         online = bool(self.win.online)
@@ -3766,7 +3872,7 @@ class Header(QWidget):
             label, colour, tip = ("daemon offline", COL_CRIT,
                                  "The daemon is not reachable; the app is "
                                  "read-only")
-        self.pill.setText(f"●  {label}")
+        self.pill.setText(label)
         self.pill.setStyleSheet(
             f"color:{text_on(colour)};background:{colour};"
             f"border-radius:{R_PILL}px;padding:4px 11px;")
@@ -3855,11 +3961,7 @@ class Sidebar(QWidget):
         lay.setContentsMargins(SPACE + 4, SPACE * 2, SPACE + 4, SPACE * 2)
         lay.setSpacing(3)
         self.buttons = []
-        self.hint = QLabel("")
-        self.hint.setFont(ui_font(TYPE_MICRO))
-        self.hint.setStyleSheet(f"color:{muted_color(self)}")
         self._stretch = lay.addStretch(1)
-        lay.addWidget(self.hint)
 
     def set_entries(self, entries) -> None:
         """Build one button per (label, glyph, stack index)."""
@@ -3883,8 +3985,6 @@ class Sidebar(QWidget):
                               self.win.tabs.setCurrentIndex(n))
             lay.insertWidget(lay.indexOf(self._stretch), b)
             self.buttons.append(b)
-        self.hint.setText(f"Ctrl+1…{len(self._entries)}  sections\n"
-                          "Ctrl+R  refresh\nCtrl+Q  quit")
 
     def sync(self, index: int):
         for i, b in enumerate(self.buttons):
@@ -4255,7 +4355,7 @@ class MainWindow(QMainWindow):
             self._uv_startup_done = True
             vals = self.uv.startup_values()
             if vals:
-                self.send({"cmd": "undervolt", "action": "set",
+                self.send({"cmd": "undervolt", "action": "apply",
                            "values": vals}, tag="undervolt")
 
     @staticmethod
@@ -4451,6 +4551,10 @@ class MainWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
+        # A window that was hidden on the slow cadence must not open on a
+        # reading up to POLL_MS_HIDDEN old; this is one submit, and the
+        # _pending_status guard turns a double submit into one.
+        self.poll_status()
 
     def _save_window_state(self):
         """Remember where the window was and which section was open."""
@@ -4479,6 +4583,22 @@ class MainWindow(QMainWindow):
             else:
                 self._show_window()
 
+    def showEvent(self, ev):
+        # Full cadence only with a window on screen; a shown window is the
+        # one place the 1.5 s tick buys anything visible.
+        self.poll.setInterval(POLL_MS)
+        super().showEvent(ev)
+
+    def hideEvent(self, ev):
+        # Hidden to the tray, the app is a temperature badge in the corner:
+        # one coarse readout, not a live editor.  One status is a full
+        # hardware read-back (about thirty EC transfers plus the OC mailbox
+        # on every logical CPU), so while hidden it runs an order of
+        # magnitude slower, and _show_window fires one immediately so the
+        # window that reappears never shows a stale reading.
+        self.poll.setInterval(POLL_MS_HIDDEN)
+        super().hideEvent(ev)
+
     def closeEvent(self, ev):
         if self.tray and self.tray.isVisible():
             self.hide()
@@ -4492,15 +4612,51 @@ class MainWindow(QMainWindow):
         super().closeEvent(ev)
 
 
-def main() -> int:
+def parse_args(argv=None):
+    """Parse only what this GUI owns; the Qt flags stay Qt's."""
+    ap = argparse.ArgumentParser(
+        prog="msi-control-gui", description="MSI Linux Control")
+    ap.add_argument("--hidden", action="store_true",
+                    help="start in the tray: no window until the tray icon "
+                         "is clicked.  With no system tray available the "
+                         "window shows anyway: a hidden start must never "
+                         "leave the app unreachable.")
+    return ap.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
     app = QApplication(sys.argv)
     app.setApplicationName("msi-control")
     # The accent is a per-user chrome choice, so it lives in QSettings with
     # the geometry and is read before the first stylesheet is built.
     qs = QSettings("msi-control", "msi-control")
     apply_theme(app, accent=qs.value("style/accent", ACCENT_DEFAULT))
+
+    # One copy per user before anything is built: a copy that already runs
+    # is asked to show and this launch ends quietly (see InstanceGuard for
+    # why running two is not a harmless convenience).  The autostart copy
+    # asks its owner nothing: the one that is running is doing what the
+    # session was set up to do.
+    guard = InstanceGuard.claim(show_request=not args.hidden)
+    if guard is None:
+        return 0
+    if not guard.claimed:
+        # A control centre that cannot start because of a wedged /tmp is
+        # worse than an unguarded second copy, so say it and carry on.
+        print("msi-control-gui: single-instance socket not claimed; "
+              "running unguarded", file=sys.stderr)
+
     win = MainWindow()
-    win.show()
+    if args.hidden and win.tray:
+        # The tray is how the user reaches the app, so starting there is
+        # not losing it.  The poll cadence is set here explicitly because
+        # a window that was never shown never got a hideEvent.
+        win.hide()
+        win.poll.setInterval(POLL_MS_HIDDEN)
+    else:
+        win.show()
+    guard.showRequested.connect(win._show_window)
 
     # Clean Ctrl-C exit: a plain default handler would raise inside the Qt
     # event loop, so ask the window to close and quit the loop instead.

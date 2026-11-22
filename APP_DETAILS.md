@@ -596,11 +596,40 @@ stylesheet can interpolate.
   `addTab`/`count`/`currentIndex`/`tabText` surface so the smoke test and the
   geometry/tab persistence were untouched by the move away from `QTabWidget`.
 
-`POLL_MS = 1500`. `mark_checked()` gives every mode button (shift, fan,
-graphics) the same unmistakable selected state: the accent fills the button
-and the label goes bold, because Breeze's checked state is a few percent off
-the unchecked one and these are read at a glance from a laptop screen at an
-angle.
+`POLL_MS = 1500` while a window is on screen and `POLL_MS_HIDDEN = 10000`
+once it is hidden to the tray (each is re-armed in `showEvent`/`hideEvent`,
+and `_show_window()` fires one immediate poll so a reopened window is never
+showing a stale reading). The slower hidden cadence is deliberate: one
+status is a full hardware read-back (~31 EC-byte transfers, ~160 OC-mailbox
+MSR operations with five planes across every logical CPU, ~50 sysfs reads),
+which is exactly what a window on screen wants every 1.5 s, and far too much
+for keeping a tray badge fresh (measured on the 10875H dev machine, one
+status is ~40 ms end to end, mostly serialized EC and mailbox time, plus a
+thread per request). `mark_checked()` gives every mode button
+(shift, fan, graphics) the same unmistakable selected state: the accent fills
+the button and the label goes bold, because Breeze's checked state is a few
+percent off the unchecked one and these are read at a glance from a laptop
+screen at an angle.
+
+`InstanceGuard` (wired up in `main()`, before any window is built) is the
+one-copy-per-user rule: a `QLocalServer` named with the UID is the
+rendezvous, a second launch probes it, asks the running copy to show its
+window and exits 0. A socket file left by a crashed copy is removed only
+after the probe found nobody listening, so a live one is never unplugged,
+and the guard hands over in `main()` so a rejected launch never even
+constructs a `MainWindow`. A `--hidden` launch (see below) hands over
+without the show request.
+
+The Startup card in Settings is the same feature's session half. The
+autostart helpers (`autostart_write`, `autostart_disable`,
+`autostart_state`) manage `~/.config/autostart/msi-control.desktop`, with
+`XDG_CONFIG_HOME` honoured so the smoke suite's scratch directory keeps the
+tests off the real one; the file's Exec line, not a QSettings shadow,
+carries the `--hidden` choice, so the desktop and the checkboxes cannot
+drift apart. `parse_args` owns `--hidden`, and `main()` starts hidden only
+when a tray exists (a tray-less hidden start is an unreachable app), at
+`POLL_MS_HIDDEN` because a window that was never shown never received a
+`hideEvent`.
 
 The status bar carries the daemon readout **permanently**, on the right:
 `msi-controld · fw 16V1EMS1.118`, or, when the daemon is down, a red
@@ -648,7 +677,7 @@ value is a decision, not a draft.
 
 ## 9. Tests
 
-**`tests/test_msi_control.py`: 173 tests, offline, unprivileged, ~9 s.**
+**`tests/test_msi_control.py`: 194 tests, offline, unprivileged, ~9 s.**
 
 Runs the *real* daemon (Service + Unix socket server + protocol), the real
 validation and the real CLI as a subprocess, against a fake sysfs tree

@@ -84,7 +84,7 @@ src/msi-control-gui     PySide6 GUI, eight sections
 models/<id>/model.json  one laptop model: THE file you add for a new laptop
 models/README.md        the model-file format, field by field
 models/<id>/README.md   optional: notes on how that model's registers were found
-tests/test_msi_control.py  offline suite: fake sysfs + RAM-backed EC + fake MSR, 173 tests
+tests/test_msi_control.py  offline suite: fake sysfs + RAM-backed EC + fake MSR, 194 tests
 tests/gui_smoke.py         headless GUI build + behaviour + screenshots
 tests/shots/               committed screenshots: dark, light/ beside it
 tools/                  hardware probes (need root) + fixup/recapture helpers
@@ -108,7 +108,7 @@ DKMS build needs no network. Its device strings, identifiers and file names are
 There is no build step. To run a test you need nothing but Python 3.10+:
 
 ```bash
-python3 tests/test_msi_control.py                       # 173 tests, no root, ~9 s
+python3 tests/test_msi_control.py                       # 194 tests, no root, ~9 s
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py    # GUI, needs PySide6
 make check        # compile + the offline suite + the GUI smoke test
 make shots        # regenerate tests/shots/          (dark)
@@ -123,7 +123,7 @@ it. Everything release-shaped lands in `dist/`, which is gitignored: a
 built artifact must never be committed, because the version is defined by
 the source and an artifact is only its echo.
 
-**Run `make check` after every change.** 173 tests, offline: the suite builds a fake
+**Run `make check` after every change.** 194 tests, offline: the suite builds a fake
 sysfs tree (cpufreq policies included), a RAM-backed EC and a fake OC mailbox,
 and runs the *real* daemon over the *real*
 socket, so protocol, validation, profiles and the CLI are exercised

@@ -2,11 +2,10 @@
 Type=Application
 Name=MSI Linux Control
 GenericName=Laptop Control Center
-Comment=Fan curves, performance modes and battery charge limit for MSI
- laptops running Linux
+Comment=Fan curves, performance modes and battery charge limit for MSI laptops running Linux
 Exec=msi-control-gui
 Icon=msi-control
 Terminal=false
-Categories=Settings;System;HardwareSettings;
+Categories=Settings;HardwareSettings;
 Keywords=MSI;laptop;notebook;fan;curve;battery;charge;EC;performance;shift;Linux;
 StartupNotify=true

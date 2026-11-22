@@ -1831,14 +1831,33 @@ class TestRegistry(unittest.TestCase):
 
     def test_the_mux_addresses_live_in_core_not_in_a_model(self):
         # Every model that enables "mux" drives the same trio, so the
-        # addresses must be shared rather than copied into each model file.
+        # addresses must be shared rather than copied into each model
+        # file.  0x2e is a byte this model also carries legitimately for a
+        # different feature (overdrive bit 4, proven per-model), so the
+        # guard is structural: no mux register block, and 0x2e appears
+        # once, as exactly the overdrive address.
         for name in ("MUX_EC_ADDR", "MUX_TRIGGER_ADDR", "MUX_EC_MASK"):
             self.assertTrue(hasattr(core, name), name)
         path = os.path.join(REPO, "models", "gs66-stealth-10se", "model.json")
         with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-        for name in ("MUX_EC_ADDR", "MUX_TRIGGER_ADDR", "\"0x2e\""):
-            self.assertNotIn(name, text)
+            data = json.load(fh)
+        self.assertNotIn("mux", data["ec"])
+        self.assertNotIn("0xd1", json.dumps(data["ec"]))
+        found = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+            elif node == "0x2e":
+                found.append(node)
+
+        walk(data["ec"])
+        self.assertEqual(found, ["0x2e"])
+        self.assertEqual(data["ec"]["overdrive"]["address"], "0x2e")
 
 
 class TestModelSelection(unittest.TestCase):
@@ -2252,6 +2271,20 @@ class TestUndervolt(DaemonTest):
         with self.assertRaises(msi_controld.BackendError):
             self.apply({"core": -80})
 
+    def test_a_device_node_counts_as_an_msr(self):
+        # The bug this pins: _msr_files() used os.path.isfile(), and a real
+        # /dev/cpu/N/msr is a character device, for which isfile() is
+        # False.  Every fixture msr in this suite is a plain file, so the
+        # suite was structurally blind to it: real machines reported
+        # "no MSR devices" with a healthy OC mailbox underneath.  A FIFO is
+        # the unprivileged stand-in for "a node that is not a regular
+        # file"; tearDown restores MSI_CPU_DEV along with the other vars.
+        root = os.path.join(self.tmp, "devcpu-node")
+        os.makedirs(os.path.join(root, "cpu0"), exist_ok=True)
+        os.mkfifo(os.path.join(root, "cpu0", "msr"))
+        os.environ["MSI_CPU_DEV"] = root
+        self.assertTrue(msi_controld.Undervolt().available())
+
     def test_cli_shows_offsets_and_requires_yes_to_write(self):
         show = self.run_cli("undervolt", "show")
         self.assertIn("Voltage offsets", show.stdout)
@@ -2265,17 +2298,29 @@ class TestUndervolt(DaemonTest):
                             expect_rc=1)
         self.assertIn("AllowUndervolt", proc.stdout + proc.stderr)
 
+    def test_cli_set_applies_when_the_gate_is_open(self):
+        # The bug this pins: the CLI used to speak action "set" while the
+        # daemon only answers "apply", so every undervolt write failed with
+        # "unknown undervolt action" the moment AllowUndervolt went on.  The
+        # gate-shut test above could never see it, because the gate's error
+        # fires first; only a served, gate-open write end to end can.
+        self.server.service = self.svc
+        self.addCleanup(setattr, self.server, "service", self.service)
+        proc = self.run_cli("undervolt", "set", "core=-80", "--yes")
+        self.assertIn("applied", proc.stdout)
+        self.assertIn("-80 mV", proc.stdout)
+        self.assertEqual(self.planes()["core"], -80)
+
 
 class TestOverdrive(DaemonTest):
     """The panel overdrive toggle: one model-proven EC bit, a one-bit RMW."""
 
-    def enable_overdrive(self, **extra) -> core.Model:
-        """Run the rest of the test as if the shipped model proved bit 4."""
+    def _model_variant(self, **extra) -> core.Model:
+        """The shipped model with optional overdrive-spec overrides."""
         with open(os.path.join(REPO, "models", "gs66-stealth-10se",
                                "model.json"), encoding="utf-8") as fh:
             data = json.load(fh)
-        data["features"]["display_overdrive"] = True
-        spec = {"address": "0x2e", "bit": 4}
+        spec = dict(data["ec"].get("overdrive") or {})
         spec.update(extra)
         data["ec"]["overdrive"] = spec
         model = core.Model(data)
@@ -2286,7 +2331,37 @@ class TestOverdrive(DaemonTest):
             self.addCleanup(p.stop)
         return model
 
+    def _without_overdrive(self) -> core.Model:
+        """The negative space: a model that proves no overdrive register.
+
+        The shipped model claims the bit (that is what the write-back test
+        earned), so the refusal paths need a variant with the flag off,
+        exactly the way fan_curve's tests build a curve-less model."""
+        with open(os.path.join(REPO, "models", "gs66-stealth-10se",
+                               "model.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["features"]["display_overdrive"] = False
+        data["ec"].pop("overdrive", None)
+        model = core.Model(data)
+        for p in (mock.patch.object(core, "MODEL", model),
+                  mock.patch.object(core, "OVERDRIVE_REGS",
+                                    dict(model.overdrive_regs)
+                                    if model.overdrive_regs else {})):
+            p.start()
+            self.addCleanup(p.stop)
+        return model
+
+    def test_the_shipped_model_proves_the_register(self):
+        # The provenance lives in the model file, so the claim has to be
+        # read there, not re-derived here: this pins the file that ships.
+        model = self._model_variant()
+        self.assertTrue(model.feature("display_overdrive"))
+        self.assertEqual(model.overdrive_regs,
+                         {"address": 0x2e, "bit": 4,
+                          "on": None, "off": None})
+
     def test_without_a_proven_register_nothing_is_claimed(self):
+        self._without_overdrive()
         st = self.call({"cmd": "status"})
         self.assertEqual(st["overdrive"], {"supported": False, "on": None})
         out = self.call({"cmd": "overdrive"})
@@ -2300,7 +2375,7 @@ class TestOverdrive(DaemonTest):
         self.assertIn("no proven", proc.stdout + proc.stderr)
 
     def test_show_reads_the_model_bit(self):
-        self.enable_overdrive()
+        self._model_variant()
         self.ec.mem[core.MUX_EC_ADDR] = 0x40 | 0x10
         st = self.call({"cmd": "status"})
         self.assertEqual(st["overdrive"], {"supported": True, "on": True})
@@ -2310,7 +2385,7 @@ class TestOverdrive(DaemonTest):
     def test_the_toggle_is_a_one_bit_rmw_over_its_neighbours(self):
         # 0x2e bit 1 is the webcam and bit 6 the MUX state; bit 4 must move
         # without touching either.  This is the rule from AGENTS.md, proven.
-        self.enable_overdrive()
+        self._model_variant()
         self.ec.mem[core.MUX_EC_ADDR] = 0x42            # webcam on, OD off
         out = self.call({"cmd": "overdrive", "action": "set", "on": True})
         self.assertEqual((out["was"], out["now"]), (0, 1))
@@ -2322,7 +2397,7 @@ class TestOverdrive(DaemonTest):
     def test_byte_override_values_from_the_model_win(self):
         # A firmware whose EC rewrites the whole byte gets exact on/off
         # values from the model file instead of bit twiddling.
-        self.enable_overdrive(off="0x02", on="0x52")
+        self._model_variant(off="0x02", on="0x52")
         self.ec.mem[core.MUX_EC_ADDR] = 0x40
         self.call({"cmd": "overdrive", "action": "set", "on": True})
         self.assertEqual(self.ec.mem[core.MUX_EC_ADDR], 0x52)
@@ -2336,6 +2411,7 @@ class TestOverdrive(DaemonTest):
         data["features"]["display_overdrive"] = True
         # but no ec.overdrive block: a model cannot claim the register it
         # never identified, exactly like fan_curve and rpm
+        data["ec"].pop("overdrive", None)
         with self.assertRaises(core.ModelError) as ctx:
             core.Model(data)
         self.assertIn("ec.overdrive", str(ctx.exception))

@@ -811,6 +811,40 @@ def check_undervolt_page(win) -> None:
     # twice-set means once-applied (a poll storm would re-write the MSR).
     assert win._uv_startup_done
 
+    # Apply must speak the daemon's verb.  The shipped bug: the page sent
+    # action "set" where the daemon only answers "apply", so every Apply
+    # came back "unknown undervolt action 'set'" the moment the config gate
+    # opened - a dialog-gated button, which is why it is exercised here
+    # with the dialog said-yes, and not by reading the source.
+    real_box = gui.QMessageBox
+
+    class _YesBox(real_box):
+        # both question() and warning() are overridden: _apply confirms with
+        # warning() and _reset with question(), and either one left real
+        # opens a modal dialog that a headless run can never answer.
+        @staticmethod
+        def question(*_a, **_k):
+            return gui.QMessageBox.Yes
+
+        @staticmethod
+        def warning(*_a, **_k):
+            return gui.QMessageBox.Yes
+
+    sent = []
+    orig_send = win.send
+    win.send = lambda cmd, tag=None: sent.append((cmd, tag))
+    gui.QMessageBox = _YesBox
+    try:
+        u.planes["core"].setValue(-100)
+        u._apply()
+    finally:
+        gui.QMessageBox = real_box
+        win.send = orig_send
+        u.planes["core"].setValue(-80)
+    assert sent and sent[-1][0]["cmd"] == "undervolt" \
+        and sent[-1][0]["action"] == "apply", sent
+    assert sent[-1][0]["values"]["core"] == -100, sent[-1][0]["values"]
+
     # Diving past the clamp is refused as a value, not as a frozen spin.
     try:
         u.planes["core"].setValue(-500)
@@ -1191,11 +1225,135 @@ def check_tray_options(app) -> None:
     again = gui.MainWindow()
     again.poll.stop()
     try:
-        assert again.tray_temp is True, "the tray toggle did not persist"
+        assert again.tray_temp is True, "tray toggle did not persist (second)"
         assert again.tray_colour == "colour", again.tray_colour
     finally:
         again.close()
         app.processEvents()
+
+
+def _pump(app, ms: int = 60) -> None:
+    """Run real event-loop slices until the socket notifiers have fired.
+
+    QCoreApplication.processEvents drains posted events only; socket
+    activation needs an actual loop pass, and on the offscreen platform
+    nothing else ever turns the local-socket notifiers.  Without this the
+    hand-over below would depend on whichever later waitFor* happened to
+    run, which is exactly the timing hole the two-channel design closes.
+    """
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop(app)
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+
+def check_single_instance(app) -> None:
+    """A second launch must hand over to the first, and a stale lock must
+    not outlive it.  The unguarded behaviour this pins out: two copies
+    each polling the daemon on the same beat, two tray icons, and two
+    owners of the same QSettings file.
+    """
+    name = f"msi-control-gui-smoke-{os.getpid()}"
+
+    def fresh_claim():
+        guard = gui.InstanceGuard.claim(name)
+        assert guard is not None, "first claim on a free name was refused"
+        assert guard.claimed, "the guard is listening but not claimed"
+        return guard
+
+    def release(guard):
+        guard.server.close()
+        guard.quiet.close()
+        for suffix in ("", gui.QUIET_CHANNEL):
+            gui.QLocalServer.removeServer(name + suffix)
+
+    guard = fresh_claim()
+    shown = []
+    guard.showRequested.connect(lambda: shown.append(True))
+    # The second copy: must stand down (claim -> None) and the running one
+    # must be asked to show itself.
+    assert gui.InstanceGuard.claim(name) is None, \
+        "a second claim must hand over to the first"
+    _pump(app)
+    assert shown == [True], "the running copy was never asked to show"
+
+    # The autostart's --hidden launch stands down the same way, but on the
+    # quiet channel: raising the window would be the one thing the session
+    # was not set up to do.
+    assert gui.InstanceGuard.claim(name, show_request=False) is None, \
+        "a hidden second claim must still hand over"
+    _pump(app)
+    assert shown == [True], "a hidden claim raised the window"
+    release(guard)
+
+    # A crashed copy leaves the socket files behind; the next claim must
+    # still work, which is why claim() probes with a connect first.
+    again = fresh_claim()
+    release(again)
+
+
+def check_autostart(app) -> None:
+    """The Settings startup box writes exactly what the desktop will read.
+
+    The .desktop file is the whole truth (the --hidden choice lives in its
+    Exec line), so the check asserts the file, not just the checkboxes,
+    and that the sync reads an external edit back the same way a poll would.
+    """
+    assert gui.parse_args([]).hidden is False
+    assert gui.parse_args(["--hidden"]).hidden is True
+
+    path = gui.autostart_path()
+    w = gui.MainWindow()
+    w.poll.stop()
+    try:
+        assert not os.path.exists(path), "no entry must exist at rest"
+        set_boot, set_hidden = w.settings.start_boot, w.settings.start_hidden
+        assert not set_boot.isChecked() and not set_hidden.isChecked()
+        assert not set_hidden.isEnabled(), \
+            "the tray box must wait for its parent"
+
+        set_boot.setChecked(True)          # fires the write
+        assert os.path.exists(path), "toggling boot installed no entry"
+        text = open(path, encoding="utf-8").read()
+        assert "Exec=msi-control-gui\n" in text, text
+        assert gui.autostart_state() == (True, False)
+        assert set_hidden.isEnabled()
+
+        set_hidden.setChecked(True)
+        assert "Exec=msi-control-gui --hidden" in \
+            open(path, encoding="utf-8").read()
+        assert gui.autostart_state() == (True, True)
+
+        # An edit from outside (or this very file, at the next boot) must
+        # be reflected by the per-poll sync, not just at construction.
+        gui.autostart_write(False)
+        w.settings._sync_startup_controls()
+        assert not set_hidden.isChecked(), "sync kept a stale tray choice"
+
+        set_boot.setChecked(False)
+        assert not os.path.exists(path), "unchecking left the entry in place"
+        assert gui.autostart_state() == (False, False)
+        assert not set_hidden.isEnabled()
+    finally:
+        gui.autostart_disable()            # never leave a file behind
+        w.close()
+        app.processEvents()
+
+
+def check_hidden_poll_backoff(app, win) -> None:
+    """Hidden to the tray means slower polling; showing means full speed.
+
+    One status is a full EC read-back plus the OC mailbox on every logical
+    CPU, so a hidden window keeping the visible cadence is pure idle cost:
+    this pins both sides of the state machine.
+    """
+    win.show()
+    assert win.poll.interval() == gui.POLL_MS, win.poll.interval()
+    win.hide()
+    assert win.poll.interval() == gui.POLL_MS_HIDDEN, win.poll.interval()
+    win.show()
+    assert win.poll.interval() == gui.POLL_MS, win.poll.interval()
 
 
 def check_action_messages(win) -> None:
@@ -1383,6 +1541,12 @@ def main() -> int:
     print("  accent presets: OK")
     check_tray_options(app)
     print("  tray options: OK")
+    check_autostart(app)
+    print("  autostart: OK")
+    check_single_instance(app)
+    print("  single instance: OK")
+    check_hidden_poll_backoff(app, win)
+    print("  hidden poll backoff: OK")
 
     print("GUI smoke: OK")
     win.close()

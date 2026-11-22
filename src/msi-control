@@ -770,7 +770,10 @@ def cmd_undervolt(args):
             + " --yes`\n  once you have read the Undervolting section of "
             "README.md.")
     try:
-        out = core.call({"cmd": "undervolt", "action": "set",
+        # The socket verb is "apply"; the subcommand keeps only its
+        # user-facing "set" name, and speaking a verb the daemon does not
+        # know used to turn every undervolt write into a refusal.
+        out = core.call({"cmd": "undervolt", "action": "apply",
                          "values": values}, timeout=args.timeout)
     except OSError as e:
         die(f"{e}\n{need_daemon_hint()}")

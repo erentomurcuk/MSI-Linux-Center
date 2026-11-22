@@ -27,7 +27,8 @@
       "numerator": 478000,
       "cpu": "0xcc",
       "gpu": "0xca"
-    }
+    },
+    "overdrive": {"address": "0x2e", "bit": 4}
   },
 
   "charge": {"min": 20, "max": 100, "step": 10},
@@ -40,6 +41,7 @@
     "fan_curve": true,
     "rpm": true,
     "mux": true,
+    "display_overdrive": true,
     "webcam": false,
     "webcam_block": false,
     "super_battery": false,
@@ -81,7 +83,8 @@
     "isw (YoyPa/isw) [16V1EMS1] section + its MSI_ADDRESS_DEFAULT profile, which carries a real EC dump from a GS66-10SE",
     "teackot/msi-ec CONF_G1_3, which explicitly lists \"16V1EMS1.118 // GS66 Stealth 10SE\"",
     "in-tree drivers/platform/x86/msi-ec.c charge-control semantics (the start and end thresholds are one EC byte, always 10% apart)",
-    "Tachometer constant RPM = 478000 / period, reproduced verbatim from isw and confirmed on hardware 2026-10-16 (Cooler Boost drives 0xcc from ~3700 to ~8100, the top of this laptop's range)"
+    "Tachometer constant RPM = 478000 / period, reproduced verbatim from isw and confirmed on hardware 2026-10-16 (Cooler Boost drives 0xcc from ~3700 to ~8100, the top of this laptop's range)",
+    "Display overdrive: EC 0x2e bit 4, confirmed on the same-generation GP76 10UG by that machine's owner writing the bit under Linux and watching the panel's overdrive artefacts switch off (Blur Busters forum thread 8627). On this 16V1EMS1 firmware the same byte already carries the webcam bit 1 and the MUX bit 6, both proven; write-back test on this own machine 2026-11-22, see models/gs66-stealth-10se/README.md"
   ],
 
   "notes": "Step function: the fan runs at speeds[0] until the temperature passes temps[0], then speeds[1], and so on, so 6 thresholds and 7 speeds. Cooler Boost does NOT update the duty registers (with boost on, 0x71/0x89 stayed at 70 while the tachometers read ~8100 RPM), so fan_pct is what the curve asks for, not what the fan is doing. 0xc8 is not a third fan: it does not follow the fans under Cooler Boost. The graphics-mode (MUX) addresses are deliberately not in this file because they are not GS66-specific -- the whole model family shares one MUX block in src/msi_control.py, and this model only sets \"mux\": true."

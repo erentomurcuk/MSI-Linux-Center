@@ -339,7 +339,7 @@ tabs, so the window reads as one system at any size:
   read-only; it does not pretend. The firmware in use sits permanently at the
   right of the status bar, which is where it used to be printed as a message
   that the next poll overwrote.
-* **Keyboard first.** `Ctrl+1…6` move between sections, `Ctrl+R` re-reads
+* **Keyboard first.** `Ctrl+1…8` move between sections, `Ctrl+R` re-reads
   everything, `Ctrl+Q` quits. The fan-curve points can be placed and nudged
   entirely from the keyboard.
 * **The tray icon is yours to ink.** It carries the hottest reading on the
@@ -351,6 +351,19 @@ tabs, so the window reads as one system at any size:
 * **Nothing is written until you say so.** The charge slider and the curve
   editor both hold a pending value with Apply/Revert, so a slow drag never
   reprograms the charger and a half-finished curve never reaches the EC.
+* **One copy, quiet in the tray.** Starting the app when it is already
+  running does not start a second copy: the running one is brought forward
+  instead, because two copies would poll the same daemon twice, paint two
+  tray icons and fight over the saved window state. Closing the window
+  hides it to the tray (Quit really quits), and while it is hidden the app
+  slows its hardware polling to a 10 s beat with one immediate re-read when
+  the window comes back: a tray badge does not need second-fresh readings,
+  and each poll is a full read-back across the EC and every CPU's voltage
+  mailbox.
+* **Start with the session if you want it.** Settings / Startup writes the
+  standard XDG autostart entry, and "Start in the tray" makes the session
+  begin with no window at all: the tray icon is the way in, and a machine
+  without a system tray falls back to opening the window.
 * **The fan curve is your setting, so it is drawn in the accent.** Where the
   machine is *now* is a separate marker in its temperature colour, labelled
   with the reading; the curve itself used to be tinted by the live
@@ -615,7 +628,7 @@ src/msi-control        CLI (status · detect · monitor · mode · fan · boost 
 src/msi-control-gui           PySide6 GUI
 models/<id>/model.json one laptop model: the per-model EC map + features
 models/README.md       the model-file format, field by field
-tests/test_msi_control.py     173 offline tests: fake sysfs + RAM-backed EC
+tests/test_msi_control.py     194 offline tests: fake sysfs + RAM-backed EC
 tests/gui_smoke.py     headless GUI construction + behaviour + screenshots
 tests/shots/           committed screenshots: dark, and light/ beside it
 tools/                 hardware probes (need root) + fixup/recapture helpers
@@ -634,7 +647,7 @@ LICENSE                GPL-2.0-or-later (the whole program)
 ### Tests
 
 ```bash
-python3 tests/test_msi_control.py                     # 173 tests, no root, no hardware
+python3 tests/test_msi_control.py                     # 194 tests, no root, no hardware
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py   # needs PySide6
 
 make check                                     # both of the above + a syntax check

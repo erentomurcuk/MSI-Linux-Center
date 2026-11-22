@@ -84,7 +84,7 @@ is the tested route.
 | `fan_curve`, `rpm` | `true` | the registers above; curve write-back verified by `verify.sh` |
 | `mux` | `true` | the shared MUX block; the switch itself is still opt-in (`AllowMuxSwitch`) |
 | `webcam`, `webcam_block`, `super_battery`, `fn_key`, `win_key` | `false` | not present on this config; they read back as absent, so the GUI disables them instead of pretending |
-| `display_overdrive` | `false` | pending: `0x2e` bit 4 is the toggle on a same-generation GP76 (Blur Busters forum), but nobody has watched it move on `16V1EMS1`. Flip it on only after a dump-diff while toggling Dragon Center, or a write-back test on this firmware; until then the app rightly says "no proven register" |
+| `display_overdrive` | `true` | `0x2e` bit 4. Prior art: the same-generation GP76 10UG toggles its panel overdrive with exactly this bit, confirmed by that machine's owner writing it under Linux (Blur Busters thread 8627); this byte already carries this model's webcam bit 1 and MUX bit 6. Proven here by the write-back test on `16V1EMS1.118` (2026-11-22, through the daemon's validated one-bit RMW: bit accepted and read back, both neighbour bits untouched, original state restored). Visual confirmation of the panel's response-time change is still a human check; say so in any review that asks |
 
 ## The built-in profiles
 

@@ -744,7 +744,12 @@ class Undervolt:
             return []
         for n in names:
             path = os.path.join(root, n, "msr")
-            if os.path.isfile(path):
+            # exists, not isfile: on the real kernel /dev/cpu/*/msr is a
+            # *character device*, and os.path.isfile() is False for one,
+            # which made every real machine report "no MSR devices" while
+            # the offline fixtures (regular files) kept passing.  exists()
+            # accepts both shapes.
+            if os.path.exists(path):
                 out.append(path)
         return out
 
@@ -755,7 +760,16 @@ class Undervolt:
     def _wr(path: str, value: int) -> None:
         # A 64-bit little-endian write; pread/pwrite-style seeks keep the
         # per-thread offset independent of what anything else did to the fd.
-        fd = os.open(path, os.O_WRONLY)
+        try:
+            fd = os.open(path, os.O_WRONLY)
+        except OSError as e:
+            # A node that cannot be opened (permissions, or ENXIO once the
+            # driver is gone) is a backend fact, not an internal error:
+            # status degrades the undervolt block to "unavailable" and the
+            # CLI can name it.  Without this, one unopenable node would
+            # sink a whole machine's status payload.
+            raise BackendError(
+                f"cannot open {path}: {e.strerror or e}") from e
         try:
             os.lseek(fd, core.UV_MSR, os.SEEK_SET)
             os.write(fd, value.to_bytes(8, "little"))
@@ -764,7 +778,11 @@ class Undervolt:
 
     @staticmethod
     def _rd(path: str) -> int:
-        fd = os.open(path, os.O_RDONLY)
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError as e:
+            raise BackendError(
+                f"cannot open {path}: {e.strerror or e}") from e
         try:
             os.lseek(fd, core.UV_MSR, os.SEEK_SET)
             return int.from_bytes(os.read(fd, 8), "little")
