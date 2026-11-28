@@ -37,7 +37,7 @@ import socket
 # MAJOR for a change that breaks an installed config or protocol.
 # --------------------------------------------------------------------------
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # --------------------------------------------------------------------------
 # Paths: every one overridable through the environment so the whole stack
@@ -1477,6 +1477,10 @@ def local_status(mux: bool = True) -> dict:
         "battery": _battery_status(bat),
         "graphics": local_graphics() if mux else None,
         "model": MODEL.summary(),
+        # Machine-wide readings (CPU speed, GPU speed, memory) are plain
+        # kernel interfaces, so the daemon-down view carries them too and
+        # the Dashboard loses nothing but the EC-backed numbers.
+        "sys": system_facts(),
         "curve": None,          # needs an EC write (tach/ec_get) → daemon only
         "partial": True,        # tells the UI this view is degraded
     }
@@ -1487,14 +1491,43 @@ def _battery_status(bat: str | None) -> dict | None:
     if not bat:
         return None
     pct = _read_int(os.path.join(bat, "capacity"))
+
+    def attr(name: str) -> int | None:
+        return _read_int(os.path.join(bat, name))
+
+    # Two spellings of the same facts exist: `energy_*` in µWh and
+    # `charge_*` in µAh.  This project's own reference laptop publishes
+    # only the charge_* pair, so a reader that looked at energy_*
+    # alone reported no health at all on real hardware while the test
+    # fixture (energy_*) stayed green.  A wear ratio is unit-independent,
+    # so the front-ends get the first pair that exists as `now`/`full`/
+    # `full_design`, and the raw pairs stay in the payload for consumers
+    # that care which unit their firmware speaks.
+    energy_now = attr("energy_now")
+    energy_full = attr("energy_full")
+    energy_full_design = attr("energy_full_design")
+    charge_now = attr("charge_now")
+    charge_full = attr("charge_full")
+    charge_full_design = attr("charge_full_design")
+
+    def first(*vals) -> int | None:
+        return next((v for v in vals if v is not None), None)
+
     return {
         "name": os.path.basename(bat),
         "present": _read_opt(os.path.join(bat, "present")) not in (None, "0"),
         "status": _read_opt(os.path.join(bat, "status")),
         "pct": pct,
-        "energy_now": _read_int(os.path.join(bat, "energy_now")),
-        "energy_full": _read_int(os.path.join(bat, "energy_full")),
-        "energy_full_design": _read_int(os.path.join(bat, "energy_full_design")),
+        "energy_now": energy_now,
+        "energy_full": energy_full,
+        "energy_full_design": energy_full_design,
+        "charge_now": charge_now,
+        "charge_full": charge_full,
+        "charge_full_design": charge_full_design,
+        "now": first(energy_now, charge_now),
+        "full": first(energy_full, charge_full),
+        "full_design": first(energy_full_design, charge_full_design),
+        "cycle_count": attr("cycle_count"),
         "charge_start": _read_int(os.path.join(bat, "charge_control_start_threshold")),
         "charge_end": _read_int(os.path.join(bat, "charge_control_end_threshold")),
         "ac_online": _ac_online(),
@@ -1802,6 +1835,355 @@ def khz_to_ghz(khz) -> str:
     if khz is None:
         return "?"
     return f"{khz / 1_000_000:.2f}"
+
+
+# --------------------------------------------------------------------------
+# System facts: memory, GPU clock, and the CPU speed it is actually running
+#
+# The dashboard wants more than the EC can say: how fast the CPU runs right
+# now (not just its cap), what the GPU is doing, and how much memory is in
+# use.  All three are plain kernel interfaces, world-readable, so they cost
+# no EC transfer, no privileges and no daemon: the offline view reports the
+# same numbers the daemon does.
+#
+# The honesty rule travels with the rest of the program: a driver that
+# publishes nothing reads as None and the UI says "no reading".  The NVIDIA
+# proprietary driver exposes no clock in sysfs at all, so on the reference
+# laptop the dGPU has no number and the Intel iGPU (i915's gt_act_freq_mhz)
+# is the one that answers.
+# --------------------------------------------------------------------------
+
+def meminfo_path() -> str:
+    """`/proc/meminfo`; MSI_MEMINFO redirects it so the tests can fake it."""
+    return os.environ.get("MSI_MEMINFO", "/proc/meminfo")
+
+
+def read_meminfo(path: str | None = None) -> dict:
+    """The meminfo fields this program cares about, as `{name: KiB}`."""
+    out = {}
+    try:
+        with open(path or meminfo_path(), "r", encoding="utf-8",
+                  errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    try:
+                        out[parts[0][:-1]] = int(parts[1])
+                    except ValueError:
+                        pass
+    except OSError:
+        return {}
+    return out
+
+
+def memory_facts() -> dict | None:
+    """Memory in use, from the kernel's own accounting.
+
+    `MemAvailable`, not `MemFree`: caches and reclaimable slab are "free"
+    to the kernel but not to MemFree, and reporting MemFree would make a
+    healthy machine look starved.  None when meminfo is unreadable.
+    """
+    info = read_meminfo()
+    total, avail = info.get("MemTotal"), info.get("MemAvailable")
+    if not total or avail is None:
+        return None
+    used = max(0, total - avail)
+    return {"total_kib": total, "available_kib": avail, "used_kib": used,
+            "used_pct": round(used * 100.0 / total, 1)}
+
+
+def drm_dir() -> str:
+    return os.path.join(sysfs_root(), "class", "drm")
+
+
+def _drm_cards() -> list:
+    """`(card_dir, device_dir, driver)` for every DRM card, sorted by name.
+
+    `card1-HDMI-A-1` style entries are connectors, not cards, so anything
+    with a dot after the card name is skipped.
+    """
+    root = drm_dir()
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    cards = []
+    for name in names:
+        if not name.startswith("card") or "." in name:
+            continue
+        card_dir = os.path.join(root, name)
+        device_dir = os.path.join(card_dir, "device")
+        if not os.path.isdir(card_dir):
+            continue
+        try:
+            driver = os.path.basename(os.readlink(
+                os.path.join(device_dir, "driver")))
+        except OSError:
+            driver = ""
+        cards.append((card_dir, device_dir, driver))
+    return cards
+
+
+def _gpu_clock_of(card_dir: str, device_dir: str, driver: str) -> tuple:
+    """`(mhz, source_label)` one card publishes, or `(None, label)`.
+
+    i915 carries the two readings on the card directory itself; gt_act is
+    what the GPU runs at and gt_cur is what it was asked for, so the
+    actual one wins.  amdgpu's pp_dpm_sclk lists every level with the
+    current one starred; it is root-readable on some kernels and not on
+    others, which the caller reports as "no reading" rather than an
+    error.  Drivers with no clock attribute at all (nouveau, nvidia) get
+    a label and no number.
+    """
+    if driver == "i915":
+        for attr, what in (("gt_act_freq_mhz", "Intel iGPU, actual"),
+                          ("gt_cur_freq_mhz", "Intel iGPU, requested")):
+            v = _read_int(os.path.join(card_dir, attr))
+            if v is not None:
+                return v, what
+        return None, "Intel iGPU"
+    if driver == "amdgpu":
+        text = _read_opt(os.path.join(device_dir, "pp_dpm_sclk"))
+        if text:
+            for line in text.splitlines():
+                if "*" not in line:
+                    continue
+                m = re.search(r"(\d+)\s*M", line, re.IGNORECASE)
+                if m:
+                    return int(m.group(1)), "AMD GPU"
+        return None, "AMD GPU"
+    return None, driver or None
+
+
+def gpu_clock() -> dict | None:
+    """The most informative GPU clock the kernel publishes, or None.
+
+    A discrete card wins the moment one publishes a clock, because on an
+    MSI laptop it is the chip the user bought; the iGPU is the fallback
+    that at least always answers on a hybrid machine.
+    """
+    igpu = None
+    for card_dir, device_dir, driver in _drm_cards():
+        mhz, label = _gpu_clock_of(card_dir, device_dir, driver)
+        if mhz is None:
+            continue
+        if driver != "i915":
+            return {"mhz": mhz, "source": label}
+        if igpu is None:
+            igpu = {"mhz": mhz, "source": label}
+    return igpu
+
+
+# --------------------------------------------------------------------------
+# The NVIDIA proprietary GPU: NVML, loaded only by the front-ends
+#
+# The proprietary driver publishes no clock anywhere under /sys, so on the
+# most common MSI laptop configuration (Intel + NVIDIA) the one remaining
+# honest source for the dGPU's clock is NVML, the vendor's management
+# library.  ctypes keeps that stdlib-only with no subprocess, but it is
+# still a vendor library, and the daemon's standing rule is that it talks
+# to the kernel and nothing else: so the probe lives in the core for the
+# unprivileged front-ends to call, and the daemon's own status payload
+# stays kernel-only.  A missing library, a missing driver, a locked-down
+# NVML: every failure is "no reading", never an error.
+# --------------------------------------------------------------------------
+
+NVML_LIBS = ("libnvidia-ml.so.1", "libnvidia-ml.so")
+NVML_SUCCESS = 0
+NVML_CLOCK_GRAPHICS = 0          # nvmlClockType_t: the graphics/SM clock
+
+# Module cache for the library handle: None = not looked for yet,
+# False = absent (do not retry a failed dlopen on every 1.5 s poll).
+_nvml_lib = None
+
+
+def _nvml_load():
+    """libnvidia-ml if the driver's userland is installed, else None.
+
+    `MSI_NO_NVML` takes the vendor library out of the picture entirely:
+    a test or a user who wants the kernel's answer only (or a machine
+    where NVML misbehaves) gets "no reading" deterministically instead
+    of a probe whose result depends on the host's GPU stack.
+    """
+    global _nvml_lib
+    if _nvml_lib is not None:
+        return _nvml_lib or None
+    if os.environ.get("MSI_NO_NVML"):
+        _nvml_lib = False
+        return None
+    import ctypes                                   # stdlib, loaded lazily
+    for name in NVML_LIBS:
+        try:
+            _nvml_lib = ctypes.CDLL(name)
+            return _nvml_lib
+        except OSError:
+            continue
+    _nvml_lib = False
+    return None
+
+
+def nvml_gpu_clock() -> dict | None:
+    """The NVIDIA dGPU's clock (and utilization) through NVML, or None.
+
+    Stateless on purpose: init, one device, clock, utilization, shutdown,
+    so a driver reload between polls can never leave a stale handle in
+    this process.  The utilization struct's first field is the GPU busy
+    percentage, which is all this program wants from it.
+    """
+    lib = _nvml_load()
+    if lib is None:
+        return None
+    import ctypes
+
+    class _Util(ctypes.Structure):
+        # nvmlUtilization_t: only `gpu` (the first field) is read, so a
+        # driver that fills fewer fields than the struct declares is
+        # harmless here.
+        _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint),
+                    ("enc", ctypes.c_uint), ("dec", ctypes.c_uint)]
+
+    def ok(rc) -> bool:
+        return rc == NVML_SUCCESS
+
+    try:
+        if not ok(lib.nvmlInit_v2()):
+            return None
+        try:
+            dev = ctypes.c_void_p()
+            handle = getattr(lib, "nvmlDeviceGetHandleByIndex_v2", None)
+            if handle is None or \
+                    not ok(handle(0, ctypes.byref(dev))):
+                return None
+            mhz = ctypes.c_uint()
+            if not ok(lib.nvmlDeviceGetClockInfo(dev, NVML_CLOCK_GRAPHICS,
+                                                ctypes.byref(mhz))):
+                return None
+            out = {"mhz": mhz.value, "source": "NVIDIA GPU (NVML)",
+                   "util_pct": None}
+            util = _Util()
+            if ok(lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(util))):
+                out["util_pct"] = util.gpu
+            return out
+        finally:
+            try:
+                lib.nvmlShutdown()
+            except Exception:                       # noqa: BLE001
+                pass
+    except Exception:                               # noqa: BLE001
+        # Any surprise inside a vendor library is a "no reading": the
+        # front-end calling this has a kernel answer to fall back to.
+        return None
+
+
+def gpu_clock_with_nvml(payload_gpu=None, nvml=None) -> dict | None:
+    """The GPU clock a front-end should show.
+
+    `payload_gpu` is whatever the status payload carries (the kernel's
+    own answer, which is None on NVIDIA machines).  NVML wins over it,
+    because on a hybrid laptop the kernel's answer is the iGPU while
+    NVML names the discrete card, which is the chip this app's audience
+    bought; when NVML has nothing the kernel's answer stands, and when
+    the payload has no block at all the local kernel walk runs.  `nvml`
+    exists so the tests can hand in a fake probe.
+    """
+    probe = nvml if nvml is not None else nvml_gpu_clock
+    got = probe() if probe is not None else None
+    if isinstance(got, dict) and got.get("mhz"):
+        return got
+    if isinstance(payload_gpu, dict):
+        return payload_gpu
+    return gpu_clock()
+
+
+# --------------------------------------------------------------------------
+# CPU load and load average: /proc/stat deltas and /proc/loadavg
+# --------------------------------------------------------------------------
+
+def stat_path() -> str:
+    """`/proc/stat`; MSI_STAT redirects it so the tests can fake it."""
+    return os.environ.get("MSI_STAT", "/proc/stat")
+
+
+def loadavg_path() -> str:
+    """`/proc/loadavg`; MSI_LOADAVG redirects it for the tests."""
+    return os.environ.get("MSI_LOADAVG", "/proc/loadavg")
+
+
+def read_cpu_times() -> tuple | None:
+    """`(idle, total)` from /proc/stat's aggregate cpu line, in jiffies.
+
+    `idle` includes iowait, which the kernel's own accounting treats as
+    idle time; `total` is every field, so the difference between two
+    samples is exactly the time the machine spent anywhere, and
+    (total - idle) is the busy part.
+    """
+    try:
+        with open(stat_path(), "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    parts = first.split()
+    if len(parts) < 5 or parts[0] != "cpu":
+        return None
+    try:
+        vals = [int(x) for x in parts[1:]]
+    except ValueError:
+        return None
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)   # idle + iowait
+    return idle, sum(vals)
+
+
+def cpu_busy_pct(prev, cur) -> float | None:
+    """Busy% between two `read_cpu_times()` samples, or None.
+
+    None rather than 0 for a non-positive delta: two samples from the
+    same instant (or a fake that does not move) say nothing about load,
+    and "0% busy" is a real answer this must not invent.
+    """
+    if not prev or not cur:
+        return None
+    d_total = cur[1] - prev[1]
+    d_idle = cur[0] - prev[0]
+    if d_total <= 0:
+        return None
+    return round((d_total - d_idle) * 100.0 / d_total, 1)
+
+
+def read_loadavg() -> float | None:
+    """The 1-minute load average from /proc/loadavg, or None."""
+    text = _read_opt(loadavg_path())
+    if not text:
+        return None
+    try:
+        return float(text.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def system_facts() -> dict:
+    """CPU speed, GPU speed, memory and load: the machine readings.
+
+    The CPU's current frequency is the mean of the policies' own
+    `scaling_cur_freq` readings, which is what a "how fast is it running"
+    question means on a machine whose cores are allowed to disagree.
+    The load average rides here too, with busy% deliberately absent:
+    loadavg is one stateless kernel reading, while busy% is a delta only
+    a process that stays alive between polls can compute, so the daemon
+    adds that one itself and the offline view honestly has none.
+    """
+    freq = cpufreq_facts()
+    cur = None
+    if freq.get("present"):
+        vals = [v for v in freq.get("cur_khz_list") or [] if v]
+        if vals:
+            cur = sum(vals) // len(vals)
+    return {
+        "cpu_cur_khz": cur,
+        "cpuinfo_max_khz": freq.get("cpuinfo_max_khz"),
+        "gpu": gpu_clock(),
+        "mem": memory_facts(),
+        "loadavg": read_loadavg(),
+    }
 
 
 # --------------------------------------------------------------------------

@@ -6,11 +6,163 @@ here. The format follows
 `YYYY-MM-DD` dates. Older rows keep the names of their time - `GS66 Center`,
 `gs66-centerd` - because they are history, not stale references.
 
-**Read this file before you trust the tree.** This project has no version
-numbers yet - the sections are dated passes, newest first, and each one is a
-rollback point that matches a by-hand backup taken before the change. Every
+**Read this file before you trust the tree.** The sections are dated
+passes, newest first, and each one is a rollback point that matches a
+by-hand backup taken before the change; `VERSION` in
+`src/msi_control.py` (introduced 2026-10-18) is the release number the
+tarball and rpms carry. Every
 upgrade, fix, or configuration change gets a row here **in the same session**
 it was made; the runbook convention is documented in `CONTRIBUTING.md`.
+
+---
+
+## 2026-11-28 (follow-up) - device toggles, NVML GPU stats, the CPU load tile
+
+### Added
+- **Device and key toggles, at last.** The daemon has always been able to
+  write the `msi-ec` driver's own device attributes; only the front-ends
+  were missing. New CLI subcommands `webcam`, `super-battery`, `fn-key`,
+  `win-key` (show plus `on`/`off`, `left`/`right` for the Fn choice), a
+  **Devices & keys** card on the GUI's Performance page (one button per
+  choice, mirroring the driver's own values), and the missing write keys
+  in the daemon's `set`. A firmware that does not expose an attribute
+  shows it dead with the reason, and a click that changes nothing is a
+  no-op rather than a pointless EC write. The GS66 model now claims
+  `webcam`/`webcam_block`/`fn_key`/`win_key` with provenance (upstream
+  `CONF_G1_3` defines the registers for this firmware family; the
+  attributes are present on this machine, verified 2026-11-28);
+  `super_battery` stays `false` because this firmware has no such
+  attribute. `selftest` grew a `devices` section that re-writes each
+  value where it already stands, the write-back proof.
+- **The NVIDIA GPU's clock and utilisation, from NVML.** The
+  proprietary driver publishes nothing in sysfs, so the GPU tile could
+  only say "no GPU clock published in sysfs" on the machine this
+  project is about. The unprivileged front-ends (GUI and CLI, never the
+  daemon: the daemon talks to the kernel and nothing else) now load
+  `libnvidia-ml.so` through a stateless ctypes probe (init, handle,
+  clock, utilisation, shutdown) and merge it over the payload's sysfs
+  reading, NVML winning. A machine without the library pays one failed
+  load per process, not per poll, and `MSI_NO_NVML` pins the probe off
+  so the tests do not depend on the host's video driver. Verified live:
+  the GPU row on this laptop reads `1710 MHz` through NVML where it
+  read nothing before.
+- **A CPU load tile.** The Dashboard's ninth tile: how busy the CPU is,
+  as the daemon's own `/proc/stat` delta (needs two samples, so the
+  first poll and the offline view honestly say so instead of inventing
+  a zero), with the kernel's 1-minute load average as the sub-line.
+  The average is one stateless reading, so it lives in
+  `system_facts()` and the offline view carries it too, with a "?" where
+  the busy percentage would be. `MSI_STAT` and `MSI_LOADAVG` redirect
+  the two files for the tests.
+- **The Frequency page says what the cores run at now.** A "running
+  now" row from the per-policy `scaling_cur_freq`: one number when
+  every core agrees (the common case under a single cap), and the
+  honest per-core list when they do not, rather than a mean that
+  matches no core.
+- The offline suite grew to 233 tests: the load math (including the
+  zero-delta case that must be `None`, not 0%), the NVML probe and its
+  merge preference and refusal to touch the library twice, the device
+  round-trips (including the absent-attribute shape and the no-op
+  click), the selftest devices section, and the GUI mirror.
+
+### Fixed
+- **A docs bug from the overdrive pass.** `APP_DETAILS.md` still said
+  the overdrive bit was "not proven for `16V1EMS1`" and the GS66 model
+  "ships with the flag `false`", fourteen days after the write-back
+  test proved it and the flag was flipped. The section now states the
+  proof and its date; a doc that describes the old behaviour is a bug
+  in the doc, and this one had a test-green model file contradicting
+  it in the same tree.
+
+---
+
+## 2026-11-28 (full pass) - head-to-toe audit: EC read races, half-applied frequency caps, and the machine-wide readings on the Dashboard
+
+### Added
+- **The Dashboard reads the whole machine, not just the EC.** Three new
+  tiles: **CPU speed** (the mean of the policies' `scaling_cur_freq`
+  against the hardware ceiling, with the cap beside it), **GPU speed**
+  (i915's `gt_act_freq_mhz`, amdgpu's starred `pp_dpm_sclk` level, the
+  discrete card preferred over the iGPU), and **memory** (used of total,
+  from `MemAvailable`, not `MemFree`, because caches are not starvation).
+  All three are world-readable kernel interfaces, so they ride in the
+  status payload (`sys` block) from both the daemon and the offline view,
+  cost no EC transfer, and a driver that publishes nothing (the NVIDIA
+  proprietary one) gets an honest "no GPU clock published in sysfs"
+  instead of a number. The CLI's `status` prints them (a `Freq` line for
+  the running speed against the cap, the GPU clock on the GPU row, a
+  `Mem` line) and `monitor` carries cpu GHz + ram % on its one line.
+  `MSI_MEMINFO` redirects `/proc/meminfo` for the tests, like every other
+  path.
+- The offline suite grew to 215 tests: the system-facts sources (i915
+  actual vs requested, amdgpu starred/unstarred, discrete-wins, the
+  no-clock NVIDIA shape, availability-not-free, no-cpufreq), the status
+  and offline-view payloads, the CLI lines, and the GUI smoke test pins
+  the three tiles' numbers, sources and no-reading states.
+
+### Fixed
+- **Battery health silently vanished on real hardware.** The wear
+  reading divided `energy_full` by `energy_full_design`, but the
+  reference laptop's own `BAT1` publishes the same facts as
+  `charge_now`/`charge_full`/`charge_full_design` (µAh) and no
+  `energy_*` attributes at all, so the Dashboard and the Battery page
+  showed no health on the machine this project is about, while the
+  fixture (energy_*) kept the suite green - the same real-versus-fixture
+  class as the MSR `isfile()` bug. `_battery_status` now reads both
+  spellings and publishes the unit-agnostic `now`/`full`/`full_design`
+  pair (plus `charge_*` and `cycle_count`) for the front-ends; the GUI
+  and the CLI's `Batt` line use it, and a battery that tracks cycles
+  shows the count. Verified live: `msi-control status --direct` on this
+  laptop now reads `health 61%` where it read nothing before.
+- **EC reads raced with other threads' transfers.** `ec_read`/`ec_write`
+  took no lock themselves; `rpm()` (every status poll) and `mux_ec_bit()`
+  read unlocked, and the driver's debug interface is
+  write-address-then-read-value on *one shared file*, so an unlocked
+  pair of transfers in two threads can each receive the other's byte
+  (an RPM read once came back carrying a fan-curve temperature byte),
+  and an unlocked read between a write and its verify reads back the
+  wrong byte and reports a phantom "EC rejected write". The lock is now
+  an `RLock` taken *inside* `ec_read` and around `ec_write`'s
+  write+verify pair, so every caller is safe by construction; a
+  regression test models the shared file and hammers it from four
+  threads.
+- **A frequency cap set could come back half-applied.** A write failure
+  on one policy aborted the whole loop mid-way: the earlier cores were
+  capped, the rest untouched, the error was an "internal error" naming
+  nothing, and every later status just said "differs per core". Every
+  policy is now attempted, all failures are collected into one error
+  naming each core, and the floor a policy needed lifted goes back to
+  its original value when that policy's cap does not land (a lift is only
+  valid under the cap it was raised for; leaving it would pin the CPU
+  fast forever).
+- **A model with registers for only one fan crashed the other fan's
+  first poll.** The registry format allows `ec.curve`/`ec.rpm` for cpu
+  alone, but `curve`/`set_curve`/`rpm` indexed the registries directly:
+  a KeyError surfaced as "internal error" on the GPU's very first
+  status. Both fans now degrade to an honest refusal (status shows a
+  dash, the write is refused with the reason), pinned by tests.
+- **Three daemon writes shared one tmp filename.** `last.json.tmp`,
+  `<profile>.json.tmp` and `mux-backup.json.tmp` are written by whatever
+  client thread is saving: two concurrent saves could interleave into
+  the same half-written file before `os.replace()` published it. The tmp
+  names are now unique per thread; the MUX backup is the one record that
+  can undo a graphics switch, so a corrupted one is not academic.
+- `wait_for_driver()` used wall clock; a suspend-time step could stretch
+  or kill the wait. Monotonic now.
+- A firmware that answers the three-mode switch with a *shorter*
+  variable raised `IndexError` in the read-back check; it is now the
+  ordinary "did not keep the request" refusal with the restore.
+- The GUI called `refresh_overdrive(st)` twice per poll (a duplicate
+  line, harmless but wasteful), and the Settings config dump was
+  re-`setPlainText`ed every 1.5 s, resetting the caret and any
+  selection mid-copy; both are now once-and-only-when-changed.
+
+### Changed
+- Version 1.1.0 → 1.2.0 (a feature release: the Dashboard tiles and the
+  `sys` status block).
+- The documented serialisation guarantee now states what the code really
+  does: *all* EC access, reads included, is serialised, and why (the
+  shared debug file).
 
 ---
 

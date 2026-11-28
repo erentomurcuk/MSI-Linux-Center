@@ -1041,6 +1041,27 @@ class TestCli(DaemonTest):
         self.assertFalse(st["partial"])
         self.assertEqual(st["cpu"]["rpm"], 478000 // 300)
 
+    def test_status_prints_the_machine_readings(self):
+        # The kernel-backed block (CPU speed, GPU clock, memory) prints
+        # in the human view too, from either status path.  NVML is off
+        # for this run: this machine really has an NVIDIA card, and the
+        # test must not depend on the host's GPU stack.
+        meminfo = os.path.join(self.tmp, "meminfo")
+        write(meminfo, "MemTotal:  4194304 kB\nMemAvailable: 3145728 kB\n")
+        os.environ["MSI_MEMINFO"] = meminfo
+        os.environ["MSI_NO_NVML"] = "1"
+        try:
+            proc = self.run_cli("status")
+        finally:
+            os.environ.pop("MSI_MEMINFO", None)
+            os.environ.pop("MSI_NO_NVML", None)
+        self.assertIn("running at", proc.stdout)
+        self.assertIn("4.00 GHz", proc.stdout)       # the fixture's cur freq
+        self.assertIn("capped at 5.10 GHz", proc.stdout)
+        self.assertIn("1.0 of 4.0 GiB in use", proc.stdout)
+        self.assertIn("25%", proc.stdout)
+        self.assertNotIn("MHz", proc.stdout)   # no GPU clock in the fixture
+
     def test_json_flag_before_the_subcommand_is_not_dropped(self):
         # Regression: `--json` placed BEFORE the subcommand used to be
         # silently ignored, printing human text.  argparse's set_defaults()
@@ -1797,11 +1818,13 @@ class TestRegistry(unittest.TestCase):
 
     def test_the_model_declares_the_features_the_gs66_has(self):
         for name in ("shift", "fan", "cooler_boost", "charge_limit",
-                     "fan_curve", "rpm", "mux"):
+                     "fan_curve", "rpm", "mux", "display_overdrive",
+                     "webcam", "webcam_block", "fn_key", "win_key"):
             self.assertTrue(core.feature(name), name)
-        # Nothing here has been proven about these on the GS66.
-        for name in ("webcam", "webcam_block", "super_battery"):
-            self.assertFalse(core.feature(name), name)
+        # Super battery is the one optional driver attribute this
+        # firmware does not expose: the file says false because the
+        # machine does, and the flag is the honest "not built in".
+        self.assertFalse(core.feature("super_battery"))
 
     def test_builtin_profiles_are_all_valid(self):
         self.assertEqual(sorted(core.BUILTIN_PROFILES),
@@ -2164,6 +2187,616 @@ class TestFrequency(DaemonTest):
                            "max_khz": 3_500_000})
         self.assertIn("read back", str(ctx.exception))
         self.assertIn("policy0", str(ctx.exception))
+
+    def test_a_broken_core_does_not_stop_the_rest(self):
+        # A half-applied cap set is the worst failure shape: each half
+        # looks right on its own and every later status just says
+        # "differs per core".  A policy that refuses must not leave the
+        # rest uncapped, and every refusal is named.  (The write used to
+        # abort mid-loop, capping the first policies and leaving the rest
+        # untouched behind an error that named nothing.)
+        real_read = core.read_khz
+
+        def frozen_policy1(path):
+            if "policy1" in path and path.endswith("scaling_max_freq"):
+                return 5_100_000            # this core ignores us, forever
+            return real_read(path)
+
+        with mock.patch.object(core, "read_khz", frozen_policy1):
+            with self.assertRaises(core.ProtocolError) as ctx:
+                self.call({"cmd": "freq", "action": "set", "max_khz": 3500000})
+        self.assertIn("policy1", str(ctx.exception))
+        self.assertIn("read back", str(ctx.exception))
+        self.assertEqual(self.policy_attr("policy0", "scaling_max_freq"),
+                         3500000)           # the healthy core was still set
+
+    def test_an_unwritable_core_is_a_backend_error_not_an_internal_one(self):
+        # OSError on the write path used to escape as "internal error"
+        # with the cap half applied; it is now collected like any other
+        # refusal.  The 0444 trick only bites unprivileged, and the
+        # suite is built to run without root.
+        if os.geteuid() == 0:
+            self.skipTest("the 0444 refusal needs an unprivileged run")
+        bad = os.path.join(self.sysfs, "devices", "system", "cpu",
+                           "cpufreq", "policy1", "scaling_max_freq")
+        os.chmod(bad, 0o444)
+        try:
+            with self.assertRaises(core.ProtocolError) as ctx:
+                self.call({"cmd": "freq", "action": "set",
+                           "max_khz": 3500000})
+        finally:
+            os.chmod(bad, 0o644)
+        self.assertIn("cannot write", str(ctx.exception))
+        self.assertIn("policy1", str(ctx.exception))
+        self.assertEqual(self.policy_attr("policy0", "scaling_max_freq"),
+                         3500000)
+
+    def test_the_lifted_floor_goes_back_when_the_cap_does_not_land(self):
+        # The floor lift only makes sense under the cap it was raised
+        # for.  When that cap never lands, leaving the floor lifted
+        # would pin the CPU fast forever, so it goes back to where the
+        # policy started.
+        for pol in ("policy0", "policy1"):
+            path = os.path.join(self.sysfs, "devices", "system", "cpu",
+                                "cpufreq", pol, "scaling_min_freq")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("4000000\n")
+        real_read = core.read_khz
+
+        def frozen_read(path):
+            if path.endswith("scaling_max_freq"):
+                return 5_100_000                    # ignores us, forever
+            return real_read(path)
+
+        with mock.patch.object(core, "read_khz", frozen_read):
+            with self.assertRaises(core.ProtocolError):
+                self.call({"cmd": "freq", "action": "set",
+                           "max_khz": 2_500_000})
+        self.assertEqual(self.policy_attr("policy0", "scaling_min_freq"),
+                         4000000)
+        self.assertEqual(self.policy_attr("policy1", "scaling_min_freq"),
+                         4000000)
+
+
+# --------------------------------------------------------------------------
+# system facts: memory, GPU clock and the CPU's running speed
+# --------------------------------------------------------------------------
+
+class TestSystemFacts(unittest.TestCase):
+    """The machine-wide readings, all world-readable kernel interfaces."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="msi-sys-")
+        self.root = os.path.join(self.tmp, "sys")
+        os.makedirs(self.root)
+        self._saved = {k: os.environ.get(k)
+                       for k in ("MSI_SYSFS", "MSI_MEMINFO")}
+        os.environ["MSI_SYSFS"] = self.root
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _card(root, name, driver, card_files=None, device_files=None):
+        base = os.path.join(root, "class", "drm", name)
+        dev = os.path.join(base, "device")
+        os.makedirs(dev, exist_ok=True)
+        os.symlink(f"../../bus/pci/drivers/{driver}",
+                   os.path.join(dev, "driver"))
+        for rel, text in (card_files or {}).items():
+            write(os.path.join(base, rel), text)
+        for rel, text in (device_files or {}).items():
+            write(os.path.join(dev, rel), text)
+
+    def test_memory_facts_use_availability_not_free_memory(self):
+        meminfo = os.path.join(self.tmp, "meminfo")
+        write(meminfo, "MemTotal:  4194304 kB\nMemFree:  100000 kB\n"
+                       "MemAvailable: 3145728 kB\n")
+        os.environ["MSI_MEMINFO"] = meminfo
+        m = core.memory_facts()
+        self.assertEqual(m["total_kib"], 4194304)
+        self.assertEqual(m["used_kib"], 1048576)     # total - available
+        self.assertEqual(m["used_pct"], 25.0)
+
+    def test_unreadable_meminfo_is_none_not_zero(self):
+        os.environ["MSI_MEMINFO"] = os.path.join(self.tmp, "absent")
+        self.assertIsNone(core.memory_facts())
+
+    def test_an_intel_gpu_reads_its_actual_clock(self):
+        self._card(self.root, "card0", "i915",
+                   card_files={"gt_act_freq_mhz": "1350\n",
+                               "gt_cur_freq_mhz": "1300\n"})
+        self.assertEqual(core.gpu_clock(),
+                         {"mhz": 1350, "source": "Intel iGPU, actual"})
+
+    def test_an_igpu_without_the_actual_clock_reads_the_requested_one(self):
+        self._card(self.root, "card0", "i915",
+                   card_files={"gt_cur_freq_mhz": "300\n"})
+        self.assertEqual(core.gpu_clock(),
+                         {"mhz": 300, "source": "Intel iGPU, requested"})
+
+    def test_a_discrete_clock_wins_over_the_igpu(self):
+        self._card(self.root, "card0", "i915",
+                   card_files={"gt_cur_freq_mhz": "300\n"})
+        self._card(self.root, "card1", "amdgpu",
+                   device_files={"pp_dpm_sclk": "0: 1500M *\n1: 2100M\n"})
+        self.assertEqual(core.gpu_clock(),
+                         {"mhz": 1500, "source": "AMD GPU"})
+
+    def test_amdgpu_without_a_starred_level_is_no_reading(self):
+        self._card(self.root, "card1", "amdgpu",
+                   device_files={"pp_dpm_sclk": "0: 300M\n1: 2100M\n"})
+        self.assertIsNone(core.gpu_clock())
+
+    def test_a_driver_that_publishes_no_clock_answers_none(self):
+        # The NVIDIA proprietary driver: a DRM node with no clock
+        # attribute at all.  None is the honest answer, not a guess.
+        self._card(self.root, "card1", "nvidia")
+        self._card(self.root, "card1-eDP-1", "nvidia")   # a connector
+        self.assertIsNone(core.gpu_clock())
+
+    def test_system_facts_pool_the_policies_running_speed(self):
+        for pol, cur in (("policy0", "2000000\n"), ("policy1", "3000000\n")):
+            base = os.path.join(self.root, "devices", "system", "cpu",
+                                "cpufreq", pol)
+            write(os.path.join(base, "cpuinfo_min_freq"), "800000\n")
+            write(os.path.join(base, "cpuinfo_max_freq"), "5100000\n")
+            write(os.path.join(base, "scaling_min_freq"), "800000\n")
+            write(os.path.join(base, "scaling_max_freq"), "5100000\n")
+            write(os.path.join(base, "scaling_cur_freq"), cur)
+        f = core.system_facts()
+        self.assertEqual(f["cpu_cur_khz"], 2500000)   # the mean
+        self.assertEqual(f["cpuinfo_max_khz"], 5100000)
+        self.assertIsNone(f["gpu"])                   # no cards here
+        self.assertIsNotNone(f["mem"])                # the real /proc
+
+    def test_no_cpufreq_means_no_current_speed(self):
+        f = core.system_facts()
+        self.assertIsNone(f["cpu_cur_khz"])
+        self.assertIsNone(f["cpuinfo_max_khz"])
+
+
+class TestSystemFactsStatus(DaemonTest):
+    """The readings ride in the status payload, daemon or not."""
+
+    def _fake_meminfo(self):
+        meminfo = os.path.join(self.tmp, "meminfo")
+        # 4 GiB total, 3 GiB available: numbers big enough that the
+        # front-ends' GiB formatting does not round them to 0.0.
+        write(meminfo, "MemTotal:  4194304 kB\nMemAvailable: 3145728 kB\n")
+        os.environ["MSI_MEMINFO"] = meminfo
+
+    def test_status_carries_the_machine_readings(self):
+        self._fake_meminfo()
+        try:
+            st = self.call({"cmd": "status"})
+        finally:
+            os.environ.pop("MSI_MEMINFO", None)
+        sysf = st["sys"]
+        self.assertEqual(sysf["cpu_cur_khz"], 4_000_000)   # the fixture's
+        self.assertEqual(sysf["cpuinfo_max_khz"], 5_100_000)
+        self.assertEqual(sysf["mem"]["used_kib"], 1048576)
+        self.assertEqual(sysf["mem"]["used_pct"], 25.0)
+        self.assertIsNone(sysf["gpu"])    # no drm cards in the fixture
+
+    def test_the_offline_view_carries_the_same_readings(self):
+        self._fake_meminfo()
+        try:
+            st = core.local_status()
+        finally:
+            os.environ.pop("MSI_MEMINFO", None)
+        self.assertEqual(st["sys"]["cpu_cur_khz"], 4_000_000)
+        self.assertEqual(st["sys"]["mem"]["total_kib"], 4194304)
+
+    def test_busy_pct_needs_two_daemon_polls_and_is_then_the_delta(self):
+        # Only a process that stays alive between polls can take two
+        # /proc/stat samples, so the busy percentage is computed on the
+        # daemon side: the first status after a start honestly has
+        # none, and the second reports the window between the two.
+        stat = os.path.join(self.tmp, "stat")
+        write(stat, "cpu  100 50 50 680 20 0 0 0\n")       # 900 total
+        os.environ["MSI_STAT"] = stat
+        try:
+            self.assertIsNone(self.call({"cmd": "status"})["sys"]
+                              ["cpu_busy_pct"])
+            write(stat, "cpu  100 50 150 680 20 0 0 0\n")  # 1000 total
+            # 100 jiffies elapsed, all of them busy.
+            self.assertEqual(
+                self.call({"cmd": "status"})["sys"]["cpu_busy_pct"], 100.0)
+        finally:
+            os.environ.pop("MSI_STAT", None)
+
+    def test_loadavg_rides_in_the_payload(self):
+        path = os.path.join(self.tmp, "loadavg")
+        write(path, "1.82 2.10 2.33 3/1234 5678\n")
+        os.environ["MSI_LOADAVG"] = path
+        try:
+            st = self.call({"cmd": "status"})
+        finally:
+            os.environ.pop("MSI_LOADAVG", None)
+        self.assertEqual(st["sys"]["loadavg"], 1.82)
+
+    def test_loadavg_rides_in_the_offline_view_too(self):
+        # The load average is one stateless kernel reading, so it lives
+        # in system_facts() with the clocks and memory, not with the
+        # daemon-side busy%: the offline view carries it too.  Busy%
+        # itself must NOT appear there, because it needs a second
+        # sample only a daemon that stays alive can take.
+        path = os.path.join(self.tmp, "loadavg")
+        write(path, "1.82 2.10 2.33 3/1234 5678\n")
+        os.environ["MSI_LOADAVG"] = path
+        try:
+            st = core.local_status()
+        finally:
+            os.environ.pop("MSI_LOADAVG", None)
+        self.assertEqual(st["sys"]["loadavg"], 1.82)
+        self.assertNotIn("cpu_busy_pct", st["sys"])
+
+
+class TestDevices(DaemonTest):
+    """The driver's optional toggles: webcam, super battery, the keys.
+
+    The daemon has always been able to write these sysfs attributes; the
+    gap was that no front-end offered them.  These tests pin the write
+    path so the new controls stand on something tested.
+    """
+
+    def test_set_webcam_roundtrips_through_the_daemon(self):
+        out = self.call({"cmd": "set", "key": "webcam", "value": "on"})
+        self.assertEqual(out["now"], "on")
+        self.assertEqual(self.read_attr("webcam"), "on")
+        self.assertEqual(self.call({"cmd": "set", "key": "webcam",
+                                    "value": "off"})["now"], "off")
+
+    def test_set_key_positions(self):
+        for key, value in (("fn_key", "right"), ("win_key", "right"),
+                           ("fn_key", "left"), ("win_key", "left")):
+            out = self.call({"cmd": "set", "key": key, "value": value})
+            self.assertEqual(out["now"], value)
+            self.assertEqual(self.read_attr(key), value)
+
+    def test_a_setting_the_firmware_does_not_have_refuses_cleanly(self):
+        # A directory where the attribute would be: a write cannot
+        # "create" a sysfs attribute any more than it can open a
+        # directory, so this is the honest fake for a firmware without
+        # the feature (removing the file would not be, because the
+        # daemon's write would just create it again in a fake tree).
+        path = os.path.join(self.sysfs, "devices", "platform", "msi-ec",
+                            "super_battery")
+        os.remove(path)
+        os.makedirs(path)
+        with self.assertRaises(core.ProtocolError) as ctx:
+            self.call({"cmd": "set", "key": "super_battery", "value": "on"})
+        self.assertIn("super_battery", str(ctx.exception))
+        st = self.call({"cmd": "status"})
+        self.assertIsNone(st["super_battery"])
+
+    def test_cli_shows_and_sets_the_devices(self):
+        self.assertEqual(self.run_cli("webcam").stdout.strip(), "off")
+        self.run_cli("webcam", "on")
+        self.assertEqual(self.read_attr("webcam"), "on")
+        # the human status lists the present device attributes
+        proc = self.run_cli("status")
+        self.assertIn("webcam on", proc.stdout)
+        self.assertIn("fn left", proc.stdout)
+        self.assertIn("win right", proc.stdout)
+        self.assertIn("super battery off", proc.stdout)
+        # the key positions are proper subcommands too
+        self.run_cli("fn-key", "right")
+        self.assertEqual(self.read_attr("fn_key"), "right")
+        self.run_cli("win-key", "left")
+        self.assertEqual(self.read_attr("win_key"), "left")
+        # argparse refuses a value the attribute would not take
+        self.run_cli("webcam", "sideways", expect_rc=2)
+
+    def test_cli_says_why_when_the_attribute_is_absent(self):
+        path = os.path.join(self.sysfs, "devices", "platform", "msi-ec",
+                           "webcam")
+        os.remove(path)
+        proc = self.run_cli("webcam", expect_rc=1)
+        self.assertIn("no webcam attribute", proc.stderr)
+
+    def test_selftest_walks_the_devices(self):
+        # The self-test re-writes each device attribute where it already
+        # stands (nothing changes, and the write path is what is tested),
+        # which is the round-trip a model file's device flags rest on.
+        out = self.call({"cmd": "selftest"})
+        devices = [r for r in out["results"] if r["section"] == "devices"]
+        names = " ".join(r["name"] for r in devices)
+        self.assertIn("webcam off", names)
+        self.assertIn("super battery off", names)
+        self.assertIn("Fn key left", names)
+        self.assertIn("Win key right", names)
+        self.assertTrue(all(r["ok"] for r in devices), devices)
+        # nothing moved: each write was the value the fixture held
+        self.assertEqual(self.read_attr("webcam"), "off")
+        self.assertEqual(self.read_attr("fn_key"), "left")
+
+
+class TestBatteryFacts(DaemonTest):
+    """Wear must survive a firmware that reports charge_* instead of energy_*.
+
+    The reference laptop's BAT1 publishes charge_now/charge_full/
+    charge_full_design (µAh) and no energy_* attributes at all, so a
+    reader that only looked at energy_* reported no health on real
+    hardware while the fixture (energy_*) kept the suite green.  Both
+    spellings of the same ratio must work.
+    """
+
+    def _rewrite_battery(self, pairs: dict):
+        bat = os.path.join(self.sysfs, "class", "power_supply", "BAT1")
+        for name in ("energy_now", "energy_full", "energy_full_design",
+                     "charge_now", "charge_full", "charge_full_design",
+                     "cycle_count"):
+            path = os.path.join(bat, name)
+            if os.path.exists(path):
+                os.remove(path)
+        for name, text in pairs.items():
+            write(os.path.join(bat, name), text)
+
+    def test_health_uses_the_charge_pair_when_that_is_all_there_is(self):
+        # The real GS66's shape: charge_* only, plus a cycle count.
+        self._rewrite_battery({"charge_now": "40000000\n",
+                               "charge_full": "60000000\n",
+                               "charge_full_design": "66000000\n",
+                               "cycle_count": "37\n"})
+        b = self.call({"cmd": "status"})["battery"]
+        self.assertIsNone(b["energy_full"])      # the firmware has none
+        self.assertEqual(b["full"], 60000000)    # the unified pair answers
+        self.assertEqual(b["full_design"], 66000000)
+        self.assertEqual(b["now"], 40000000)
+        self.assertEqual(b["cycle_count"], 37)
+
+    def test_health_uses_the_energy_pair_when_that_is_all_there_is(self):
+        self._rewrite_battery({"energy_now": "40000000\n",
+                               "energy_full": "60000000\n",
+                               "energy_full_design": "66000000\n"})
+        b = self.call({"cmd": "status"})["battery"]
+        self.assertIsNone(b["charge_full"])
+        self.assertEqual(b["full"], 60000000)
+        self.assertEqual(b["full_design"], 66000000)
+
+    def test_no_publishable_pair_means_no_health_not_zero(self):
+        self._rewrite_battery({})
+        b = self.call({"cmd": "status"})["battery"]
+        self.assertIsNone(b["full"])
+        self.assertIsNone(b["full_design"])
+        self.assertEqual(b["pct"], 67)        # capacity is still the truth
+
+
+class TestEcBus(DaemonTest):
+    """The driver's debug interface is one shared file: no crossing."""
+
+    def test_concurrent_reads_never_receive_another_address(self):
+        # debug/ec_get is write-the-address-then-read-the-value, so two
+        # unlocked transfers in two threads can each receive the other's
+        # address (the status poll's RPM read once came back carrying a
+        # fan-curve temperature byte).  Model the shared file itself
+        # with a sleep where the real driver does its EC transfer, and
+        # hammer it: the lock inside ec_read is what lets every thread
+        # see only its own address.
+        cell = {"addr": 0}
+
+        def threaded_xfer(_self, addr):
+            # The shared "debug/ec_get" cell: the value read back equals
+            # the address last written, so a crossed transfer is visible
+            # as a mismatch instead of a plausible-looking byte.
+            cell["addr"] = addr              # the write to debug/ec_get
+            time.sleep(0.0002)               # the transfer window
+            return cell["addr"]              # the read of debug/ec_get
+
+        with mock.patch.object(MsiEc, "_xfer_read", threaded_xfer):
+            errors = []
+
+            def worker(base):
+                for i in range(64):
+                    addr = base + i
+                    try:
+                        if self.service.ec.ec_read(addr) != addr:
+                            errors.append(addr)
+                    except Exception as e:            # noqa: BLE001
+                        # A dead thread is a failed test, not a quiet pass.
+                        errors.append(f"{addr}: {e}")
+                        return
+
+            threads = [threading.Thread(target=worker, args=(64 * k,))
+                       for k in range(4)]     # 0..255, disjoint per thread
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(errors, [])
+
+
+class TestLoadFacts(unittest.TestCase):
+    """Busy% from /proc/stat deltas, and the load average."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="msi-load-")
+        self._saved = {k: os.environ.get(k)
+                       for k in ("MSI_STAT", "MSI_LOADAVG")}
+        core._nvml_lib = None          # a fresh NVML decision per test
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        core._nvml_lib = None
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_stat(self, idle, total):
+        # A plausible aggregate cpu line: user nice system idle iowait.
+        # idle+iowait = `idle`, and the five fields sum to `total`.
+        system = total - idle - 100 - 50
+        path = os.path.join(self.tmp, "stat")
+        write(path, f"cpu  100 50 {system} {idle - 20} 20 0 0 0\n"
+                    "cpu0 100 50 0 700 0 0 0 0\n")
+        os.environ["MSI_STAT"] = path
+        return path
+
+    def test_busy_pct_is_the_non_idle_share_of_the_delta(self):
+        self._write_stat(700, 900)
+        prev = core.read_cpu_times()
+        self.assertEqual(prev, (700, 900))
+        self._write_stat(750, 1000)
+        cur = core.read_cpu_times()
+        # 100 jiffies elapsed, 50 of them idle: half the window was busy.
+        self.assertEqual(core.cpu_busy_pct(prev, cur), 50.0)
+
+    def test_a_standing_still_machine_has_no_opinion_not_zero(self):
+        # Two identical samples say nothing about load; "0% busy" is a
+        # real answer this must not invent from a zero-width window.
+        self._write_stat(700, 900)
+        t = core.read_cpu_times()
+        self.assertIsNone(core.cpu_busy_pct(t, t))
+        self.assertIsNone(core.cpu_busy_pct(None, t))
+        self.assertIsNone(core.cpu_busy_pct(t, None))
+
+    def test_a_backwards_or_unreadable_sample_is_none(self):
+        self._write_stat(700, 900)
+        prev = core.read_cpu_times()
+        self._write_stat(700, 800)          # total went backwards
+        self.assertIsNone(core.cpu_busy_pct(prev, core.read_cpu_times()))
+        os.environ["MSI_STAT"] = os.path.join(self.tmp, "absent")
+        self.assertIsNone(core.read_cpu_times())
+
+    def test_loadavg_reads_the_one_minute_field(self):
+        path = os.path.join(self.tmp, "loadavg")
+        write(path, "1.82 2.10 2.33 3/1234 5678\n")
+        os.environ["MSI_LOADAVG"] = path
+        self.assertEqual(core.read_loadavg(), 1.82)
+        write(path, "garbage\n")
+        self.assertIsNone(core.read_loadavg())
+        os.environ["MSI_LOADAVG"] = os.path.join(self.tmp, "absent")
+        self.assertIsNone(core.read_loadavg())
+
+
+class _FakeNvml:
+    """A stand-in for libnvidia-ml with the four calls the probe makes.
+
+    The real library fills out-parameters through pointers; the fake
+    writes the same values through `byref()`'s wrapped object, which is
+    the only private attribute the test touches.
+    """
+
+    def __init__(self, mhz=1247, util=37, fail_clock=False):
+        self.mhz, self.util = mhz, util
+        self.fail_clock = fail_clock
+        self.inits = self.shutdowns = 0
+
+    def nvmlInit_v2(self):
+        self.inits += 1
+        return 0
+
+    def nvmlDeviceGetHandleByIndex_v2(self, _index, ref):
+        ref._obj.value = 0x1234
+        return 0
+
+    def nvmlDeviceGetClockInfo(self, _dev, _clock, ref):
+        if self.fail_clock:
+            return 9                      # NVML_ERROR_NOT_SUPPORTED-ish
+        ref._obj.value = self.mhz
+        return 0
+
+    def nvmlDeviceGetUtilizationRates(self, _dev, ref):
+        ref._obj.gpu = self.util
+        return 0
+
+    def nvmlShutdown(self):
+        self.shutdowns += 1
+        return 0
+
+
+class TestNvmlClock(unittest.TestCase):
+    """The NVIDIA probe: stateless, cache-negative, and never an error."""
+
+    def setUp(self):
+        self._saved = os.environ.get("MSI_NO_NVML")
+        os.environ.pop("MSI_NO_NVML", None)
+        self._orig_lib = core._nvml_lib
+        core._nvml_lib = None
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("MSI_NO_NVML", None)
+        else:
+            os.environ["MSI_NO_NVML"] = self._saved
+        core._nvml_lib = self._orig_lib
+
+    def test_the_probe_reads_clock_and_utilization(self):
+        lib = _FakeNvml(mhz=1247, util=37)
+        core._nvml_lib = lib
+        self.assertEqual(core.nvml_gpu_clock(),
+                         {"mhz": 1247, "source": "NVIDIA GPU (NVML)",
+                          "util_pct": 37})
+        self.assertEqual((lib.inits, lib.shutdowns), (1, 1))
+
+    def test_a_clock_refusal_is_no_reading_and_the_shutdown_still_runs(self):
+        lib = _FakeNvml(fail_clock=True)
+        core._nvml_lib = lib
+        self.assertIsNone(core.nvml_gpu_clock())
+        self.assertEqual(lib.shutdowns, 1)
+
+    def test_an_absent_library_is_cached_not_retried(self):
+        # On a machine WITH the driver userland (this dev laptop has it)
+        # the absence must still be forced and then cached: one failed
+        # dlopen decision, not a retry on every poll.
+        with mock.patch("ctypes.CDLL", side_effect=OSError("absent")):
+            self.assertIsNone(core.nvml_gpu_clock())
+        self.assertIs(core._nvml_lib, False)      # the negative is cached
+        self.assertIsNone(core.nvml_gpu_clock())  # the cache answers
+
+    def test_msi_no_nvml_takes_the_library_out_of_the_picture(self):
+        os.environ["MSI_NO_NVML"] = "1"
+        self.assertIsNone(core.nvml_gpu_clock())
+        self.assertIs(core._nvml_lib, False)
+
+    def test_the_merge_prefers_nvml_then_the_payload_then_the_kernel(self):
+        fake = {"mhz": 1710, "source": "NVIDIA GPU (NVML)", "util_pct": 61}
+        # NVML wins: on a hybrid laptop the kernel's answer names the
+        # iGPU while NVML names the discrete card.
+        self.assertEqual(
+            core.gpu_clock_with_nvml({"mhz": 300, "source": "Intel iGPU"},
+                                     nvml=lambda: fake)["mhz"], 1710)
+        # No NVML answer: the payload the daemon carried stands.
+        self.assertEqual(
+            core.gpu_clock_with_nvml({"mhz": 300, "source": "Intel iGPU"},
+                                     nvml=lambda: None)["mhz"], 300)
+        # No payload either: the local kernel walk is the last resort.
+        self.assertIsNone(core.gpu_clock_with_nvml(None, nvml=lambda: None))
+        # A probe that answers with no clock counts as no answer.
+        self.assertEqual(
+            core.gpu_clock_with_nvml({"mhz": 300, "source": "Intel iGPU"},
+                                     nvml=lambda: {"mhz": None})["mhz"], 300)
+
+
+class TestAsymmetricModels(DaemonTest):
+    """A model may prove registers for only one fan (the format says so)."""
+
+    def test_a_cpu_only_curve_model_refuses_the_gpu_cleanly(self):
+        with mock.patch.object(core, "CURVE_REGS",
+                               {"cpu": core.CURVE_REGS["cpu"]}):
+            st = self.call({"cmd": "status"})
+            self.assertIsNotNone(st["curve"]["cpu"])
+            self.assertIsNone(st["curve"]["gpu"])    # not an internal error
+            with self.assertRaises(core.ProtocolError) as ctx:
+                self.call({"cmd": "curve", "which": "gpu",
+                           "temps": [40, 50, 60, 70, 80, 90],
+                           "speeds": [0, 30, 50, 70, 85, 95, 100]})
+        self.assertIn("no gpu fan-curve registers", str(ctx.exception))
+
+    def test_a_cpu_only_tachometer_degrades_the_other_fan(self):
+        with mock.patch.object(core, "RPM_REGS", {"cpu": 0xCC}):
+            st = self.call({"cmd": "status"})
+            self.assertEqual(st["cpu"]["rpm"], 478000 // 300)
+            self.assertIsNone(st["gpu"]["rpm"])
 
 
 class TestUndervolt(DaemonTest):

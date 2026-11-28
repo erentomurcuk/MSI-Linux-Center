@@ -173,13 +173,21 @@ register-backed ones `false`):
 | `rpm` | register | fan tachometers: **requires `ec.rpm`** |
 | `mux` | register | graphics-mode (MUX) switch |
 | `display_overdrive` | register | panel overdrive: **requires `ec.overdrive`** |
-| `webcam`, `webcam_block`, `super_battery`, `fn_key`, `win_key` | driver | optional features only some firmwares have |
+| `webcam`, `webcam_block`, `super_battery`, `fn_key`, `win_key` | driver | optional features only some firmwares have; the driver creates each sysfs attribute only when the firmware can do it |
 
 The first four are also checked at runtime against the attributes the driver
 actually exposes, so a model cannot enable a control the driver does not offer.
 `fan_curve: true` with no `ec.curve`, `rpm: true` with no `ec.rpm`, or
 `display_overdrive: true` with no `ec.overdrive`, is a
 **load error**; a model may not claim a feature it has no registers for.
+
+The five optional driver flags are **informational**: the daemon writes the
+sysfs attribute (which exists only on firmware that has the feature), and the
+front-ends offer the control exactly when the attribute is present, so a
+`false` here is a "not proven, do not advertise it" statement rather than an
+enforcement gate. Turn them `true` when the attribute is present on the
+machine (the driver's own `CONF` block naming this firmware is good
+provenance), and leave them `false` when it is not.
 
 Only turn a flag on for something you have proven. `fan_curve` and `mux` in
 particular write registers, and a guessed address is a machine that will not

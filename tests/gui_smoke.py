@@ -23,6 +23,13 @@ spec = importlib.util.spec_from_loader("msigui", loader)
 gui = importlib.util.module_from_spec(spec)
 loader.exec_module(gui)
 
+# The NVML probe reads the host's real GPU when the driver userland is
+# installed, and this suite must not depend on the machine it runs on:
+# pin the "library absent" state so every FAKE-driven check is
+# deterministic, and let check_nvml_tile inject a fake probe for the
+# one check that exercises the NVIDIA path.
+gui.core._nvml_lib = False
+
 from PySide6.QtGui import QColor                                 # noqa: E402
 from PySide6.QtWidgets import QApplication                      # noqa: E402
 
@@ -40,6 +47,8 @@ FAKE = {
     "battery": {"name": "BAT1", "present": True, "status": "Charging",
                 "pct": 67, "energy_now": 40000000, "energy_full": 60000000,
                 "energy_full_design": 66000000,
+                "now": 40000000, "full": 60000000,
+                "full_design": 66000000, "cycle_count": 37,
                 "charge_start": 50, "charge_end": 60, "ac_online": True},
     "curve": {"cpu": {"temps": [58, 63, 68, 73, 78, 83],
                       "speeds": [0, 50, 60, 65, 70, 80, 85]},
@@ -54,6 +63,11 @@ FAKE = {
              "min_khz_list": [800_000] * 8,
              "cur_khz_list": [3_500_000] * 8},
     "overdrive": {"supported": True, "on": False},
+    "sys": {"cpu_cur_khz": 3_500_000, "cpuinfo_max_khz": 5_000_000,
+            "cpu_busy_pct": 37.5, "loadavg": 1.24,
+            "gpu": {"mhz": 1247, "source": "AMD GPU"},
+            "mem": {"total_kib": 16_777_216, "available_kib": 10_485_760,
+                    "used_kib": 6_291_456, "used_pct": 37.5}},
     "undervolt": {"planes": {"core": -80, "gpu": 0, "cache": -60,
                              "uncore": 0, "analogio": 0},
                   "msr_present": True},
@@ -415,7 +429,7 @@ def check_nav_matches_tabs(win) -> None:
 
 
 def check_type_scale(win) -> None:
-    """One type scale: the five dashboard tiles must set their big number to
+    """One type scale: the nine dashboard tiles must set their big number to
     the same size, and every card caption to the same size.
 
     The GUI used to mix setPointSize and setPixelSize, so "the big number"
@@ -423,7 +437,8 @@ def check_type_scale(win) -> None:
     screenshot cannot tell you the two do not match; this can.
     """
     tiles = (win.dash.cpu, win.dash.gpu, win.dash.cpu_rpm,
-             win.dash.gpu_rpm, win.dash.battery)
+             win.dash.gpu_rpm, win.dash.cpu_hz, win.dash.cpu_load,
+             win.dash.gpu_hz, win.dash.memory, win.dash.battery)
     sizes = {t.value.font().pixelSize() for t in tiles}
     assert sizes == {gui.TYPE_DISPLAY}, f"tile value sizes: {sizes}"
     assert win.batt.label.font().pixelSize() == gui.TYPE_H1
@@ -662,6 +677,42 @@ def check_performance_tab(win) -> None:
                     {"was": "comfort", "now": "turbo"},
                     None) == "Set performance mode to turbo"
 
+    # --- the Devices & keys card mirrors the driver's own attributes ---
+    # The daemon could always write these; the card is the missing
+    # front-end, so the mirror and the no-op guard are what needs
+    # pinning.
+    assert perf.dev_val["webcam"].text() == "off", \
+        perf.dev_val["webcam"].text()
+    assert perf.dev_btns["webcam"]["off"].isChecked(), "webcam not mirrored"
+    assert perf.dev_btns["fn_key"]["left"].isChecked(), "fn key not mirrored"
+    assert perf.dev_btns["win_key"]["right"].isChecked(), "win key not mirrored"
+    sent = []
+    orig = win.send
+    win.send = lambda cmd, tag=None: sent.append(cmd)
+    try:
+        perf._device("webcam", "off")            # same value: a no-op
+        assert sent == [], f"a no-op sent {sent}"
+        perf._device("webcam", "on")
+        assert sent == [{"cmd": "set", "key": "webcam", "value": "on"}], \
+            f"unexpected sends: {sent}"
+        perf._device("fn_key", "right")
+        assert sent[-1] == {"cmd": "set", "key": "fn_key", "value": "right"}
+    finally:
+        win.send = orig
+    # an attribute the firmware does not have: "?" and dead, with the why
+    st = {**FAKE, "super_battery": None}
+    win._refresh(st)
+    assert perf.dev_val["super_battery"].text() == "?"
+    assert not perf.dev_btns["super_battery"]["on"].isEnabled()
+    assert "does not expose" in \
+        perf.dev_btns["super_battery"]["on"].toolTip()
+    # offline: every device button goes dead like every other writer
+    win.online = False
+    win._refresh(FAKE)
+    assert not perf.dev_btns["webcam"]["on"].isEnabled()
+    win.online = True
+    win._refresh(FAKE)
+
 
 def check_graphics(win) -> None:
     """The MUX card: four dangerous states, and the reason for each.
@@ -751,6 +802,18 @@ def check_frequency_page(win) -> None:
         f.rows["all cores at"].text()
     assert f.slider.value() * gui.FREQ_STEP_KHZ == 4_000_000
     assert not f.apply_btn.isEnabled(), "Apply must wait for a change"
+    # The per-core running frequency: all-equal collapses to one number
+    # and a machine whose cores disagree gets the honest per-core list
+    # rather than a mean that matches no core.
+    assert f.rows["running now"].text() == "3.50 GHz (all 8 cores)", \
+        f.rows["running now"].text()
+    st = {**FAKE, "freq": dict(FAKE["freq"],
+                               cur_khz_list=[3_000_000] + [3_500_000] * 7)}
+    win._refresh(st)
+    assert "3.00" in f.rows["running now"].text() \
+        and "3.50" in f.rows["running now"].text(), \
+        f.rows["running now"].text()
+    win._refresh(FAKE)
 
     f.slider.setValue(3_000_000 // gui.FREQ_STEP_KHZ)
     assert f.apply_btn.isEnabled() and f.revert_btn.isEnabled()
@@ -889,6 +952,11 @@ def check_dashboard_facts(win) -> None:
     # the two agreeing.
     assert "health 91%" in sub, sub
     assert "67% of new" not in sub, sub
+    # The Battery page's detail line carries the same health plus the
+    # cycle count a tracking firmware reports.
+    info = win.batt.info.text()
+    assert "health ≈ 91% of design" in info, info
+    assert "37 cycles" in info, info
     # The fan cards show RPM as the number and duty as the bar; the label has
     # to say so or the bar's meaning is a guess.
     assert "RPM" in win.dash.cpu_rpm.sub.text(), win.dash.cpu_rpm.sub.text()
@@ -907,6 +975,89 @@ def check_dashboard_facts(win) -> None:
         assert not card.sub.isVisible(), "an empty sub-line still takes space"
         assert card.chip.text() in ("Cool", "Warm", "Hot", "Critical"), \
             card.chip.text()
+
+    # The kernel-backed tiles: CPU speed shows what the cores run at now
+    # against the hardware ceiling, the GPU clock names the source it came
+    # from, and memory's bar is the used fraction of the total.  A driver
+    # that publishes no GPU clock (the NVIDIA proprietary one) must say
+    # so rather than show a bare "?" that reads as a bug.
+    assert win.dash.cpu_hz.value.text() == "3.50 GHz", \
+        win.dash.cpu_hz.value.text()
+    assert "cap 4.00 GHz" in win.dash.cpu_hz.sub.text(), \
+        win.dash.cpu_hz.sub.text()
+    assert win.dash.gpu_hz.value.text() == "1247 MHz", \
+        win.dash.gpu_hz.value.text()
+    assert "AMD GPU" in win.dash.gpu_hz.sub.text(), \
+        win.dash.gpu_hz.sub.text()
+    assert win.dash.memory.value.text() == "6.0 GiB", \
+        win.dash.memory.value.text()
+    assert "of 16.0 GiB" in win.dash.memory.sub.text(), \
+        win.dash.memory.sub.text()
+    assert win.dash.memory.bar.value() == 375, win.dash.memory.bar.value()
+    # The load tile: busy% as the number and the bar, the kernel's own
+    # 1-minute load average as the sub-line.
+    assert win.dash.cpu_load.value.text() == "38%", \
+        win.dash.cpu_load.value.text()
+    assert win.dash.cpu_load.bar.value() == 375, \
+        win.dash.cpu_load.bar.value()
+    assert "1-min load 1.24" in win.dash.cpu_load.sub.text(), \
+        win.dash.cpu_load.sub.text()
+    # Busy% needs two daemon-side samples; the first poll honestly has
+    # none, and the tile must say why rather than invent a zero.
+    st = dict(FAKE, sys=dict(FAKE["sys"], cpu_busy_pct=None, loadavg=None))
+    win._refresh(st)
+    assert win.dash.cpu_load.value.text() == "?", \
+        win.dash.cpu_load.value.text()
+    assert "needs the daemon" in win.dash.cpu_load.sub.text(), \
+        win.dash.cpu_load.sub.text()
+    # The load average is stateless, so the offline view (no busy%) still
+    # carries it: the number stays "?" but the sub-line reads the machine.
+    st = dict(FAKE, sys=dict(FAKE["sys"], cpu_busy_pct=None))
+    win._refresh(st)
+    assert win.dash.cpu_load.value.text() == "?", \
+        win.dash.cpu_load.value.text()
+    assert "1-min load 1.24" in win.dash.cpu_load.sub.text() \
+        and "needs the daemon" in win.dash.cpu_load.sub.text(), \
+        win.dash.cpu_load.sub.text()
+    st = dict(FAKE, sys=dict(FAKE["sys"], gpu=None))
+    win._refresh(st)
+    assert win.dash.gpu_hz.value.text() == "?", win.dash.gpu_hz.value.text()
+    assert "no GPU clock" in win.dash.gpu_hz.sub.text(), \
+        win.dash.gpu_hz.sub.text()
+    st = dict(FAKE, sys={"cpu_cur_khz": None, "cpuinfo_max_khz": None,
+                         "gpu": None, "mem": None})
+    win._refresh(st)
+    assert win.dash.cpu_hz.value.text() == "?", win.dash.cpu_hz.value.text()
+    assert win.dash.memory.value.text() == "?", win.dash.memory.value.text()
+    win._refresh(FAKE)
+
+
+def check_nvml_tile(win) -> None:
+    """The NVIDIA path: an NVML reading wins over the kernel's own.
+
+    The proprietary driver publishes no clock under /sys, so on the
+    reference laptop the dGPU's number can only come from NVML, which
+    the unprivileged front-end loads (the daemon talks to the kernel
+    and nothing else).  A fake probe stands in for the library here so
+    the check is deterministic on any host.
+    """
+    real = gui.core.nvml_gpu_clock
+    st = dict(FAKE, sys=dict(FAKE["sys"], gpu=None))
+    win._refresh(st)
+    assert win.dash.gpu_hz.value.text() == "?", win.dash.gpu_hz.value.text()
+    gui.core.nvml_gpu_clock = lambda: {
+        "mhz": 1710, "source": "NVIDIA GPU (NVML)", "util_pct": 61}
+    try:
+        win._refresh(st)
+        assert win.dash.gpu_hz.value.text() == "1710 MHz", \
+            win.dash.gpu_hz.value.text()
+        assert "NVIDIA GPU (NVML)" in win.dash.gpu_hz.sub.text(), \
+            win.dash.gpu_hz.sub.text()
+        assert "61% busy" in win.dash.gpu_hz.sub.text(), \
+            win.dash.gpu_hz.sub.text()
+    finally:
+        gui.core.nvml_gpu_clock = real
+    win._refresh(FAKE)
 
     # The battery chip names the state and colours it by whether that state
     # wants your attention.  Pinned because it is a decision, not a reading:
@@ -1517,6 +1668,7 @@ def main() -> int:
     check_type_scale(win)
     check_control_sizes(win)
     check_dashboard_facts(win)
+    check_nvml_tile(win)
     check_tray_icon(win)
     check_tray_menu(win)
     check_battery_apply_state(win)

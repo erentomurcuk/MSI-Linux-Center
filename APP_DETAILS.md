@@ -50,7 +50,9 @@ and GUI are unprivileged clients.
 
 * **`src/msi_controld.py`**: root daemon, systemd system service `msi-controld`.
   One JSON object per line, one request per connection. Validates every
-  client value, serialises all EC access under one lock, and **verifies each
+  client value, serialises all EC access (reads included: the debug
+  interface is write-address-then-read-value on one shared file) under one
+  re-entrant lock, and **verifies each
   write by reading it back**.
 * **`src/msi-control`**: stdlib-only CLI. Reads work without the daemon
   (plain sysfs); writes need it.
@@ -76,7 +78,8 @@ and GUI are unprivileged clients.
 
 `MSI_SYSFS`, `MSI_SOCK`, `MSI_CONFIG`, `MSI_STATE`: let the whole stack
 run against a fake sysfs tree and a RAM-backed EC with no root at all.
-`MSI_CPU_DEV` redirects the `/dev/cpu` tree the undervolt backend probes
+`MSI_CPU_DEV` redirects the `/dev/cpu` tree the undervolt backend probes;
+`MSI_MEMINFO` redirects `/proc/meminfo` for the memory facts
 (default `/dev/cpu`, what the `msr` module creates).
 `MSI_MODELS` overrides the model-registry directory, and `MSI_MODEL` forces a
 model id (§2a).
@@ -273,10 +276,42 @@ all three follow the same rules (validate, serialise, read back):
   model flag plus `ec.overdrive` (`address`, `bit`, optional whole-byte
   `off`/`on` values). Same byte as the webcam (bit 1) and the MUX state
   (bit 6), so `MsiEc.set_overdrive` is a one-bit RMW unless the model
-  supplies explicit byte values. **Not proven for `16V1EMS1`**, so the
-  GS66 model ships with the flag `false` and the GUI/CLI report
-  "no proven register" rather than flipping a bit nobody has watched
-  move on this firmware.
+  supplies explicit byte values. Proven for this project's own
+  `16V1EMS1.118` by the write-back test on 2026-11-22 (bit accepted and
+  read back, both neighbour bits untouched, original state restored),
+  so the GS66 model ships with the flag `true`; the panel's visible
+  response-time change is the one check only a human can make.
+* **The machine-wide readings** (`system_facts()` in the core, the `sys`
+  block of every status, daemon or offline): the CPU's current running
+  speed (the mean of the policies' `scaling_cur_freq`), how busy the CPU
+  is (a `/proc/stat` delta the daemon samples on its own clock; the
+  offline view honestly has none, because busy% needs two samples and a
+  window), the kernel's 1-minute load average (`/proc/loadavg`, which
+  is stateless and so rides in `system_facts()` with the rest: the
+  offline view carries it, with a "?" where the busy% would be), the
+  GPU's clock, and memory in use. Sources: `cpufreq_facts()` for the CPU,
+  `/proc/meminfo` (`MemTotal`/`MemAvailable`; availability, not `MemFree`,
+  because caches count against "free" but not against what an app can
+  allocate; `MSI_MEMINFO` redirects it for the tests), and the DRM
+  device sysfs for the GPU: i915's `gt_act_freq_mhz` (falling back to
+  `gt_cur_freq_mhz`, the requested clock), amdgpu's `pp_dpm_sclk` (the
+  starred level), preferring a discrete card's reading over the iGPU's.
+  The NVIDIA proprietary driver publishes no clock in sysfs at all, so
+  that case is an honest `null` and the Dashboard says "no GPU clock
+  published in sysfs" instead of inventing a number. Nothing here needs
+  root, the daemon, or an EC transfer, which is why the offline view
+  carries the same numbers the daemon does.
+* **NVML, the one non-kernel source, and only in the front-ends.** On
+  the proprietary NVIDIA driver the discrete GPU's clock and
+  utilisation live in the vendor's `libnvidia-ml.so`, not in sysfs.
+  The daemon talks to the kernel and nothing else, so `nvml_gpu_clock()`
+  (a stateless ctypes probe: init, device handle, clock, utilisation,
+  shutdown, no handle kept alive) is called by the GUI and the CLI only,
+  and merged over the payload's sysfs reading (`gpu_clock_with_nvml()`,
+  NVML wins when both exist). The probe caches its absence so a machine
+  without the library pays one failed `dlopen` per process, never per
+  poll, and `MSI_NO_NVML` pins it off for the tests, which must not
+  depend on the host's video driver.
 
 ---
 
@@ -316,9 +351,10 @@ One JSON object per line, one request per connection.
 
 ```jsonc
 {"cmd":"ping"}
-{"cmd":"status"}                                    // incl. RPM + curve
+{"cmd":"status"}                                    // incl. RPM + curve + sys (clocks, busy%, loadavg, memory)
 {"cmd":"set","key":"shift","value":"eco"}
 {"cmd":"set","key":"charge_end","value":60}
+{"cmd":"set","key":"webcam","value":"on"}             // device toggles: webcam, super_battery, fn_key, win_key
 {"cmd":"curve","which":"cpu","temps":[…6],"speeds":[…7]}
 {"cmd":"profile","action":"list|show|apply|save|delete|save-current","name":…}
 {"cmd":"reapply"}
@@ -432,9 +468,9 @@ Status   transient actions (left) · daemon + firmware (right, permanent)
 
 | Section | Contents |
 |---|---|
-| Dashboard | 4 stat tiles (CPU/GPU temp, CPU/GPU fan RPM) + Battery + Right now + System |
-| Performance | shift mode buttons + Cooler Boost + **Graphics mode (MUX)** + panel overdrive (model-gated) |
-| Frequency | all-core max-frequency slider + four quick slots (a slot click applies immediately); values reset at reboot |
+| Dashboard | 9 stat tiles: CPU/GPU temp, CPU/GPU fan RPM, CPU speed (running, against the ceiling), CPU load (busy% with the 1-min load average), GPU speed (with its source named), memory (used of total) + Battery + Right now + System |
+| Performance | shift mode buttons + Cooler Boost + **Graphics mode (MUX)** + panel overdrive (model-gated) + **Devices & keys**: webcam, fn/win key swap, super battery, one button per choice, dead with the reason when the firmware does not expose one |
+| Frequency | all-core max-frequency slider + four quick slots (a slot click applies immediately) + the per-core "running now" readout (one number when every core agrees, the honest list when they do not); values reset at reboot |
 | Undervolting | five plane offsets + Apply/Reset + the permanent BIOS-unlock notice + the app-startup set |
 | Fans | fan mode + draggable CPU/GPU curve canvases with factory ghost |
 | Battery | charge-limit slider + 60/80/100 presets + Apply/Revert |
@@ -677,7 +713,7 @@ value is a decision, not a draft.
 
 ## 9. Tests
 
-**`tests/test_msi_control.py`: 194 tests, offline, unprivileged, ~9 s.**
+**`tests/test_msi_control.py`: 233 tests, offline, unprivileged, ~9 s.**
 
 Runs the *real* daemon (Service + Unix socket server + protocol), the real
 validation and the real CLI as a subprocess, against a fake sysfs tree
@@ -729,7 +765,7 @@ It also pins the things that are invisible by construction:
 | `check_theme_tokens` (accent half) | a preset that fails WCAG AA in either theme: every preset is measured in both, not only the one this process happens to wear |
 | `check_glyphs` | a typo in a sidebar page's `glyph` name: `glyph_pixmap` falls through its if-chain and returns a transparent pixmap, so the sidebar shows a label with a hole beside it |
 | `check_nav_matches_tabs` | a section with no nav entry (unreachable) or a nav entry with no section (a dead click) |
-| `check_type_scale` | the five dashboard tiles disagreeing about `TYPE_DISPLAY`, or a card caption that is not `TYPE_CAPTION` bold |
+| `check_type_scale` | the nine dashboard tiles disagreeing about `TYPE_DISPLAY`, or a card caption that is not `TYPE_CAPTION` bold |
 | `check_control_sizes` | one control that is 10 px taller than its neighbour, the battery `Apply` bug, which is invisible as a bug in a screenshot because it just looks like the button is emphasised |
 | the battery-chip cases in `check_dashboard_facts` | a chip colour policy that is a decision, not a reading, pinned so it cannot quietly change |
 

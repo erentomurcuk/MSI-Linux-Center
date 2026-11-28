@@ -1736,6 +1736,15 @@ class DashboardTab(QWidget):
         self.cpu_rpm = StatCard("CPU fan")
         self.gpu_rpm = StatCard("GPU fan")
         self.battery = StatCard("Battery")
+        # The machine-wide readings the kernel hands out for free: how
+        # fast the CPU actually runs, how busy it is, the GPU's own
+        # clock, and memory.  They live beside the EC-backed tiles
+        # rather than on a page of their own, because "what is the
+        # machine doing" is the dashboard's one job.
+        self.cpu_hz = StatCard("CPU speed")
+        self.cpu_load = StatCard("CPU load")
+        self.gpu_hz = StatCard("GPU speed")
+        self.memory = StatCard("Memory")
 
         grid = QGridLayout()
         grid.setSpacing(PAGE_GAP)
@@ -1743,9 +1752,13 @@ class DashboardTab(QWidget):
         grid.addWidget(self.gpu, 0, 1)
         grid.addWidget(self.cpu_rpm, 0, 2)
         grid.addWidget(self.gpu_rpm, 0, 3)
-        grid.addWidget(self.battery, 1, 0, 1, 2)
+        grid.addWidget(self.cpu_hz, 1, 0)
+        grid.addWidget(self.cpu_load, 1, 1)
+        grid.addWidget(self.gpu_hz, 1, 2)
+        grid.addWidget(self.memory, 1, 3)
+        grid.addWidget(self.battery, 2, 0, 1, 2)
         self.modes = Card("Right now")
-        grid.addWidget(self.modes, 1, 2, 1, 2)
+        grid.addWidget(self.modes, 2, 2, 1, 2)
         for c in range(4):
             grid.setColumnStretch(c, 1)
         lay.addLayout(grid)
@@ -1789,7 +1802,9 @@ class DashboardTab(QWidget):
             # that is a real answer, not a missing daemon.
             if rpm is None:
                 sub = ("RPM off: no model definition for this laptop"
-                       if not core.feature("rpm") else "RPM needs the daemon")
+                       if not core.feature("rpm") else
+                       "no reading: daemon offline or this fan has no "
+                       "tachometer")
                 card.show("?", None, sub, COL_DEAD)
             else:
                 # The bar is fan duty, the number is RPM.  Say so.  With the
@@ -1798,16 +1813,22 @@ class DashboardTab(QWidget):
                 card.show(f"{rpm:,}", (pct / 100.0) if pct is not None else None,
                           f"RPM · fan {pct}%" if pct is not None else "RPM",
                           temp_color(d.get("temp")))
+        self._refresh_sys(st)
 
         bat = st.get("battery") or {}
         pct = bat.get("pct")
-        # Wear is *capacity now* against *capacity when new*.  This used to be
+        # Wear is *capacity now* against *capacity when new*, through the
+        # unit-agnostic `full`/`full_design` pair: firmwares publish the
+        # same facts as energy_* in µWh or charge_* in µAh, and this
+        # project's own reference laptop publishes only the latter, so
+        # reading energy_* alone showed no health on real hardware
+        # while the fixture stayed green.  This used to be
         # energy_now / energy_full, which is the state of charge, so the
         # dashboard announced "67% of new" beside a big 67% and told you
         # nothing about the battery's health at all.
         wear = None
-        if bat.get("energy_full") and bat.get("energy_full_design"):
-            wear = bat["energy_full"] / bat["energy_full_design"]
+        if bat.get("full") and bat.get("full_design"):
+            wear = bat["full"] / bat["full_design"]
         limit = bat.get("charge_end")
         status = (bat.get("status") or "").strip()
         word = status.lower()
@@ -1874,6 +1895,88 @@ class DashboardTab(QWidget):
             bits.append("MUX switch "
                         + ("ON" if cfg.get("AllowMuxSwitch") else "off"))
         self.sys_rows["Config"].setText("  ·  ".join(bits) or "?")
+
+    def _refresh_sys(self, st: dict):
+        """CPU speed, CPU load, GPU speed and memory: kernel facts, not
+        EC ones.
+
+        The status payload carries them under `sys` (both the daemon's
+        and the offline view's), so a missing block can only mean a
+        status older than this feature: fall back to reading the same
+        world-readable files directly rather than showing dead cards.
+        A card with no number says why, because a bare "?" on a
+        dashboard reads as a bug rather than an honest "the driver
+        publishes nothing".
+        """
+        sysf = st.get("sys")
+        if not isinstance(sysf, dict):
+            sysf = core.system_facts()
+        freq = st.get("freq") or {}
+        if not freq:
+            freq = core.cpufreq_facts()
+
+        cur = sysf.get("cpu_cur_khz")
+        cap = freq.get("max_khz")
+        ceiling = freq.get("cpuinfo_max_khz") or sysf.get("cpuinfo_max_khz")
+        if cur:
+            self.cpu_hz.show(
+                f"{core.khz_to_ghz(cur)} GHz",
+                (cur / ceiling) if ceiling else None,
+                (f"running · cap {core.khz_to_ghz(cap)} GHz" if cap
+                 else "running now"),
+                THEME["accent"])
+        else:
+            self.cpu_hz.show("?", None, "no cpufreq reading", COL_DEAD)
+
+        # Busy% is a delta between two /proc/stat samples, so only the
+        # daemon (a process that stays alive between polls) can report
+        # it; the first poll after a daemon start honestly has none.
+        # The load average is stateless, so the offline view carries it:
+        # there the number stays "?" but the sub-line still reads the
+        # machine, which is better than a tile that says nothing.
+        busy = sysf.get("cpu_busy_pct")
+        loadavg = sysf.get("loadavg")
+        if busy is not None:
+            sub = (f"1-min load {loadavg:.2f}" if loadavg is not None
+                   else f"{freq.get('policies') or '?'} cores")
+            self.cpu_load.show(f"{busy:.0f}%", busy / 100.0, sub,
+                               THEME["accent"])
+        elif loadavg is not None:
+            self.cpu_load.show(
+                "?", None, f"1-min load {loadavg:.2f} · busy% needs the daemon",
+                COL_DEAD)
+        else:
+            self.cpu_load.show("?", None, "needs the daemon (two samples)",
+                               COL_DEAD)
+
+        # The proprietary NVIDIA driver publishes no clock in sysfs, so
+        # the dGPU's reading comes from NVML, loaded here in the
+        # unprivileged front-end on purpose: the daemon talks to the
+        # kernel and nothing else.  NVML wins over the kernel's answer
+        # because on a hybrid machine the kernel names the iGPU while
+        # NVML names the discrete card.
+        g = core.gpu_clock_with_nvml(sysf.get("gpu"))
+        if g and g.get("mhz"):
+            sub = g.get("source") or "GPU"
+            if g.get("util_pct") is not None:
+                sub += f" · {g['util_pct']}% busy"
+            self.gpu_hz.show(f"{g['mhz']} MHz", None, sub, THEME["accent"])
+        else:
+            self.gpu_hz.show(
+                "?", None,
+                "no GPU clock published (kernel or NVML)", COL_DEAD)
+
+        m = sysf.get("mem")
+        if m and m.get("total_kib"):
+            gib = 1_048_576.0        # a GiB in KiB, the unit meminfo speaks
+            self.memory.show(
+                f"{m['used_kib'] / gib:.1f} GiB",
+                (m.get("used_pct") or 0.0) / 100.0,
+                f"of {m['total_kib'] / gib:.1f} GiB · "
+                f"{m.get('used_pct', 0):.0f}% in use",
+                THEME["accent"])
+        else:
+            self.memory.show("?", None, "no memory info", COL_DEAD)
 
 
 class PerformanceTab(QWidget):
@@ -1995,6 +2098,49 @@ class PerformanceTab(QWidget):
         self.od_note.setVisible(False)
         panel.box.addWidget(self.od_note)
         lay.addWidget(panel)
+
+        # ---- devices: the driver's own toggles ----------------------------
+        # These are msi-ec sysfs attributes, not model registers: the
+        # driver creates each one only on firmware that has the feature,
+        # so the control is offered exactly when the attribute exists,
+        # the same rule the shift and fan buttons follow.  The daemon
+        # already writes them through its validated, read-back `set`
+        # path; this card is only the front-end that was missing.
+        dev = Card("Devices & keys")
+        # (daemon key, row label, choices, tooltip)
+        self._dev_specs = (
+            ("webcam", "webcam", ("on", "off"),
+             "Power the built-in camera at the EC level; reversible"),
+            ("super_battery", "super battery", ("on", "off"),
+             "MSI's lowest-power mode; only some firmwares have it"),
+            ("fn_key", "Fn key on", ("left", "right"),
+             "Which side the Fn key sits on (left is the factory layout)"),
+            ("win_key", "Win key on", ("left", "right"),
+             "Which side the Win key sits on"),
+        )
+        self.dev_val = {}
+        self.dev_btns = {}
+        self._dev_cur = {}
+        for key, label, choices, tip in self._dev_specs:
+            drow = QHBoxLayout()
+            drow.setSpacing(SPACE)
+            row, v = kv_row(label, dev)
+            drow.addLayout(row)
+            btns = {}
+            for ch in choices:
+                b = QPushButton(ch.capitalize())
+                b.setCheckable(True)
+                mark_checked(b)
+                b.setToolTip(tip)
+                b.clicked.connect(
+                    lambda _=False, k=key, c=ch: self._device(k, c))
+                btns[ch] = b
+                drow.addWidget(b)
+            drow.addStretch(1)
+            dev.box.addLayout(drow)
+            self.dev_val[key] = v
+            self.dev_btns[key] = btns
+        lay.addWidget(dev)
         lay.addStretch(1)
 
         self._avail = []
@@ -2008,6 +2154,12 @@ class PerformanceTab(QWidget):
             return
         self.win.send({"cmd": "overdrive", "action": "set",
                        "on": key == "on"}, tag="overdrive")
+
+    def _device(self, key: str, choice: str):
+        """One of the Devices & keys buttons; same-value clicks are no-ops."""
+        if self._dev_cur.get(key) == choice:
+            return
+        self.win.set_key(key, choice)
 
     def _boost(self):
         self.win.set_key("cooler_boost", self.boost_btn.isChecked())
@@ -2123,6 +2275,26 @@ class PerformanceTab(QWidget):
         self.gfx_warn.setStyleSheet(style)
         self.gfx_warn.setVisible(bool(note))
 
+    def refresh_devices(self, st: dict):
+        """Mirror the driver's device attributes into their card.
+
+        A None value means the driver did not create the attribute, which
+        is the firmware's own "not built in": the row shows "?" and its
+        buttons stay dead with a tooltip saying why, rather than a
+        control that can only fail.
+        """
+        online = bool(self.win.online)
+        for key, label, choices, tip in self._dev_specs:
+            cur = st.get(key)
+            self._dev_cur[key] = cur
+            self.dev_val[key].setText(cur if cur is not None else "?")
+            for ch, b in self.dev_btns[key].items():
+                with QSignalBlockerSafe(b):
+                    b.setChecked(cur is not None and ch == cur)
+                b.setEnabled(online and cur is not None)
+                b.setToolTip(tip if cur is not None else
+                             "this firmware does not expose this attribute")
+
     def refresh_overdrive(self, st: dict):
         od = st.get("overdrive") or {}
         self._od = od
@@ -2185,7 +2357,7 @@ class PerformanceTab(QWidget):
             self.boost_btn.setStyleSheet("")
         self.refresh_graphics(st)
         self.refresh_overdrive(st)
-        self.refresh_overdrive(st)
+        self.refresh_devices(st)
 
 
 FREQ_STEP_KHZ = 100_000            # one slider notch is 100 MHz
@@ -2222,8 +2394,8 @@ class CpuFreqTab(QWidget):
 
         card = Card("Maximum frequency")
         self.rows = {}
-        for label in ("all cores at", "hardware range"):
-            row, v = kv_row(label, card)
+        for label in ("all cores at", "running now", "hardware range"):
+            row, v = kv_row(label, card, selectable=True)
             card.box.addLayout(row)
             self.rows[label] = v
 
@@ -2421,6 +2593,7 @@ class CpuFreqTab(QWidget):
         f = self._facts(st)
         if not f.get("present"):
             self.rows["all cores at"].setText("unavailable")
+            self.rows["running now"].setText("-")
             self.rows["hardware range"].setText("-")
             self.slider.setEnabled(False)
             self.apply_btn.setEnabled(False)
@@ -2444,6 +2617,21 @@ class CpuFreqTab(QWidget):
             f"{core.khz_to_ghz(f.get('max_khz'))} GHz"
             if f.get("max_khz") else
             ("differs per core" if f.get("max_khz_list") else "?"))
+        # What the cores are actually running at, from the payload's own
+        # per-policy list: all-equal reads as one number (the common
+        # idle case under a single cap), and a machine whose cores
+        # disagree gets the honest per-core list rather than a mean that
+        # matches no core.
+        curs = [v for v in f.get("cur_khz_list") or [] if v]
+        if not curs:
+            self.rows["running now"].setText("?")
+        elif len(set(curs)) == 1:
+            self.rows["running now"].setText(
+                f"{core.khz_to_ghz(curs[0])} GHz (all "
+                f"{f.get('policies') or len(curs)} cores)")
+        else:
+            self.rows["running now"].setText(
+                " · ".join(core.khz_to_ghz(v) for v in curs) + " GHz")
         self.rows["hardware range"].setText(
             f"{core.khz_to_ghz(lo)}..{core.khz_to_ghz(hi)} GHz "
             f"({f.get('policies')} cores)")
@@ -3242,9 +3430,13 @@ class BatteryTab(QWidget):
             bits.append(f"charge {bat['pct']}%")
         if bat.get("status"):
             bits.append(bat["status"])
-        if bat.get("energy_full") and bat.get("energy_full_design"):
-            wear = bat["energy_full"] / bat["energy_full_design"]
+        if bat.get("full") and bat.get("full_design"):
+            wear = bat["full"] / bat["full_design"]
             bits.append(f"health ≈ {wear:.0%} of design")
+        # A firmware that does not track cycles reports 0, which says
+        # nothing; the line stays quiet rather than wearing a fake zero.
+        if bat.get("cycle_count"):
+            bits.append(f"{bat['cycle_count']} cycles")
         return " · ".join(bits) or "no battery data"
 
 
@@ -3597,9 +3789,10 @@ class SettingsTab(QWidget):
             self, "Run the hardware self-test",
             "The self-test briefly switches every shift and fan mode, "
             "lights Cooler Boost, writes the charge threshold twice and "
-            "re-writes the fan curve and the frequency cap where they "
-            "already are, verifying each by reading it back.  Everything "
-            "it finds is restored.\n\nIt takes a few seconds.  Run it?",
+            "re-writes the fan curve, the frequency cap and the device "
+            "attributes (webcam, keys) where they already are, verifying "
+            "each by reading it back.  Everything it finds is "
+            "restored.\n\nIt takes a few seconds.  Run it?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
             return
@@ -3734,7 +3927,12 @@ class SettingsTab(QWidget):
             f"MSI Linux Control {core.VERSION}  ·  model schema "
             f"{core.MODEL_SCHEMA}")
         cfg = st.get("config") or {}
-        self.cfg_text.setPlainText(json.dumps(cfg, indent=2, sort_keys=True))
+        text = json.dumps(cfg, indent=2, sort_keys=True)
+        # Only replace the dump when it changed: setPlainText on every poll
+        # reset the caret and any selection the reader had mid-diff, which
+        # made copying a config line off this card impossible.
+        if self.cfg_text.toPlainText() != text:
+            self.cfg_text.setPlainText(text)
         self._sync_startup_controls()
         # Re-apply and capture-factory are daemon writes; disable them with
         # the daemon, same as every other writer in the app.

@@ -142,6 +142,19 @@ def print_status(st: dict, as_json: bool = False):
     cb_txt = {"on": red("ON"), "off": dim("off")}.get(cb, dim("n/a"))
     print(f"{bold('Boost')}  {cb_txt}")
 
+    # The driver's optional device attributes: present only on firmware
+    # that has them, so the line appears only when there is something to
+    # say (an absent attribute is not "off", it is "not built in").
+    misc = []
+    for key, label in (("webcam", "webcam"),
+                       ("super_battery", "super battery"),
+                       ("fn_key", "fn"), ("win_key", "win")):
+        v = st.get(key)
+        if v is not None:
+            misc.append(f"{label} {v}")
+    if misc:
+        print(f"{bold('Misc')}    {dim(' · '.join(misc))}")
+
     for which in ("cpu", "gpu"):
         s = st.get(which, {})
         temp = s.get("temp")
@@ -156,7 +169,53 @@ def print_status(st: dict, as_json: bool = False):
         line = f"{bold(which.upper()):<6}{temp_s:<8}"
         line += f"fan {('??' if pct is None else str(pct) + '%'):>4}"
         line += f"  {dim(str(rpm) + ' RPM') if rpm is not None else dim('RPM n/a')}"
+        # The GPU's own clock rides on its row.  The merge tries NVML
+        # first because on a hybrid machine the kernel's reading is the
+        # iGPU's while NVML names the discrete card; the NVIDIA
+        # proprietary driver publishes nothing in sysfs at all.
+        if which == "gpu":
+            g = core.gpu_clock_with_nvml(
+                (st.get("sys") or {}).get("gpu"))
+            if g and g.get("mhz"):
+                line += f"  {cyan(str(g['mhz']) + ' MHz')}"
         print(line)
+
+    # The machine-wide readings (kernel interfaces, present with the
+    # daemon down too, so they print from either status path).
+    sysf = st.get("sys") or {}
+    # The cap is world-readable as well; the offline payload simply does
+    # not carry a `freq` block, so read the same facts the daemon would.
+    freq = st.get("freq")
+    if not freq:
+        freq = core.cpufreq_facts()
+    cur = sysf.get("cpu_cur_khz")
+    if cur:
+        cap = freq.get("max_khz")
+        print(f"{bold('Freq')}   running at "
+              f"{cyan(core.khz_to_ghz(cur))} GHz"
+              + (dim(f", capped at {core.khz_to_ghz(cap)} GHz")
+                 if cap else ""))
+    mem = sysf.get("mem")
+    if mem and mem.get("total_kib"):
+        gib = 1_048_576.0
+        used = mem["used_kib"] / gib
+        total = mem["total_kib"] / gib
+        pct = mem.get("used_pct") or 0.0
+        print(f"{bold('Mem')}    {cyan(f'{used:.1f}')} of "
+              f"{cyan(f'{total:.1f}')} GiB in use  "
+              f"{dim('(' + f'{pct:.0f}' + '%)')}")
+    # Busy% needs two samples of /proc/stat, so only the daemon (a
+    # process that stays alive between polls) can report it; the load
+    # average is a kernel-maintained window and needs no state.
+    busy = sysf.get("cpu_busy_pct")
+    loadavg = sysf.get("loadavg")
+    if busy is not None or loadavg is not None:
+        parts = []
+        if busy is not None:
+            parts.append(f"CPU {cyan(f'{busy:.0f}%')} busy")
+        if loadavg is not None:
+            parts.append(dim(f"1-min load {loadavg:.2f}"))
+        print(f"{bold('Load')}   " + "  ".join(parts))
 
     bat = st.get("battery")
     if not bat:
@@ -168,8 +227,14 @@ def print_status(st: dict, as_json: bool = False):
         bar_len = 20
         filled = 0 if pct is None else round(pct * bar_len / 100)
         bar = green("█" * filled) + dim("░" * (bar_len-filled))
+        # Health (capacity now over capacity when new) through whichever
+        # pair this firmware publishes, energy_* or charge_*; both spell
+        # the same ratio in different units.
+        wear = (bat["full"] / bat["full_design"]
+                if bat.get("full") and bat.get("full_design") else None)
         print(f"{bold('Batt')}   {bar} {pct if pct is not None else '?'}%  {dim(ac_s)}  "
-              f"{dim(bat.get('status') or '')}")
+              f"{dim(bat.get('status') or '')}"
+              + (f"  {dim(f'health {wear:.0%}')}" if wear else ""))
         cs, ce = bat.get("charge_start"), bat.get("charge_end")
         if ce is not None:
             print(f"{bold('Limit')}  stop at {cyan(str(ce) + '%')}"
@@ -231,6 +296,10 @@ def cmd_detect(args):
 
 
 def cmd_monitor(args):
+    # Client-side busy% accounting: a monitor run stays alive between
+    # ticks, so it can take two /proc/stat samples itself when the
+    # daemon's own delta (over its poll window) is not in the payload.
+    prev_times = core.read_cpu_times()
     try:
         while True:
             st = status(args)
@@ -246,6 +315,26 @@ def cmd_monitor(args):
                         f"GPU {gpu.get('temp')}°C {gpu.get('fan_pct')}% "
                         f"{gpu.get('rpm') or '?'}rpm | "
                         f"{shift}/{fan} | bat {bat.get('pct')}%")
+                # The same machine-wide readings the Dashboard shows, on
+                # the one line this view has: they are kernel facts, so
+                # they are present with the daemon down too.
+                sysf = st.get("sys") or {}
+                cur = sysf.get("cpu_cur_khz")
+                mem = sysf.get("mem") or {}
+                extras = []
+                if cur:
+                    extras.append(f"cpu {core.khz_to_ghz(cur)}GHz")
+                if mem.get("used_pct") is not None:
+                    extras.append(f"ram {mem['used_pct']:.0f}%")
+                busy = sysf.get("cpu_busy_pct")
+                now_times = core.read_cpu_times()
+                if busy is None:
+                    busy = core.cpu_busy_pct(prev_times, now_times)
+                prev_times = now_times
+                if busy is not None:
+                    extras.append(f"load {busy:.0f}%")
+                if extras:
+                    line += " | " + " ".join(extras)
                 print(line, flush=True)
             time.sleep(args.interval)
     except KeyboardInterrupt:
@@ -825,6 +914,49 @@ def cmd_overdrive(args):
     print(green("✓ ") + out.get("summary", "set"))
 
 
+def _device_cmd(args, key, label):
+    """Show or set one of the driver's device attributes (webcam, keys).
+
+    These are msi-ec sysfs attributes, not model registers: the driver
+    creates each one only on firmware that has the feature, so a missing
+    attribute is the firmware's own "not available", and the daemon
+    writes them through the same validated, read-back path as any other
+    setting.
+    """
+    if args.value is None:
+        st = status(args)
+        cur = st.get(key)
+        if cur is None:
+            die(f"this firmware exposes no {label} attribute; the msi-ec "
+                "driver creates it only when the feature exists")
+        if args.json:
+            print(json.dumps({key: cur}, indent=2))
+            return
+        print(cur)
+        return
+    _set(args, key, args.value)
+
+
+def cmd_webcam(args):
+    """The built-in camera's power, at the EC level (reversible)."""
+    _device_cmd(args, "webcam", "webcam")
+
+
+def cmd_super_battery(args):
+    """MSI's lowest-power mode (only some firmwares have it)."""
+    _device_cmd(args, "super_battery", "super battery")
+
+
+def cmd_fn_key(args):
+    """Which side the Fn key sits on (left is the factory layout)."""
+    _device_cmd(args, "fn_key", "fn key")
+
+
+def cmd_win_key(args):
+    """Which side the Win key sits on."""
+    _device_cmd(args, "win_key", "win key")
+
+
 
 def build_parser() -> argparse.ArgumentParser:
     # Global flags are accepted BOTH before and after the subcommand
@@ -940,6 +1072,26 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("value", nargs="?", choices=["on", "off"],
                    help="toggle it (omit to show)")
     m.set_defaults(fn=cmd_overdrive)
+
+    m = sp("webcam", help="built-in camera power (driver attribute)")
+    m.add_argument("value", nargs="?", choices=["on", "off"],
+                   help="on|off (omit to show)")
+    m.set_defaults(fn=cmd_webcam)
+
+    m = sp("super-battery", help="MSI's lowest-power mode, if the firmware has it")
+    m.add_argument("value", nargs="?", choices=["on", "off"],
+                   help="on|off (omit to show)")
+    m.set_defaults(fn=cmd_super_battery)
+
+    m = sp("fn-key", help="which side the Fn key sits on")
+    m.add_argument("value", nargs="?", choices=["left", "right"],
+                   help="left|right (omit to show)")
+    m.set_defaults(fn=cmd_fn_key)
+
+    m = sp("win-key", help="which side the Win key sits on")
+    m.add_argument("value", nargs="?", choices=["left", "right"],
+                   help="left|right (omit to show)")
+    m.set_defaults(fn=cmd_win_key)
 
     sp("reapply",
        help="re-apply persisted state (used after resume)"

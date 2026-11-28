@@ -21,7 +21,19 @@ does on Windows, on Linux, without Dragon Center:
   profile captured from the EC so you can always go back.
 * **Graphics mode (MUX)**: run the panel off the Intel iGPU (hybrid) or the
   NVIDIA GPU alone (discrete). Off by default; read the warning first.
-* **Live monitoring**: CPU/GPU temperature, fan duty and **RPM**.
+* **Device and key toggles**: the webcam (and its kill switch), the Fn/Windows
+  key swap and super battery, when the firmware's `msi-ec` driver exposes
+  them. A machine that lacks a toggle shows it dead, with the reason, rather
+  than guessing.
+* **Live monitoring**: CPU/GPU temperature, fan duty and **RPM**, plus what
+  the kernel knows for free: the CPU's current running speed, the 1-minute
+  load average, the GPU's clock when the driver publishes one, and memory in
+  use. Those are world-readable interfaces, so they keep working with the
+  daemon down. The CPU-busy percentage (and, on NVIDIA proprietary graphics,
+  the GPU clock) has a catch: busy% needs two `/proc/stat` samples only the
+  daemon's lifetime makes possible, and the NVIDIA clock lives in NVML,
+  loaded by the unprivileged front-end (the daemon talks to the kernel and
+  nothing else).
 
 Not every laptop is the same, so the laptop-specific facts live in a **model
 registry** under `models/`: one small JSON file per model, holding that
@@ -267,6 +279,10 @@ msi-control undervolt                     # Intel voltage offsets (show)
 msi-control undervolt set core=-80 cache=-60 --yes   # write them
 msi-control undervolt reset               # back to 0, now, not at reboot
 msi-control overdrive                     # panel overdrive (model-gated)
+msi-control webcam on                     # the camera, and its kill switch
+msi-control fn-key right                  # which key acts as Fn: left|right
+msi-control win-key on                    # the Windows key
+msi-control super-battery off             # firmware's own battery saver
 msi-control reapply                      # push persisted state back into the EC
 msi-control selftest                      # verify.sh as one command (add --yes to run)
 msi-control selftest --yes --pr           # the same, printing a paste-ready PR report
@@ -325,7 +341,7 @@ tabs, so the window reads as one system at any size:
 * **One type scale, in pixels.** `setPointSize` and `setPixelSize` were mixed,
   so "the big number" rendered at two different heights depending on the page;
   every size now comes from one rung (`TYPE_MICRO` … `TYPE_DISPLAY`), and the
-  smoke test asserts the five dashboard tiles agree.
+  smoke test asserts the nine dashboard tiles agree.
 * **One control height.** Every button, field, spin box and sidebar row is the
   same height, from a single token, because widgets used to carry their own
   minimum height, which left the battery page's `Apply` standing 10 px taller
@@ -606,8 +622,10 @@ guesses) on models without a proven register.
    daemon refuses to report success unless the value really stuck. Undervolt
    read-back is also the *lock detector*: a locked BIOS is indistinguishable
    from a refused write, so that is how it is reported.
-3. **Serialisation.** All EC writes take one lock: the kernel's ACPI code
-   talks to the same controller.
+3. **Serialisation.** All EC access, reads included, takes one lock: the
+   driver's debug interface is write-address-then-read-value on one file, so
+   two unlocked transfers can each receive the other's byte, and the kernel's
+   ACPI code talks to the same controller besides.
 4. **Least privilege.** Only `msi-controld` is root. The socket is `0660
    root:wheel`, and `wheel` already implies admin, so socket access grants
    nothing new. **Nothing over HTTP can reach the EC**: there is no web
@@ -628,7 +646,7 @@ src/msi-control        CLI (status · detect · monitor · mode · fan · boost 
 src/msi-control-gui           PySide6 GUI
 models/<id>/model.json one laptop model: the per-model EC map + features
 models/README.md       the model-file format, field by field
-tests/test_msi_control.py     194 offline tests: fake sysfs + RAM-backed EC
+tests/test_msi_control.py     233 offline tests: fake sysfs + RAM-backed EC
 tests/gui_smoke.py     headless GUI construction + behaviour + screenshots
 tests/shots/           committed screenshots: dark, and light/ beside it
 tools/                 hardware probes (need root) + fixup/recapture helpers
@@ -647,7 +665,7 @@ LICENSE                GPL-2.0-or-later (the whole program)
 ### Tests
 
 ```bash
-python3 tests/test_msi_control.py                     # 194 tests, no root, no hardware
+python3 tests/test_msi_control.py                     # 233 tests, no root, no hardware
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py   # needs PySide6
 
 make check                                     # both of the above + a syntax check
@@ -675,8 +693,11 @@ The suite builds a **fake sysfs tree** (cpufreq policies included) and a
 then runs the real daemon in-process and drives it over the real socket, so
 protocol, validation, profiles, restore-after-reboot and the CLI are all
 exercised end-to-end. The environment variables `MSI_SYSFS`, `MSI_SOCK`,
-`MSI_CONFIG`, `MSI_STATE` and `MSI_CPU_DEV` redirect every path, which is
-what makes this possible without root.
+`MSI_CONFIG`, `MSI_STATE`, `MSI_CPU_DEV`, `MSI_MEMINFO` (a fake
+`/proc/meminfo`), `MSI_STAT` and `MSI_LOADAVG` (fake `/proc/stat` and
+`/proc/loadavg`) redirect every path, and `MSI_NO_NVML` pins the NVIDIA
+probe off so the suite is deterministic on a machine that has the library,
+which is what makes this possible without root.
 
 It deliberately covers the ugly cases: an EC byte that refuses to be written
 (read-back must catch it), a `True` that must not become fan speed 1, a

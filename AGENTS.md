@@ -79,12 +79,13 @@ src/msi_control.py      shared core: model registry, EC map, validation, paths
 src/msi_controld.py     the privileged daemon (systemd service msi-controld)
 src/msi-control         CLI (subcommands: status, detect, monitor, mode, fan,
                         boost, battery, curve, profile, graphics, freq,
-                        undervolt, overdrive, reapply, selftest, raw, wait)
+                        undervolt, overdrive, webcam, super-battery, fn-key,
+                        win-key, reapply, selftest, raw, wait)
 src/msi-control-gui     PySide6 GUI, eight sections
 models/<id>/model.json  one laptop model: THE file you add for a new laptop
 models/README.md        the model-file format, field by field
 models/<id>/README.md   optional: notes on how that model's registers were found
-tests/test_msi_control.py  offline suite: fake sysfs + RAM-backed EC + fake MSR, 194 tests
+tests/test_msi_control.py  offline suite: fake sysfs + RAM-backed EC + fake MSR, 233 tests
 tests/gui_smoke.py         headless GUI build + behaviour + screenshots
 tests/shots/               committed screenshots: dark, light/ beside it
 tools/                  hardware probes (need root) + fixup/recapture helpers
@@ -108,7 +109,7 @@ DKMS build needs no network. Its device strings, identifiers and file names are
 There is no build step. To run a test you need nothing but Python 3.10+:
 
 ```bash
-python3 tests/test_msi_control.py                       # 194 tests, no root, ~9 s
+python3 tests/test_msi_control.py                       # 233 tests, no root, ~9 s
 QT_QPA_PLATFORM=offscreen python3 tests/gui_smoke.py    # GUI, needs PySide6
 make check        # compile + the offline suite + the GUI smoke test
 make shots        # regenerate tests/shots/          (dark)
@@ -123,11 +124,12 @@ it. Everything release-shaped lands in `dist/`, which is gitignored: a
 built artifact must never be committed, because the version is defined by
 the source and an artifact is only its echo.
 
-**Run `make check` after every change.** 194 tests, offline: the suite builds a fake
+**Run `make check` after every change.** 233 tests, offline: the suite builds a fake
 sysfs tree (cpufreq policies included), a RAM-backed EC and a fake OC mailbox,
 and runs the *real* daemon over the *real*
 socket, so protocol, validation, profiles and the CLI are exercised
-end-to-end. MSI_SYSFS, MSI_SOCK, MSI_CONFIG, MSI_STATE, MSI_CPU_DEV and
+end-to-end. MSI_SYSFS, MSI_SOCK, MSI_CONFIG, MSI_STATE, MSI_CPU_DEV,
+MSI_MEMINFO, MSI_STAT, MSI_LOADAVG and
 MSI_MODELS redirect every path, which is what makes that possible, and it is
 also how you test a new model without installing it.
 
@@ -376,6 +378,10 @@ feature, not a bug.**
 | `MSI_CONFIG` | `/etc/msi-control/config.json` | tests |
 | `MSI_STATE` | `/var/lib/msi-control` | tests |
 | `MSI_CPU_DEV` | `/dev/cpu` | the fake MSR tree in tests |
+| `MSI_MEMINFO` | `/proc/meminfo` | the fake memory facts in tests |
+| `MSI_STAT` | `/proc/stat` | the fake CPU-times sample in tests |
+| `MSI_LOADAVG` | `/proc/loadavg` | the fake load average in tests |
+| `MSI_NO_NVML` | the NVML probe | pins the NVIDIA library off, so the suite is deterministic on a machine that has it |
 | `MSI_MODELS` | the registry directory | tests, and trying a model out un-installed |
 | `MSI_MODEL` | model auto-detection; forces one model id | tests, debugging |
 | `MSI_THEME` | `light` \| `dark` (else follow the desktop) | the GUI |

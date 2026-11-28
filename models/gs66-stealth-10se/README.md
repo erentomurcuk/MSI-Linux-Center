@@ -83,7 +83,8 @@ is the tested route.
 | `shift`, `fan`, `cooler_boost`, `charge_limit` | `true` | driver-provided; exposed on this firmware |
 | `fan_curve`, `rpm` | `true` | the registers above; curve write-back verified by `verify.sh` |
 | `mux` | `true` | the shared MUX block; the switch itself is still opt-in (`AllowMuxSwitch`) |
-| `webcam`, `webcam_block`, `super_battery`, `fn_key`, `win_key` | `false` | not present on this config; they read back as absent, so the GUI disables them instead of pretending |
+| `webcam`, `webcam_block`, `fn_key`, `win_key` | `true` | msi-ec `CONF_G1_3` defines them for this firmware family upstream (webcam EC `0x2e` bit 1, block register `0x2f`, Fn/Win swap EC `0xbf` bit 4, inverted), and the sysfs attributes are present on this machine (verified 2026-11-28). Driver-mediated and reversible; `msi-control selftest` re-writes each where it already stands as the write-back proof |
+| `super_battery` | `false` | this firmware does not expose the attribute; the GUI shows the row dead with the reason instead of pretending |
 | `display_overdrive` | `true` | `0x2e` bit 4. Prior art: the same-generation GP76 10UG toggles its panel overdrive with exactly this bit, confirmed by that machine's owner writing it under Linux (Blur Busters thread 8627); this byte already carries this model's webcam bit 1 and MUX bit 6. Proven here by the write-back test on `16V1EMS1.118` (2026-11-22, through the daemon's validated one-bit RMW: bit accepted and read back, both neighbour bits untouched, original state restored). Visual confirmation of the panel's response-time change is still a human check; say so in any review that asks |
 
 ## The built-in profiles

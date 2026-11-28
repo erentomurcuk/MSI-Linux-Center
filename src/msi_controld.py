@@ -14,8 +14,9 @@ Design rules:
   * never trust a client: every value is validated by msi_control;
   * every EC write is followed by a read-back, because an EC that silently
     ignores a byte is indistinguishable from one that accepted it;
-  * all writes are serialised under one lock (the EC is a shared resource
-    the kernel's ACPI code also talks to);
+  * all EC access, reads included, is serialised under one lock (the
+    debug interface is write-address-then-read-value on one shared file,
+    and the kernel's ACPI code talks to the same controller besides);
   * no subprocesses, ever: only sysfs reads/writes at fixed paths.
 
 Run: msi-controld [--socket PATH] [--sysfs PATH] [--config PATH] [--state PATH]
@@ -112,7 +113,16 @@ class MsiEc:
     def __init__(self, sysfs_root: str | None = None):
         if sysfs_root:
             os.environ["MSI_SYSFS"] = sysfs_root   # keeps core.* in sync
-        self.lock = threading.Lock()
+        # RLock, and taken inside ec_read/ec_write as well as by callers,
+        # for two reasons.  The debug interface is write-address-then-read-
+        # value, so two unlocked transfers in two threads can each receive
+        # the *other's* address (the status poll's RPM read once came back
+        # with a fan-curve temperature byte in it), and an unlocked read
+        # between a write and its verify reads back the wrong byte and
+        # reports a phantom refusal.  Re-entrant because several callers
+        # already hold the lock around whole multi-transfer sequences
+        # (curves, the MUX handshake) and must keep working.
+        self.lock = threading.RLock()
         self._bat = None
         # How long to wait for the three-mode firmware's acknowledge bit once
         # a switch request is armed, and how often to poll it.  Attribute
@@ -186,22 +196,37 @@ class MsiEc:
             raise BackendError(f"EC write failed at {addr:#04x}: {e}") from e
 
     def ec_read(self, addr: int) -> int:
-        """Read one EC byte.  Needs msi-ec loaded with debug=1."""
+        """Read one EC byte.  Needs msi-ec loaded with debug=1.
+
+        The lock lives here, not in the caller: the status poll reads the
+        tachometer and the graphics bit without holding anything, and one
+        unlocked read interleaved with another thread's transfer returns
+        the other transfer's byte (see the note on self.lock).
+        """
         self._check_ec_debug()
         if not 0 <= addr <= 0xFF:
             raise ValidationError("EC address out of range 0x00..0xff")
-        return self._xfer_read(addr)
+        with self.lock:
+            return self._xfer_read(addr)
 
     def ec_write(self, addr: int, val: int, verify: bool = True) -> None:
+        """Write one EC byte and read it back, as one locked unit.
+
+        The write and its verify read are a pair: an unlocked reader
+        between them makes the verify see a different address's byte and
+        the write look rejected when it stuck.
+        """
         self._check_ec_debug()
         if not 0 <= addr <= 0xFF or not 0 <= val <= 0xFF:
             raise ValidationError("EC address/value out of range 0x00..0xff")
-        self._xfer_write(addr, val)
-        if verify:
-            got = self.ec_read(addr)
-            if got != val:
-                raise BackendError(
-                    f"EC rejected write {addr:#04x}={val:02x} (read back {got:02x})")
+        with self.lock:
+            self._xfer_write(addr, val)
+            if verify:
+                got = self._xfer_read(addr)
+                if got != val:
+                    raise BackendError(
+                        f"EC rejected write {addr:#04x}={val:02x} "
+                        f"(read back {got:02x})")
 
     # -- battery -----------------------------------------------------------
 
@@ -238,7 +263,14 @@ class MsiEc:
         core.check_choice(which, ("cpu", "gpu"), "fan curve")
         if not core.feature("fan_curve"):
             raise NotSupported.feature("fan_curve")
-        regs = core.CURVE_REGS[which]
+        # `.get`, never `[...]`: the registry format allows a model with
+        # registers for only one fan, and a KeyError here would surface as
+        # "internal error" on the other fan's very first status poll.
+        regs = core.CURVE_REGS.get(which)
+        if not regs:
+            raise BackendError(
+                f"this model's model file names no {which} fan-curve "
+                "registers")
         with self.lock:
             temps = [self.ec_read(a) for a in regs["temps"]]
             speeds = [self.ec_read(a) for a in regs["speeds"]]
@@ -248,8 +280,12 @@ class MsiEc:
         core.check_choice(which, ("cpu", "gpu"), "fan curve")
         if not core.feature("fan_curve"):
             raise NotSupported.feature("fan_curve")
+        regs = core.CURVE_REGS.get(which)
+        if not regs:
+            raise BackendError(
+                f"this model's model file names no {which} fan-curve "
+                "registers")
         temps, speeds = core.check_curve(temps, speeds)
-        regs = core.CURVE_REGS[which]
         with self.lock:
             for addr, val in zip(regs["temps"], temps):
                 self.ec_write(addr, val)
@@ -261,9 +297,20 @@ class MsiEc:
         core.check_choice(which, ("cpu", "gpu"), "fan")
         if not core.feature("rpm"):
             raise NotSupported.feature("rpm")
-        addr = core.RPM_REGS[which]
+        # A model may prove a tachometer for one fan only; the other then
+        # has "no reading" (BackendError, caught by status and shown as a
+        # dash) rather than an internal error.
+        addr = core.RPM_REGS.get(which)
+        if addr is None:
+            raise BackendError(
+                f"this model's model file names no {which} tachometer "
+                "register")
         try:
-            hi, lo = self.ec_read(addr), self.ec_read(addr + 1)
+            # ec_read takes the lock per byte; the pair wants it whole, or
+            # another thread's transfer can hand the high byte of one
+            # tachometer the low byte of another.
+            with self.lock:
+                hi, lo = self.ec_read(addr), self.ec_read(addr + 1)
         except BackendError:
             return None
         period = (hi << 8) | lo
@@ -419,8 +466,9 @@ class MsiEc:
         # would happily report our own write back to us on firmware that
         # rewrites the variable, so this check is about bytes, not trust.
         got = self.mux_var_raw()
-        if got is None or got[core.MUX_VAR_SKIP + core.MUX_VAR_GPU_BYTE] \
-                != new[core.MUX_VAR_GPU_BYTE]:
+        byte = core.MUX_VAR_SKIP + core.MUX_VAR_GPU_BYTE
+        if got is None or len(got) <= byte \
+                or got[byte] != new[core.MUX_VAR_GPU_BYTE]:
             # Put the exact previous image back; a half-staged request is the
             # worst state to leave behind, because nothing on screen can
             # distinguish it from a made-up-our-mind one.
@@ -671,8 +719,65 @@ class CpuFreq:
                                f"({key} missing)")
         return v
 
+    @staticmethod
+    def _write_policy(path: str, value: int) -> None:
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"{value}\n")
+        except OSError as e:
+            raise BackendError(
+                f"cannot write {path}: {e.strerror or e}") from e
+
+    def _set_policy_max(self, pol: str, wanted: int) -> None:
+        """Cap one policy at `wanted`, and read the cap back.
+
+        The floor is lifted only when the requested max is below it (the
+        kernel refuses that pair), and goes back to its original value if
+        the cap does not land: the lift was only valid under the new cap,
+        and a floor left raised would pin the CPU fast forever.  The
+        read-back is a poll with a deadline, not one shot, because the
+        kernel applies a new limit after write(2) returns (see the class
+        docstring).
+        """
+        floor_path = self._path(pol, "scaling_min_freq")
+        max_path = self._path(pol, "scaling_max_freq")
+        floor = core.read_khz(floor_path)
+        lifted = floor is not None and floor > wanted
+        ok = False
+        try:
+            if lifted:
+                self._write_policy(floor_path, wanted)
+            self._write_policy(max_path, wanted)
+            got = None
+            deadline = time.monotonic() + self.APPLY_WAIT_S
+            while True:
+                got = core.read_khz(max_path)
+                if got == wanted or time.monotonic() >= deadline:
+                    break
+                time.sleep(self.APPLY_POLL_S)
+            if got != wanted:
+                raise BackendError(
+                    f"read back {core.khz_to_ghz(got)} GHz, wanted "
+                    f"{core.khz_to_ghz(wanted)} GHz")
+            ok = True
+        finally:
+            if lifted and not ok:
+                # Best effort: the pair stays valid either way, because
+                # the old cap still stands above both floor values.
+                try:
+                    self._write_policy(floor_path, floor)
+                except BackendError:
+                    pass
+
     def set_all_max(self, khz: int) -> dict:
-        """One max frequency for every core.  khz in kilohertz."""
+        """One max frequency for every core.  khz in kilohertz.
+
+        Every policy is attempted whatever happens to its neighbours: a
+        set that stops at the first broken core leaves the machine half
+        capped, the worst state to debug, because each half looks right
+        on its own and every later status just says "differs per core".
+        All failures are collected and reported in one error.
+        """
         facts = self.facts()
         if not facts.get("present"):
             raise BackendError("cpufreq is unavailable on this machine")
@@ -683,29 +788,10 @@ class CpuFreq:
         with self.lock:
             stops = []
             for pol in pols:
-                cur = core.read_khz(self._path(pol, "scaling_max_freq"))
-                # min must never overtake max: lift the floor when the
-                # requested max is below the current floor.
-                floor = core.read_khz(self._path(pol, "scaling_min_freq"))
-                if floor is not None and floor > wanted:
-                    with open(self._path(pol, "scaling_min_freq"), "w",
-                              encoding="utf-8") as fh:
-                        fh.write(f"{wanted}\n")
-                with open(self._path(pol, "scaling_max_freq"), "w",
-                          encoding="utf-8") as fh:
-                    fh.write(f"{wanted}\n")
-                # Poll rather than read once: the kernel applies the new
-                # limit after write(2) returns (see the class docstring).
-                got = None
-                deadline = time.monotonic() + self.APPLY_WAIT_S
-                while True:
-                    got = core.read_khz(self._path(pol, "scaling_max_freq"))
-                    if got == wanted or time.monotonic() >= deadline:
-                        break
-                    time.sleep(self.APPLY_POLL_S)
-                if got != wanted:
-                    stops.append(f"core {pol}: read back "
-                                 f"{core.khz_to_ghz(got)} GHz")
+                try:
+                    self._set_policy_max(pol, wanted)
+                except BackendError as e:
+                    stops.append(f"core {pol}: {e}")
             if stops:
                 raise BackendError("; ".join(stops))
             now = core.cpufreq_facts()
@@ -908,7 +994,11 @@ class Profiles:
         core.check_profile_name(name)
         prof = core.clean_profile(data)
         prof["name"] = name
-        tmp = self._path(name) + ".tmp"
+        # Unique per thread: two clients saving the same name at once must
+        # not write into one shared tmp file and replace each other's
+        # half of it.
+        tmp = (f"{self._path(name)}.{os.getpid()}."
+               f"{threading.get_ident()}.tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(prof, fh, indent=2, sort_keys=True)
             fh.write("\n")
@@ -944,12 +1034,36 @@ class Service:
         self.profiles = Profiles(os.path.join(core.state_dir(), "profiles"))
         os.makedirs(core.state_dir(), exist_ok=True)
         self._igpu: bool | None = None      # one look per daemon lifetime
+        # CPU-load accounting: the previous /proc/stat sample, and the
+        # lock that makes "two concurrent statuses" compute one honest
+        # delta rather than two racing halves of the same second.
+        self._stat_lock = threading.Lock()
+        self._cpu_times: tuple | None = None
+
+    def _cpu_busy(self) -> float | None:
+        """Busy% since the previous status, from /proc/stat deltas.
+
+        The first status after a daemon start has no previous sample and
+        honestly reports None; every later one reports the load over the
+        window between the two polls.
+        """
+        now = core.read_cpu_times()
+        with self._stat_lock:
+            prev, self._cpu_times = self._cpu_times, now
+        return core.cpu_busy_pct(prev, now)
 
     # -- state --------------------------------------------------------------
 
     def status(self) -> dict:
         st = core.local_status(mux=False)
         st["partial"] = False
+        # Busy% is the one machine reading that cannot live in
+        # `system_facts()`: it is a delta between two /proc/stat samples,
+        # and only a process that stays alive between polls (this daemon)
+        # can take the second sample.  Everything else about the machine's
+        # load, including the 1-minute average, is stateless and already
+        # in the `sys` block from the core.
+        st.setdefault("sys", {})["cpu_busy_pct"] = self._cpu_busy()
         debug = self.ec.debug_present()
         st["driver"]["debug"] = debug
         if debug and core.feature("rpm"):
@@ -1021,7 +1135,12 @@ class Service:
     def save_last(self) -> None:
         try:
             snap = self.snapshot()
-            tmp = os.path.join(core.state_dir(), "last.json.tmp")
+            # The tmp name is unique per thread: two client threads can
+            # save at once, and one shared "*.tmp" would let one thread
+            # os.replace() the other's half-written file.
+            tmp = os.path.join(core.state_dir(),
+                               f"last.json.{os.getpid()}."
+                               f"{threading.get_ident()}.tmp")
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(snap, fh, indent=2, sort_keys=True)
             os.replace(tmp, os.path.join(core.state_dir(), "last.json"))
@@ -1109,7 +1228,10 @@ class Service:
         }
         os.makedirs(core.state_dir(), exist_ok=True)
         path = self._mux_backup_path()
-        tmp = path + ".tmp"
+        # Unique per thread, same reason as save_last: the MUX backup is
+        # the one record that can undo a graphics switch, and a shared
+        # tmp name under two concurrent writers is how it gets corrupted.
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(rec, fh, indent=2, sort_keys=True)
             fh.write("\n")
@@ -1581,6 +1703,31 @@ class Service:
             except (BackendError, ValidationError) as e:
                 check("cpu frequency", "cpufreq write-back", False, str(e))
 
+        # -- device attributes: the driver's own toggles, proved by
+        # -- re-writing the value each already holds (the same trick the
+        # -- curve write-back uses: nothing changes, and the write path
+        # -- itself is what is being tested).  This is the round-trip a
+        # -- model file's webcam/fn_key/win_key flags should rest on.
+        for key, label in (("webcam", "webcam"), ("super_battery", "super battery"),
+                           ("fn_key", "Fn key"), ("win_key", "Win key")):
+            cur = self.ec.read_opt(key)
+            if cur is None:
+                # The driver creates the attribute only on firmware that
+                # has the feature, so absence is the firmware's own "no".
+                check("devices", f"{label} attribute", True,
+                      "skipped: this firmware does not expose it")
+                continue
+            err = ""
+            got = None
+            try:
+                self.ec.set(key, cur)
+                got = self.ec.get(key)
+            except (BackendError, ValidationError, NotSupported) as e:
+                err = str(e)
+            check("devices", f"{label} {cur} -> read back "
+                  f"{got if got is not None else 'nothing'}",
+                  got == cur, err)
+
         # -- sanity: what the sensors say must be plausible
         for which in ("cpu", "gpu"):
             d = st.get(which) or {}
@@ -1853,8 +2000,10 @@ def already_running(path: str) -> bool:
 
 
 def wait_for_driver(timeout: float) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    # Monotonic, not wall clock: a laptop that wakes from suspend with
+    # its clock stepped would otherwise wait minutes or none at all.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if os.path.isdir(core.msi_ec_dir()):
             return True
         time.sleep(0.5)
